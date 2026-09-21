@@ -19,12 +19,11 @@ static ImVec4 color_for(int kind)
 
 static void text_list(app_state& state)
 {
-    if (ImGui::BeginTable("disasm_table", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY)) {
+    if (ImGui::BeginTable("disasm_table", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY)) {
         ImGui::TableSetupColumn("address", ImGuiTableColumnFlags_WidthFixed, 78);
-        ImGui::TableSetupColumn("bytes", ImGuiTableColumnFlags_WidthFixed, 118);
-        ImGui::TableSetupColumn("code", ImGuiTableColumnFlags_WidthFixed, 200);
+        ImGui::TableSetupColumn("bytes", ImGuiTableColumnFlags_WidthFixed, 110);
+        ImGui::TableSetupColumn("code", ImGuiTableColumnFlags_WidthFixed, 210);
         ImGui::TableSetupColumn("comment", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("xref", ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableHeadersRow();
         int n = sizeof(mock_lines) / sizeof(mock_lines[0]);
         for (int i = 0; i < n; i++) {
@@ -39,8 +38,6 @@ static void text_list(app_state& state)
             ImGui::TextColored(color_for(mock_lines[i].kind), "%-5s %s", mock_lines[i].mnemonic, mock_lines[i].operands);
             ImGui::TableNextColumn();
             ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.55f, 1.0f), "%s", mock_lines[i].comment);
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("%s", mock_lines[i].kind == 2 ? "xref" : "");
             if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0))
                 state.selected_line = i;
         }
@@ -90,10 +87,6 @@ void draw(app_state& state)
         return;
     ImGui::Begin("ida view", &state.show_view);
     widgets::nav_band();
-    ImGui::Checkbox("graph", &state.graph_mode);
-    ImGui::SameLine();
-    ImGui::TextDisabled("main_loop | %d lines", (int)(sizeof(mock_lines) / sizeof(mock_lines[0])));
-    ImGui::Separator();
     if (state.graph_mode)
         graph(state);
     else

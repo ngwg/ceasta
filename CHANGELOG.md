@@ -1,5 +1,14 @@
 # changelog
 
+## v0.4 - 2026-09-21
+
+- flattened the ui, less nesting
+- left is just functions now, no tabs
+- ida view is just nav + list, 4 cols
+- right is one list with imports then strings
+- bottom is output + hex side by side, no tabs
+- still ida-like, just cleaner
+
 ## v0.3 - 2026-09-21
 
 - split ui into folders, no more one big app.cpp
