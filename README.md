@@ -16,5 +16,8 @@ just run it, it loads with mock data. use the view menu to show/hide panels.
 
 # layout
 
-- `src/` - app code
+- `src/app.*` - state + main draw calls
+- `src/ui/` - one file per panel (top_bar, left_panel, ida_view, etc)
+- `src/widgets/` - small shared bits like nav_band
+- `src/data/` - mock data for now
 - `third_party/imgui` - imgui

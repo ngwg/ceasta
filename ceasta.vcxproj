@@ -77,6 +77,12 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\app.cpp" />
+    <ClCompile Include="src\ui\top_bar.cpp" />
+    <ClCompile Include="src\ui\left_panel.cpp" />
+    <ClCompile Include="src\ui\ida_view.cpp" />
+    <ClCompile Include="src\ui\right_panel.cpp" />
+    <ClCompile Include="src\ui\cpu_panel.cpp" />
+    <ClCompile Include="src\ui\bottom_panel.cpp" />
     <ClCompile Include="third_party\imgui\imgui.cpp" />
     <ClCompile Include="third_party\imgui\imgui_draw.cpp" />
     <ClCompile Include="third_party\imgui\imgui_tables.cpp" />
@@ -87,8 +93,16 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\app.h" />
-    <ClInclude Include="src\mock_data.h" />
     <ClInclude Include="src\theme.h" />
+    <ClInclude Include="src\data\mock_data.h" />
+    <ClInclude Include="src\widgets\nav_band.h" />
+    <ClInclude Include="src\ui\top_bar.h" />
+    <ClInclude Include="src\ui\left_panel.h" />
+    <ClInclude Include="src\ui\ida_view.h" />
+    <ClInclude Include="src\ui\right_panel.h" />
+    <ClInclude Include="src\ui\cpu_panel.h" />
+    <ClInclude Include="src\ui\bottom_panel.h" />
+    <ClInclude Include="src\ui\status_bar.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="README.md" />

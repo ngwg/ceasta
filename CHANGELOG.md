@@ -1,5 +1,15 @@
 # changelog
 
+## v0.3 - 2026-09-21
+
+- split ui into folders, no more one big app.cpp
+- added `src/ui/` with a file per panel
+  - top_bar, left_panel, ida_view, right_panel, cpu_panel, bottom_panel
+- added `src/widgets/` for shared bits
+  - nav_band + addr label
+- moved mock data to `src/data/`
+- same look, just organized better
+
 ## v0.2 - 2026-09-21
 
 - more filled ida-like layout
