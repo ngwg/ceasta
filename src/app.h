@@ -18,6 +18,7 @@ struct app_state {
     char log_buf[8192] = {};
     int log_len = 0;
     char file_name[256] = "sample.exe";
+    bool layout_done = false;
 };
 
 void app_init(app_state& state);

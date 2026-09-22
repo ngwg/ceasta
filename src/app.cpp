@@ -7,7 +7,34 @@
 #include "ui/bottom_panel.h"
 #include "ui/status_bar.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include <cstring>
+
+static void build_layout(app_state& state)
+{
+    ImGuiViewport* view = ImGui::GetMainViewport();
+    ImGuiID root = ImGui::GetID("ceasta_root");
+    ImGui::DockBuilderRemoveNode(root);
+    ImGui::DockBuilderAddNode(root, ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodeSize(root, view->Size);
+
+    ImGuiID left, rest;
+    ImGui::DockBuilderSplitNode(root, ImGuiDir_Left, 0.17f, &left, &rest);
+    ImGuiID right, center;
+    ImGui::DockBuilderSplitNode(rest, ImGuiDir_Right, 0.24f, &right, &center);
+    ImGuiID bottom, mid;
+    ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.30f, &bottom, &mid);
+    ImGuiID right_top, right_bottom;
+    ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.55f, &right_bottom, &right_top);
+
+    ImGui::DockBuilderDockWindow("functions", left);
+    ImGui::DockBuilderDockWindow("ida view", mid);
+    ImGui::DockBuilderDockWindow("imports", right_top);
+    ImGui::DockBuilderDockWindow("cpu", right_bottom);
+    ImGui::DockBuilderDockWindow("output", bottom);
+    ImGui::DockBuilderFinish(root);
+    state.layout_done = true;
+}
 
 void app_init(app_state& state)
 {
@@ -30,7 +57,10 @@ void app_log(app_state& state, const char* text)
 
 void app_render(app_state& state)
 {
-    ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+    if (!state.layout_done)
+        build_layout(state);
+    ImGuiID root = ImGui::GetID("ceasta_root");
+    ImGui::DockSpaceOverViewport(root, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
 
     top_bar::draw(state);
     left_panel::draw(state);
