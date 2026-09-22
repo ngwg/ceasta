@@ -1,5 +1,13 @@
 # changelog
 
+## v0.5 - 2026-09-22
+
+- default dock positions now
+- functions left, ida view center
+- imports top right, cpu bottom right
+- output bottom
+- no more windows piled on top of each other
+
 ## v0.4 - 2026-09-21
 
 - flattened the ui, less nesting
