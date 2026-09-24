@@ -19,7 +19,7 @@ struct lua_bridge {
     std::function<uint64_t()> here;                    // cursor address
     std::function<void(uint64_t)> jump;                // move the cursor
     std::function<uint64_t(uint64_t)> to_runtime;      // static -> debuggee address
-    std::function<uint64_t(uint64_t)> to_static;       // debuggee -> static address
+    std::function<bool(uint64_t, uint64_t&)> to_static; // debuggee -> static, false outside the image
 };
 
 struct lua_command {

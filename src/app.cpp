@@ -497,10 +497,7 @@ static void setup_lua(app_state& s)
     br.here = [&s]() { return s.cursor; };
     br.jump = [&s](uint64_t a) { app_jump(s, a); };
     br.to_runtime = [&s](uint64_t a) { return app_to_runtime(s, a); };
-    br.to_static = [&s](uint64_t a) {
-        uint64_t out;
-        return app_to_static(s, a, out) ? out : a;
-    };
+    br.to_static = [&s](uint64_t a, uint64_t& out) { return app_to_static(s, a, out); };
     s.lua.init(br);
     std::string user_plugins = os::join(os::user_dir(), "plugins");
     os::make_dirs(user_plugins);

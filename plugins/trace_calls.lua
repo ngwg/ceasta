@@ -8,6 +8,7 @@
 -- ceasta.dbg.* side of the api and the "stop" event hook.
 
 local MAX_STEPS = 4000
+local tracing = false
 
 local function trace()
     local dbg = ceasta.dbg
@@ -16,31 +17,37 @@ local function trace()
         return
     end
     local depth, steps, calls = 0, 0, 0
+    tracing = true
     while steps < MAX_STEPS do
-        local pc = dbg.pc()
-        local ins = ceasta.disasm(pc)
-        if not ins then break end
+        -- pc is a runtime address, the listing may sit elsewhere when aslr moved the image
+        local pc = dbg.to_static(dbg.pc())
+        local ins = pc and ceasta.disasm(pc)
+        if not ins then
+            ceasta.log("left the program's own code, ending trace")
+            break
+        end
+        local step = dbg.step_into
         if ins.flow == "call" then
             local dst = ins.target and ceasta.location(ins.target) or "(indirect)"
             ceasta.log(("%s%s -> %s"):format(("  "):rep(math.min(depth, 8)), string.format("%X", pc), dst))
             calls = calls + 1
-            depth = depth + 1
+            if ins.target and ceasta.is_code(ins.target) then
+                depth = depth + 1
+            else
+                step = dbg.step_over -- imports and indirect calls run at full speed
+            end
         elseif ins.flow == "ret" then
             depth = math.max(0, depth - 1)
         end
-        local ok, err = dbg.step_into()
-        if not ok then
-            ceasta.warn("step failed: " .. tostring(err))
-            break
-        end
-        -- the app pumps debug events between turns; the console runs synchronously,
-        -- so give the state a moment to settle by re-reading pc on the next loop
+        -- steps wait until the target stops again (or exits)
+        local ok, err = step()
         steps = steps + 1
-        if dbg.state() ~= "stopped" then
-            ceasta.log("target is no longer stopped, ending trace")
+        if not ok then
+            ceasta.log(err and ("step failed: " .. tostring(err)) or "target is no longer stopped, ending trace")
             break
         end
     end
+    tracing = false
     ceasta.log(("traced %d step(s), %d call(s)"):format(steps, calls))
 end
 
@@ -49,5 +56,7 @@ ceasta.register_command("Trace calls (debugger)", trace,
 
 -- example event hook: announce each stop with the current location
 ceasta.on("stop", function(pc)
-    ceasta.log("debugger stopped at " .. ceasta.location(pc))
+    if not tracing then
+        ceasta.log("debugger stopped at " .. ceasta.location(pc))
+    end
 end)

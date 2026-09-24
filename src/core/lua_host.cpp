@@ -528,10 +528,61 @@ int dbg_action(lua_State* L, bool (debugger::*fn)(std::string&))
     return 1;
 }
 
+// pumps debug events until the target stops (or exits / the time runs out)
+bool wait_stopped(debugger* d, uint32_t ms)
+{
+    uint64_t until = os::now_ms() + ms;
+    while (d->state() == dbg_state::running && os::now_ms() < until)
+        d->poll(20);
+    return d->state() == dbg_state::stopped;
+}
+
+// steps finish in milliseconds, so they wait: a script can read pc / registers right after
+int dbg_step(lua_State* L, bool (debugger::*fn)(std::string&))
+{
+    debugger* d = need_dbg(L);
+    std::string err;
+    if (!(d->*fn)(err)) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, wait_stopped(d, 5000));
+    return 1;
+}
+
 int dbg_cont(lua_State* L) { return dbg_action(L, &debugger::cont); }
-int dbg_step_into(lua_State* L) { return dbg_action(L, &debugger::step_into); }
-int dbg_step_over(lua_State* L) { return dbg_action(L, &debugger::step_over); }
+int dbg_step_into(lua_State* L) { return dbg_step(L, &debugger::step_into); }
+int dbg_step_over(lua_State* L) { return dbg_step(L, &debugger::step_over); }
 int dbg_pause(lua_State* L) { return dbg_action(L, &debugger::pause); }
+
+// runtime <-> listing addresses (they differ when the program was relocated by aslr)
+int dbg_to_static(lua_State* L)
+{
+    lua_host* h = host_of(L);
+    uint64_t a = check_addr(L, 1), out = 0;
+    if (h->bridge().to_static && h->bridge().to_static(a, out))
+        push_addr(L, out);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
+int dbg_to_runtime(lua_State* L)
+{
+    lua_host* h = host_of(L);
+    uint64_t a = check_addr(L, 1);
+    push_addr(L, h->bridge().to_runtime ? h->bridge().to_runtime(a) : a);
+    return 1;
+}
+
+int dbg_wait(lua_State* L)
+{
+    debugger* d = need_dbg(L);
+    lua_Integer ms = luaL_optinteger(L, 1, 10000);
+    wait_stopped(d, (uint32_t)std::max<lua_Integer>(0, std::min<lua_Integer>(ms, 60000)));
+    return dbg_state_fn(L);
+}
 
 int dbg_add_bp(lua_State* L)
 {
@@ -604,6 +655,7 @@ static const luaL_Reg dbg_funcs[] = {
     {"state", dbg_state_fn}, {"pc", dbg_pc}, {"reg", dbg_reg}, {"regs", dbg_regs},
     {"read", dbg_read}, {"write", dbg_write},
     {"cont", dbg_cont}, {"step_into", dbg_step_into}, {"step_over", dbg_step_over}, {"pause", dbg_pause},
+    {"wait", dbg_wait}, {"to_static", dbg_to_static}, {"to_runtime", dbg_to_runtime},
     {"add_bp", dbg_add_bp}, {"del_bp", dbg_del_bp},
     {nullptr, nullptr},
 };

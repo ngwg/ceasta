@@ -61,7 +61,10 @@ ceasta.on("load", function() ceasta.log("analysis finished") end)
 
 - `state()` → `"none" | "running" | "stopped"` · `pc()`
 - `reg(name)` · `regs()` → table · `read(addr, n)` · `write(addr, bytes)` → ok[,err]
-- `cont()` · `step_into()` · `step_over()` · `pause()` · `add_bp(addr)` · `del_bp(addr)`
+- `step_into()` · `step_over()` — wait until the target stops again, return true when it did
+- `cont()` · `pause()` — return right away, `wait([ms])` waits for the next stop and returns the state
+- `add_bp(addr)` · `del_bp(addr)` — runtime addresses
+- `to_static(addr)` → listing address or nil · `to_runtime(addr)` — they differ when aslr moved the program
 
 Plugins run on the UI thread with a time limit (30 s by default) so a runaway
 loop can't freeze the program.
