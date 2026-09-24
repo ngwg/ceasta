@@ -1,0 +1,67 @@
+# ceasta plugins
+
+Plugins are plain [Lua](https://www.lua.org/) scripts. ceasta loads every `.lua`
+file in this folder at startup and again whenever you pick **Plugins → Reload**.
+It also loads plugins from your user folder, so you can add your own without
+touching the install:
+
+- next to the program: `<install>/plugins/`
+- per user: `%APPDATA%\ceasta\plugins\` (Windows), `~/.config/ceasta/plugins/` (Linux)
+
+A plugin usually registers one or more commands. Each command shows up in the
+**Plugins** menu and can be run from the command palette. You can also type Lua
+straight into the **Console** tab at the bottom.
+
+## The files here
+
+| file | what it does |
+|------|--------------|
+| `hello.lua` | one command that prints a file summary — copy it to start your own |
+| `find_crypto.lua` | flags and renames functions that look like crypto / hashing |
+| `name_wrappers.lua` | renames one-call wrapper functions to `w_<callee>` |
+| `strings_report.lua` | groups urls / paths / registry keys / format strings |
+| `trace_calls.lua` | debugger plugin: single-steps a stopped target and logs calls |
+
+## Writing a plugin
+
+```lua
+-- addr arguments accept a number, a hex string ("0x401000"), or a name ("main").
+-- addresses come back as integers.
+ceasta.register_command("My command", function()
+    local f = ceasta.file()                 -- { name, format, arch, kind, base, entry, bits, has_entry }
+    ceasta.log("loaded " .. f.name)
+    for _, fn in ipairs(ceasta.functions()) do   -- { addr, size, name, thunk }
+        if fn.size > 0x400 then
+            ceasta.set_comment(fn.addr, "big function")
+        end
+    end
+end, "optional help text")
+
+-- react to app events: "load", "stop" (arg = pc), "exit" (arg = code)
+ceasta.on("load", function() ceasta.log("analysis finished") end)
+```
+
+## API reference
+
+`ceasta.*`
+
+- `log(...)`, `warn(msg)` — write to the output log (`print` also works)
+- `file()` — table describing the loaded binary
+- `read(addr, n)` → string · `read_u8/16/32/64(addr)` · `read_i32(addr)` · `read_ptr(addr)` · `read_cstr(addr [,max])`
+- `is_mapped(addr)` · `is_code(addr)`
+- `name(addr)` · `location(addr)` · `set_name(addr, name)` → ok[,err] · `resolve(text)` → addr|nil
+- `comment(addr)` · `set_comment(addr, text)`
+- `disasm(addr)` → `{ addr, size, mnemonic, operands, text, flow, target? }` · `next_addr(addr)`
+- `functions()` · `imports()` · `exports()` · `strings()` · `xrefs_to(addr)` — arrays of tables
+- `find(pattern [,from [,max]])` — byte search like `"48 8b ?? 05"`, returns addresses
+- `here()` · `goto_addr(addr)` — the cursor in the disassembly view
+- `register_command(name, fn [,help])` · `on(event, fn)`
+
+`ceasta.dbg.*` (Windows build, while debugging)
+
+- `state()` → `"none" | "running" | "stopped"` · `pc()`
+- `reg(name)` · `regs()` → table · `read(addr, n)` · `write(addr, bytes)` → ok[,err]
+- `cont()` · `step_into()` · `step_over()` · `pause()` · `add_bp(addr)` · `del_bp(addr)`
+
+Plugins run on the UI thread with a time limit (30 s by default) so a runaway
+loop can't freeze the program.
