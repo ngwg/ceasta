@@ -461,6 +461,25 @@ int dbg_pc(lua_State* L)
     return 1;
 }
 
+int dbg_sp(lua_State* L)
+{
+    push_addr(L, need_dbg(L)->sp());
+    return 1;
+}
+
+// pointer sized read from the live process (4 bytes for 32 bit targets)
+int dbg_read_ptr(lua_State* L)
+{
+    debugger* d = need_dbg(L);
+    uint64_t a = check_addr(L, 1), v = 0;
+    size_t n = d->is64() ? 8 : 4;
+    if (d->read(a, &v, n) != n)
+        lua_pushnil(L);
+    else
+        push_addr(L, v);
+    return 1;
+}
+
 int dbg_reg(lua_State* L)
 {
     debugger* d = need_dbg(L);
@@ -576,6 +595,20 @@ int dbg_to_runtime(lua_State* L)
     return 1;
 }
 
+int dbg_run_to(lua_State* L)
+{
+    debugger* d = need_dbg(L);
+    uint64_t a = check_addr(L, 1);
+    std::string err;
+    if (!d->run_to(a, err)) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, wait_stopped(d, 10000));
+    return 1;
+}
+
 int dbg_wait(lua_State* L)
 {
     debugger* d = need_dbg(L);
@@ -652,7 +685,8 @@ static const luaL_Reg api_funcs[] = {
 };
 
 static const luaL_Reg dbg_funcs[] = {
-    {"state", dbg_state_fn}, {"pc", dbg_pc}, {"reg", dbg_reg}, {"regs", dbg_regs},
+    {"state", dbg_state_fn}, {"pc", dbg_pc}, {"sp", dbg_sp}, {"reg", dbg_reg}, {"regs", dbg_regs},
+    {"read_ptr", dbg_read_ptr}, {"run_to", dbg_run_to},
     {"read", dbg_read}, {"write", dbg_write},
     {"cont", dbg_cont}, {"step_into", dbg_step_into}, {"step_over", dbg_step_over}, {"pause", dbg_pause},
     {"wait", dbg_wait}, {"to_static", dbg_to_static}, {"to_runtime", dbg_to_runtime},

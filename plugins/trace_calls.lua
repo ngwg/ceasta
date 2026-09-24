@@ -28,9 +28,19 @@ local function trace()
     while steps < MAX_STEPS do
         -- pc is a runtime address, the listing may sit elsewhere when aslr moved the image
         local pc = dbg.to_static(dbg.pc())
+        if not pc then
+            -- a tail jump into a dll: the return address into our code is on top of the stack
+            local ret = dbg.read_ptr(dbg.sp())
+            if not (ret and dbg.to_static(ret) and dbg.run_to(ret)) then
+                ceasta.log("left the program's own code, ending trace")
+                break
+            end
+            depth = math.max(0, depth - 1)
+            pc = dbg.to_static(dbg.pc())
+        end
         local ins = pc and ceasta.disasm(pc)
         if not ins then
-            ceasta.log("left the program's own code, ending trace")
+            ceasta.log("can't decode at " .. tostring(pc) .. ", ending trace")
             break
         end
         local step = dbg.step_into

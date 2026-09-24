@@ -59,9 +59,9 @@ ceasta.on("load", function() ceasta.log("analysis finished") end)
 
 `ceasta.dbg.*` (Windows build, while debugging)
 
-- `state()` → `"none" | "running" | "stopped"` · `pc()`
-- `reg(name)` · `regs()` → table · `read(addr, n)` · `write(addr, bytes)` → ok[,err]
-- `step_into()` · `step_over()` — wait until the target stops again, return true when it did
+- `state()` → `"none" | "running" | "stopped"` · `pc()` · `sp()`
+- `reg(name)` · `regs()` → table · `read(addr, n)` · `read_ptr(addr)` · `write(addr, bytes)` → ok[,err]
+- `step_into()` · `step_over()` · `run_to(addr)` — wait until the target stops again, return true when it did
 - `cont()` · `pause()` — return right away, `wait([ms])` waits for the next stop and returns the state
 - `add_bp(addr)` · `del_bp(addr)` — runtime addresses
 - `to_static(addr)` → listing address or nil · `to_runtime(addr)` — they differ when aslr moved the program
