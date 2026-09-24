@@ -1,5 +1,6 @@
 #include "core/lua_host.h"
 #include "core/database.h"
+#include "core/dbg_trace.h"
 #include "core/debugger.h"
 #include "core/decompiler.h"
 #include "core/os.h"
@@ -619,6 +620,71 @@ int dbg_run_to(lua_State* L)
     return 1;
 }
 
+// ceasta.dbg.trace(n) -> number of new indirect targets recorded as xrefs
+int dbg_trace_fn(lua_State* L)
+{
+    debugger* d = need_dbg(L);
+    lua_host* h = host_of(L);
+    database* db = h ? h->bridge().db : nullptr;
+    int max = (int)luaL_optinteger(L, 1, 2000);
+    int found = 0;
+    std::string err;
+    dbg_trace(*d, max, [&](uint64_t from, uint64_t to, bool is_call) {
+        uint64_t sf, st;
+        if (db && h->bridge().to_static && h->bridge().to_static(from, sf) && h->bridge().to_static(to, st) &&
+            db->add_xref(sf, st, is_call ? xref_type::call : xref_type::jump))
+            found++;
+    }, err);
+    lua_pushinteger(L, found);
+    return 1;
+}
+
+// ceasta.dbg.call(func, arg1, arg2, ...) -> result. a string argument that isn't a name or
+// hex address is written into the target and its pointer is passed. 64-bit targets only.
+int dbg_call(lua_State* L)
+{
+    debugger* d = need_dbg(L);
+    lua_host* h = host_of(L);
+    // check_addr gives static (listing) addresses; the live call needs runtime ones
+    auto runtime = [&](uint64_t st) {
+        if (h && h->bridge().db && h->bridge().db->bin.is_mapped(st) && h->bridge().to_runtime)
+            return h->bridge().to_runtime(st);
+        return st;
+    };
+    uint64_t func = runtime(check_addr(L, 1));
+    uint64_t scratch = d->sp() - 0x8000;
+    std::vector<uint64_t> args;
+    int n = lua_gettop(L);
+    for (int i = 2; i <= n; i++) {
+        if (lua_type(L, i) == LUA_TSTRING) {
+            uint64_t v;
+            std::string s = lua_tostring(L, i);
+            if (h && h->bridge().db && h->bridge().db->resolve(s, v)) {
+                args.push_back(runtime(v));
+            } else if (util::parse_hex(s, v)) {
+                args.push_back(v);
+            } else {
+                size_t need = (s.size() + 1 + 15) & ~size_t(15);
+                scratch -= need;
+                std::string err;
+                d->write(scratch, s.c_str(), s.size() + 1, err);
+                args.push_back(scratch);
+            }
+        } else {
+            args.push_back((uint64_t)(int64_t)luaL_checknumber(L, i));
+        }
+    }
+    uint64_t result = 0;
+    std::string err;
+    if (!d->call(func, args, result, err)) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    push_addr(L, result);
+    return 1;
+}
+
 int dbg_wait(lua_State* L)
 {
     debugger* d = need_dbg(L);
@@ -697,7 +763,7 @@ static const luaL_Reg api_funcs[] = {
 static const luaL_Reg dbg_funcs[] = {
     {"state", dbg_state_fn}, {"pc", dbg_pc}, {"sp", dbg_sp}, {"reg", dbg_reg}, {"regs", dbg_regs},
     {"read_ptr", dbg_read_ptr}, {"run_to", dbg_run_to},
-    {"read", dbg_read}, {"write", dbg_write},
+    {"read", dbg_read}, {"write", dbg_write}, {"call", dbg_call}, {"trace", dbg_trace_fn},
     {"cont", dbg_cont}, {"step_into", dbg_step_into}, {"step_over", dbg_step_over}, {"pause", dbg_pause},
     {"wait", dbg_wait}, {"to_static", dbg_to_static}, {"to_runtime", dbg_to_runtime},
     {"add_bp", dbg_add_bp}, {"del_bp", dbg_del_bp},

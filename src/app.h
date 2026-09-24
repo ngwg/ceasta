@@ -125,6 +125,7 @@ void app_open(app_state& s, const std::string& path, const load_options& opts = 
 void app_open_dialog(app_state& s);
 void app_close_file(app_state& s);
 void app_save(app_state& s);
+void app_save_project(app_state& s);
 bool app_loading(const app_state& s);
 
 void app_jump(app_state& s, uint64_t addr, bool remember = true);

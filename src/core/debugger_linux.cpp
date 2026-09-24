@@ -864,6 +864,121 @@ bool debugger::write(uint64_t addr, const void* in, size_t n, std::string& err)
     return true;
 }
 
+bool debugger::call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err)
+{
+    if (d->state != dbg_state::stopped) {
+        err = "the process isn't stopped";
+        return false;
+    }
+    if (d->m32) {
+        err = "calling a function is 64-bit only for now";
+        return false;
+    }
+    thread_ctx saved;
+    if (!d->get_ctx(d->cur_tid, saved)) {
+        err = "can't read the registers";
+        return false;
+    }
+    // a place to trap when the call returns: the entry point is mapped and executable. we only
+    // trap on it, never run it, so reusing it is fine.
+    uint64_t trap = d->entry ? d->entry : func;
+    if (trap == func)
+        trap = func + 1;
+
+    // run the callee against clean code: lift our int3s (and the entry temp) for the call
+    for (const auto& b : d->bps)
+        d->raw_write(b.first, &b.second, 1);
+    bool had_temp = d->temp_active;
+    if (had_temp)
+        d->raw_write(d->temp_bp, &d->temp_orig, 1);
+    uint8_t trap_orig = 0;
+    if (d->raw_read(trap, &trap_orig, 1) != 1) {
+        err = "can't read the return trap address";
+        for (const auto& b : d->bps)
+            d->write_cc(b.first);
+        return false;
+    }
+
+    thread_ctx c = saved;
+    for (size_t i = 0; i < args.size() && i < 6; i++) {
+        switch (i) {
+        case 0: c.r64.rdi = args[i]; break;
+        case 1: c.r64.rsi = args[i]; break;
+        case 2: c.r64.rdx = args[i]; break;
+        case 3: c.r64.rcx = args[i]; break;
+        case 4: c.r64.r8 = args[i]; break;
+        case 5: c.r64.r9 = args[i]; break;
+        }
+    }
+    size_t stack_args = args.size() > 6 ? args.size() - 6 : 0;
+    uint64_t sp = saved.sp() - 256;                 // clear the red zone
+    sp = (sp - (8 + stack_args * 8)) & ~15ULL;      // 16-align the block base
+    if (sp % 16 == 0)
+        sp -= 8;                                    // so rsp % 16 == 8 at the callee's entry
+    d->raw_write(sp, &trap, 8);
+    for (size_t i = 0; i < stack_args; i++)
+        d->raw_write(sp + 8 + i * 8, &args[6 + i], 8);
+    c.r64.rsp = sp;
+    c.set_pc(func);
+
+    uint8_t cc = 0xCC;
+    d->raw_write(trap, &cc, 1);
+    bool ok = false;
+    std::string why;
+    if (!d->set_ctx(d->cur_tid, c)) {
+        why = "can't set the registers";
+    } else {
+        for (int i = 0; i < 2000000; i++) {
+            if (ptrace(PTRACE_CONT, d->cur_tid, nullptr, nullptr) != 0) {
+                why = "continue failed: " + errno_str(errno);
+                break;
+            }
+            int status = 0;
+            if (waitpid(d->cur_tid, &status, __WALL) < 0) {
+                why = "wait failed";
+                break;
+            }
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                d->state = dbg_state::none;
+                why = "the program exited during the call";
+                break;
+            }
+            if (!WIFSTOPPED(status))
+                continue;
+            int sig = WSTOPSIG(status);
+            if (sig == SIGTRAP) {
+                thread_ctx cc2;
+                d->get_ctx(d->cur_tid, cc2);
+                uint64_t pc = cc2.pc();
+                if (pc == trap || pc == trap + 1) {
+                    result = cc2.r64.rax;
+                    ok = true;
+                    break;
+                }
+                why = "hit a breakpoint at " + util::hex(pc ? pc - 1 : 0) + " inside the call";
+                break;
+            }
+            why = util::fmt("the called function got signal %d", sig);
+            break;
+        }
+    }
+
+    // put everything back: the trap byte, our breakpoints, the saved registers
+    if (d->state != dbg_state::none) {
+        d->raw_write(trap, &trap_orig, 1);
+        for (const auto& b : d->bps)
+            d->write_cc(b.first);
+        if (had_temp)
+            d->write_cc(d->temp_bp);
+        d->set_ctx(d->cur_tid, saved);
+    }
+    if (!ok) {
+        err = why.empty() ? "the call didn't return" : why;
+        return false;
+    }
+    return true;
+}
+
 bool debugger::is64() const { return !d->m32; }
 uint64_t debugger::image_base() const { return d->image_base; }
 uint32_t debugger::pid() const { return (uint32_t)d->pid; }

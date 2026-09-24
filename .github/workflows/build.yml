@@ -43,6 +43,19 @@ jobs:
           name: ceasta-linux
           path: dist/*.tar.gz
 
+  linux-gui:
+    name: linux - experimental gui (compile + link)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install glfw + opengl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libglfw3-dev libgl1-mesa-dev
+      - name: build the gui
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCEASTA_LINUX_GUI=ON
+          cmake --build build --target ceasta --parallel
+          test -x build/ceasta && echo "the linux gui built and linked"
+
   windows:
     name: windows - msvc, installer
     runs-on: windows-2022
@@ -116,7 +129,7 @@ jobs:
 
           - **ceasta-$version-setup.exe** - installer for windows 10/11 x64. installs for your user without admin rights, adds a start menu entry and (optionally) "open with ceasta" to the right-click menu.
           - **ceasta-$version-windows-x64.zip** - portable, unzip and run \`ceasta.exe\`.
-          - **ceasta-cli-$version-linux-x64.tar.gz** - the command line tool for linux: analysis, disassembly, the decompiler, lua scripting and a terminal debugger (\`ceasta-cli dbg\`). no gui on linux.
+          - **ceasta-cli-$version-linux-x64.tar.gz** - the command line tool for linux: analysis, disassembly, the decompiler, a terminal debugger (\`ceasta-cli dbg\`), binary diff, library signatures, lua scripting, and the mcp server (\`ceasta-cli mcp\`) for connecting an ai. no gui on linux.
 
           checksums are in SHA256SUMS.txt.
           EOF

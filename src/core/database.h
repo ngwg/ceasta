@@ -58,7 +58,13 @@ public:
     std::map<uint64_t, std::string> user_names;
     std::map<uint64_t, std::string> user_comments;
     std::set<uint64_t> breakpoints; // static addresses
+    std::vector<xref> extra_xrefs;  // learned at runtime (indirect call / jump targets)
     uint32_t crc = 0;
+
+    // record a cross-reference the static analysis couldn't see (an indirect branch resolved
+    // while debugging). merges into refs_to / refs_from and the listing. returns false if it
+    // already existed or an address isn't in the file.
+    bool add_xref(uint64_t from, uint64_t to, xref_type type);
 
     // call once after bin + an are filled
     void build();
@@ -86,7 +92,11 @@ public:
     std::vector<uint64_t> find_bytes(const std::string& pattern, uint64_t from, size_t max_results) const;
 
     std::string db_path() const;
-    bool save(std::string& err) const;
+    std::string project_path() const;              // "<binary>.ceasta", next to the file
+    std::string serialize() const;                 // the annotations file text (sorted, diffable)
+    bool save(std::string& err) const;             // private copy, and the project file if it exists
+    bool save_project(std::string& err) const;     // write the project file next to the binary
+    bool write_annotations(const std::string& path, std::string& err) const;
     bool load_annotations(std::string& err);
     bool dirty = false; // unsaved user changes
 

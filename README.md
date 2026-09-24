@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/c%2B%2B-17-00599C" alt="c++17">
 </p>
 
-ida-style listing, a decompiler, a function graph, an x64dbg-style debugger, and lua plugins — one small program, everything vendored, nothing to install to build.
+ida-style listing, a decompiler, a function graph, an x64dbg-style debugger, lua plugins, and a built-in MCP server so you can point an AI at a binary — one small program, everything vendored, nothing to install to build.
 
 ![listing](docs/listing.png)
 
@@ -64,8 +64,13 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 - debugger: start or attach, breakpoints, step into / over, run to cursor, pause, registers, stack, live memory
   - **windows**: full gui debugger + terminal, win32 debug api, 32-bit via wow64
   - **linux**: a terminal debugger on ptrace (`ceasta-cli dbg`) — breakpoints, stepping, registers, memory. basic but real; best on single-threaded targets
+- decompiler while debugging: stopped in a function, the pseudocode marks the current line
+- call a function in the running program (`call decrypt "..."`), record indirect call targets as xrefs (`trace`)
+- binary diff: match functions between two builds and see what changed
+- library signatures: name known functions in a stripped binary (`sigmake` / `sigapply`)
+- a built-in MCP server: connect an AI (Claude Code, Cursor, ...) to the open binary — see [connect an AI](docs/mcp.md)
 - rename, comments, jump to address or name, xrefs, byte search, back / forward
-- names, comments and breakpoints are saved per file
+- names, comments and breakpoints save per file, and to a committable `<binary>.ceasta` next to it
 - lua plugins and a lua console; `ceasta-cli` for scripts and ci
 
 ## layout
@@ -126,7 +131,24 @@ ceasta-cli xrefs file.exe CreateFileW
 ceasta-cli find file.exe "48 8b ?? 05"
 ceasta-cli run file.exe script.lua  run a plugin / script
 ceasta-cli dbg ./program [args]     interactive debugger (linux + windows)
+ceasta-cli diff old.exe new.exe     match functions, show what changed
+ceasta-cli sigmake libc.a lib.sig   make signatures from a file with symbols
+ceasta-cli sigapply stripped lib.sig  name matching functions
+ceasta-cli mcp file.exe             serve the file to an AI over MCP
 ```
+
+## connect an AI
+
+point an AI (Claude Code, Claude Desktop, Cursor, ...) at the binary through ceasta's built-in
+MCP server:
+
+```
+claude mcp add ceasta -- ceasta-cli mcp /path/to/target.exe
+```
+
+it can decompile, read xrefs, rename functions, diff builds, and — with `--allow-debug` — set
+breakpoints, step, read memory and even call a function in the running program. the full guide,
+including the debugger tools and the safety notes, is in [connect an AI](docs/mcp.md).
 
 ## on linux
 

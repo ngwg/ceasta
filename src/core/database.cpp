@@ -655,8 +655,46 @@ std::string database::db_path() const
     return os::join(os::join(os::user_dir(), "db"), safe + "-" + util::fmt("%08X", crc) + ".ceasta");
 }
 
-bool database::save(std::string& err) const
+// a committable project file that sits next to the binary. when it exists, ceasta reads it and
+// writes to it, so a team (or an ai) can keep names and comments in version control.
+std::string database::project_path() const { return bin.path + ".ceasta"; }
+
+bool database::add_xref(uint64_t from, uint64_t to, xref_type type)
 {
+    if (!bin.is_mapped(from) || !bin.is_mapped(to))
+        return false;
+    xref x{from, to, type};
+    // keep an.xto sorted by (to, from, type)
+    auto to_less = [](const xref& a, const xref& b) {
+        if (a.to != b.to)
+            return a.to < b.to;
+        if (a.from != b.from)
+            return a.from < b.from;
+        return a.type < b.type;
+    };
+    auto it = std::lower_bound(an.xto.begin(), an.xto.end(), x, to_less);
+    if (it != an.xto.end() && it->to == to && it->from == from && it->type == type)
+        return false; // already known
+    an.xto.insert(it, x);
+    // keep an.xfrom sorted by (from, to)
+    auto from_less = [](const xref& a, const xref& b) {
+        return a.from != b.from ? a.from < b.from : a.to < b.to;
+    };
+    an.xfrom.insert(std::lower_bound(an.xfrom.begin(), an.xfrom.end(), x, from_less), x);
+    uint8_t f = an.flags_at(to);
+    bool tail = (f & fl_tail) && !(f & (fl_code | fl_str | fl_data));
+    if (!tail && !(f & (fl_func | fl_label)))
+        an.add_flags(to, fl_label);
+    extra_xrefs.push_back(x);
+    rows_dirty_ = true;
+    dirty = true;
+    return true;
+}
+
+std::string database::serialize() const
+{
+    // sorted (user_names / user_comments are std::map, breakpoints std::set), so the file is
+    // stable line by line and diffs cleanly
     std::string s = "ceasta 1\nfile " + bin.name + "\n";
     for (const auto& n : user_names)
         s += "name " + util::hex(n.first) + " " + n.second + "\n";
@@ -664,16 +702,39 @@ bool database::save(std::string& err) const
         s += "comment " + util::hex(c.first) + " " + escape_line(c.second) + "\n";
     for (uint64_t b : breakpoints)
         s += "bp " + util::hex(b) + "\n";
-    std::string path = db_path();
+    for (const xref& x : extra_xrefs)
+        s += "xref " + util::hex(x.from) + " " + util::hex(x.to) + " " + std::to_string((int)x.type) + "\n";
+    return s;
+}
+
+bool database::write_annotations(const std::string& path, std::string& err) const
+{
+    std::string s = serialize();
     size_t slash = path.find_last_of("/\\");
     if (slash != std::string::npos)
         os::make_dirs(path.substr(0, slash));
     return os::write_file(path, s, err);
 }
 
+bool database::save(std::string& err) const
+{
+    // keep the private copy in the user dir up to date, and, if the user has started a project
+    // file next to the binary, update that too
+    bool ok = write_annotations(db_path(), err);
+    if (os::exists(project_path())) {
+        std::string e;
+        ok = write_annotations(project_path(), e) && ok;
+    }
+    return ok;
+}
+
+bool database::save_project(std::string& err) const { return write_annotations(project_path(), err); }
+
 bool database::load_annotations(std::string& err)
 {
-    std::string path = db_path();
+    // the project file next to the binary wins over the private copy, so a committed file is
+    // what a fresh checkout sees
+    std::string path = os::exists(project_path()) ? project_path() : db_path();
     if (!os::exists(path))
         return true;
     std::vector<uint8_t> bytes;
@@ -711,6 +772,17 @@ bool database::load_annotations(std::string& err)
             set_comment(a, unescape_line(rest));
         else if (kind == "bp" && bin.is_mapped(a))
             breakpoints.insert(a);
+        else if (kind == "xref") {
+            // "xref <from> <to> <kind>": a runtime-learned cross reference
+            uint64_t to = 0;
+            int k = 0;
+            size_t sp3 = rest.find(' ');
+            if (sp3 != std::string::npos && util::parse_hex(rest.substr(0, sp3), to)) {
+                k = atoi(rest.c_str() + sp3 + 1);
+                if (k >= 0 && k <= (int)xref_type::offset)
+                    add_xref(a, to, (xref_type)k);
+            }
+        }
     }
     dirty = false;
     return true;

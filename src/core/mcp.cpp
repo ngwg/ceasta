@@ -1,0 +1,1559 @@
+#include "core/mcp.h"
+
+#include "core/database.h"
+#include "core/debugger.h"
+#include "core/dbg_trace.h"
+#include "core/decompiler.h"
+#include "core/diff.h"
+#include "core/lua_host.h"
+#include "core/os.h"
+#include "core/util.h"
+#include "version.h"
+
+#include <algorithm>
+#include <exception>
+
+namespace {
+
+std::string hexa(uint64_t v) { return "0x" + util::hex_lower(v); }
+
+// ------------------------------------------------------------------ argument helpers
+
+json::value schema(std::initializer_list<std::pair<const char*, json::value>> props,
+                   std::initializer_list<const char*> required = {})
+{
+    json::value s = json::value::make_object();
+    s["type"] = "object";
+    json::value& p = s["properties"];
+    p = json::value::make_object();
+    for (const auto& kv : props)
+        p[kv.first] = kv.second;
+    if (required.size()) {
+        json::value& r = s["required"];
+        for (const char* k : required)
+            r.push(k);
+    }
+    return s;
+}
+
+json::value prop(const char* type, const char* description)
+{
+    json::value v = json::value::make_object();
+    v["type"] = type;
+    v["description"] = description;
+    return v;
+}
+
+// an address argument: hex ("0x401000"), a name ("main"), name+offset ("main+0x10") or a number
+bool arg_addr(database& db, const json::value& args, const char* key, uint64_t& out, std::string& err)
+{
+    const json::value* v = args.get(key);
+    if (!v || v->is_null()) {
+        err = std::string("missing argument: ") + key;
+        return false;
+    }
+    if (v->is_number()) {
+        out = (uint64_t)v->n;
+        return true;
+    }
+    std::string t = util::trim(v->str());
+    if (t.empty()) {
+        err = std::string("empty argument: ") + key;
+        return false;
+    }
+    if (db.resolve(t, out))
+        return true;
+    size_t plus = t.find('+');
+    uint64_t base = 0, off = 0;
+    if (plus != std::string::npos && db.resolve(util::trim(t.substr(0, plus)), base) &&
+        util::parse_hex(util::trim(t.substr(plus + 1)), off)) {
+        out = base + off;
+        return true;
+    }
+    err = "unknown address or name: " + t;
+    return false;
+}
+
+int arg_int(const json::value& args, const char* key, int fallback, int lo, int hi)
+{
+    const json::value* v = args.get(key);
+    long long n = fallback;
+    if (v && v->is_number())
+        n = (long long)v->n;
+    else if (v && v->is_string() && !v->s.empty())
+        n = strtoll(v->s.c_str(), nullptr, 0);
+    return (int)std::max<long long>(lo, std::min<long long>(hi, n));
+}
+
+std::string arg_str(const json::value& args, const char* key)
+{
+    const json::value* v = args.get(key);
+    return v ? v->str() : std::string();
+}
+
+bool arg_bool(const json::value& args, const char* key, bool fallback)
+{
+    const json::value* v = args.get(key);
+    if (!v)
+        return fallback;
+    if (v->is_bool())
+        return v->b;
+    if (v->is_string())
+        return v->s == "true" || v->s == "1" || v->s == "yes";
+    return fallback;
+}
+
+// ------------------------------------------------------------------ text helpers
+
+const size_t max_output = 120 * 1024;
+
+void cap(std::string& out)
+{
+    if (out.size() > max_output) {
+        size_t cut = out.rfind('\n', max_output);
+        out.resize(cut == std::string::npos ? max_output : cut);
+        out += "\n... (output cut at " + std::to_string(max_output / 1024) + " KB, ask for less)";
+    }
+}
+
+std::string listing_line(database& db, const row& r)
+{
+    line_text t;
+    db.format(r, t);
+    if (r.kind == row_kind::blank)
+        return std::string();
+    std::string s = util::fmt("%-22s %s", t.addr.c_str(), t.text.c_str());
+    std::string c = t.comment.empty() ? t.auto_comment
+                                      : (t.auto_comment.empty() ? t.comment : t.comment + " | " + t.auto_comment);
+    if (!c.empty())
+        s += "  ; " + c;
+    while (!s.empty() && s.back() == ' ')
+        s.pop_back();
+    return s;
+}
+
+std::string byte_view(uint64_t addr, const uint8_t* p, size_t n)
+{
+    std::string out;
+    for (size_t i = 0; i < n; i += 16) {
+        out += util::fmt("%016llx  ", (unsigned long long)(addr + i));
+        for (size_t k = 0; k < 16; k++)
+            out += i + k < n ? util::fmt("%02x ", p[i + k]) : std::string("   ");
+        out += " ";
+        for (size_t k = 0; k < 16 && i + k < n; k++)
+            out += p[i + k] >= 0x20 && p[i + k] < 0x7F ? (char)p[i + k] : '.';
+        out += "\n";
+    }
+    return out;
+}
+
+// paging for the list tools
+struct page {
+    int offset = 0, limit = 0;
+    size_t total = 0, shown = 0;
+    std::string body;
+    void add(size_t index, const std::string& line)
+    {
+        total = index + 1;
+        if ((int)index >= offset && (int)index < offset + limit) {
+            body += line + "\n";
+            shown++;
+        }
+    }
+    std::string finish(const std::string& what) const
+    {
+        std::string head = shown ? util::fmt("%s %d-%d of %zu\n", what.c_str(), offset + 1, offset + (int)shown, total)
+                                 : util::fmt("%s: none%s (%zu in total)\n", what.c_str(),
+                                             offset ? " at this offset" : "", total);
+        std::string tail;
+        if ((size_t)(offset + (int)shown) < total)
+            tail = util::fmt("... %zu more, pass offset %d\n", total - (size_t)(offset + (int)shown), offset + (int)shown);
+        return head + body + tail;
+    }
+};
+
+page make_page(const json::value& args, int def_limit)
+{
+    page p;
+    p.offset = arg_int(args, "offset", 0, 0, 1 << 30);
+    p.limit = arg_int(args, "limit", def_limit, 1, 2000);
+    return p;
+}
+
+const char* const xref_kinds[] = {"call", "jump", "read", "write", "offset"};
+
+database* need_db(mcp_server& s, std::string& out)
+{
+    database* db = s.get_db ? s.get_db() : nullptr;
+    if (!db)
+        out = "no file is open in ceasta";
+    return db;
+}
+
+} // namespace
+
+// ------------------------------------------------------------------ read-only tools
+
+namespace {
+
+using tool = mcp_server::tool;
+
+void add_read_tools(std::vector<tool>& t)
+{
+    auto add = [&](const char* name, const char* desc, json::value sch, tool::run_t fn) {
+        tool x;
+        x.name = name;
+        x.description = desc;
+        x.schema = std::move(sch);
+        x.run = std::move(fn);
+        t.push_back(std::move(x));
+    };
+
+    add("get_binary_info",
+        "Overview of the loaded file: format, architecture, entry point, base address, segments, imported "
+        "libraries, and how many functions, imports, exports and strings the analysis found. A good first call.",
+        schema({}), [](mcp_server& s, const json::value&, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            const binary& b = db->bin;
+            out += "file      " + b.path + "\n";
+            out += util::fmt("format    %s %s (%s)\n", format_name(b.format), arch_name(b.arch), b.kind.c_str());
+            out += "base      " + hexa(b.base) + "\n";
+            out += "entry     " + (b.has_entry ? hexa(b.entry) + " " + db->name_at(b.entry) : std::string("none")) + "\n";
+            out += util::fmt("counts    %zu functions, %zu imports, %zu exports, %zu strings\n", db->an.funcs.size(),
+                             b.imports.size(), b.exports.size(), db->an.strings.size());
+            if (!b.libs.empty()) {
+                out += "libraries";
+                for (const std::string& l : b.libs)
+                    out += " " + l;
+                out += "\n";
+            }
+            out += "segments\n";
+            for (const segment& sg : b.segments)
+                out += util::fmt("  %-12s %s - %s  %c%c%c\n", sg.name.c_str(), hexa(sg.start).c_str(),
+                                 hexa(sg.end).c_str(), (sg.perms & perm_r) ? 'r' : '-', (sg.perms & perm_w) ? 'w' : '-',
+                                 (sg.perms & perm_x) ? 'x' : '-');
+            for (const std::string& n : b.notes)
+                out += "note: " + n + "\n";
+            return true;
+        });
+
+    add("list_functions",
+        "Functions found by the analysis: address, size and name, sorted by address. Names like sub_401000 are "
+        "not yet named. Use filter for a case-insensitive name search and offset/limit to page.",
+        schema({{"filter", prop("string", "only names containing this")},
+                {"offset", prop("integer", "skip this many matches (paging)")},
+                {"limit", prop("integer", "at most this many (default 200)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::string filter = arg_str(args, "filter");
+            page p = make_page(args, 200);
+            size_t i = 0;
+            for (const function& f : db->an.funcs) {
+                std::string name = db->name_at(f.start);
+                if (!util::icontains(name, filter))
+                    continue;
+                p.add(i++, util::fmt("%s  size 0x%llx  %s%s", hexa(f.start).c_str(),
+                                     (unsigned long long)(f.end - f.start), name.c_str(), f.thunk ? "  (thunk)" : ""));
+            }
+            out = p.finish(filter.empty() ? "functions" : "functions matching \"" + filter + "\"");
+            return true;
+        });
+
+    add("decompile_function",
+        "C-like pseudocode for the function at or containing an address or name. Registers stand in for "
+        "variables (rdi, rsi, ... are the arguments on system v; rcx, rdx, r8, r9 on windows), there are no types "
+        "yet, and memory reads look like *(int*)(rdi + 8). Check the disassembly when something looks off.",
+        schema({{"function", prop("string", "name or address of the function, or any address inside it")}},
+               {"function"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "function", a, out))
+                return false;
+            const function* f = db->an.func_containing(a);
+            if (!f) {
+                out = "no function at " + hexa(a) + " (list_functions shows them)";
+                return false;
+            }
+            out = "// " + db->location(f->start) + " at " + hexa(f->start) + "\n" + decompile_text(*db, f->start);
+            cap(out);
+            return true;
+        });
+
+    add("disassemble",
+        "The listing from an address: instructions with names in place of addresses, labels, data and comments.",
+        schema({{"address", prop("string", "where to start: hex address or name")},
+                {"count", prop("integer", "how many lines (default 60, at most 800)")}},
+               {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "address", a, out))
+                return false;
+            int n = arg_int(args, "count", 60, 1, 800);
+            const std::vector<row>& rows = db->rows();
+            for (size_t i = db->row_of(a); i < rows.size() && n > 0; i++) {
+                std::string l = listing_line(*db, rows[i]);
+                if (!l.empty()) {
+                    out += l + "\n";
+                    n--;
+                }
+            }
+            return true;
+        });
+
+    add("disassemble_function", "The whole listing of the function at or containing an address or name.",
+        schema({{"function", prop("string", "name or address of the function, or any address inside it")}},
+               {"function"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "function", a, out))
+                return false;
+            const function* f = db->an.func_containing(a);
+            if (!f) {
+                out = "no function at " + hexa(a);
+                return false;
+            }
+            const std::vector<row>& rows = db->rows();
+            size_t i = db->row_of(f->start);
+            while (i > 0 && rows[i - 1].addr == f->start)
+                i--;
+            int lines = 0;
+            for (; i < rows.size() && rows[i].addr < f->end && lines < 3000; i++, lines++) {
+                std::string l = listing_line(*db, rows[i]);
+                if (!l.empty())
+                    out += l + "\n";
+            }
+            cap(out);
+            return true;
+        });
+}
+
+} // namespace
+
+namespace {
+
+void add_query_tools(std::vector<tool>& t)
+{
+    auto add = [&](const char* name, const char* desc, json::value sch, tool::run_t fn) {
+        tool x;
+        x.name = name;
+        x.description = desc;
+        x.schema = std::move(sch);
+        x.run = std::move(fn);
+        t.push_back(std::move(x));
+    };
+
+    add("get_xrefs_to",
+        "Who references an address: calls, jumps, data reads / writes and pointers to it, each with the function "
+        "it comes from. Use it to find the callers of a function or the users of a string or global.",
+        schema({{"address", prop("string", "hex address or name")},
+                {"limit", prop("integer", "at most this many (default 300)")}},
+               {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "address", a, out))
+                return false;
+            int limit = arg_int(args, "limit", 300, 1, 5000);
+            auto refs = db->an.refs_to(a);
+            size_t n = (size_t)(refs.second - refs.first);
+            out = util::fmt("%zu references to %s (%s)\n", n, db->location(a).c_str(), hexa(a).c_str());
+            int shown = 0;
+            for (const xref* x = refs.first; x != refs.second && shown < limit; x++, shown++)
+                out += util::fmt("%s  %-6s %s\n", hexa(x->from).c_str(), xref_kinds[(int)x->type],
+                                 db->location(x->from).c_str());
+            if ((size_t)shown < n)
+                out += util::fmt("... %zu more\n", n - (size_t)shown);
+            return true;
+        });
+
+    add("get_xrefs_from",
+        "What an instruction references, or with whole_function what a whole function references: the functions "
+        "it calls, the strings and globals it uses.",
+        schema({{"address", prop("string", "hex address or name")},
+                {"whole_function", prop("boolean", "everything referenced from the function containing address")}},
+               {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "address", a, out))
+                return false;
+            uint64_t lo = a, hi = a + 1;
+            if (arg_bool(args, "whole_function", false)) {
+                const function* f = db->an.func_containing(a);
+                if (!f) {
+                    out = "no function at " + hexa(a);
+                    return false;
+                }
+                lo = f->start;
+                hi = f->end;
+            }
+            const std::vector<xref>& xs = db->an.xfrom;
+            auto it = std::lower_bound(xs.begin(), xs.end(), lo, [](const xref& x, uint64_t v) { return x.from < v; });
+            size_t n = 0;
+            for (; it != xs.end() && it->from < hi && n < 2000; ++it, n++)
+                out += util::fmt("%s  %-6s -> %s  %s\n", hexa(it->from).c_str(), xref_kinds[(int)it->type],
+                                 hexa(it->to).c_str(), db->location(it->to).c_str());
+            if (!n)
+                out = "no references from " + db->location(a) + "\n";
+            return true;
+        });
+
+    add("list_strings",
+        "Strings found in the file (ascii and utf-16) with their addresses. Filter is a case-insensitive "
+        "substring. get_xrefs_to on a string's address shows the code that uses it.",
+        schema({{"filter", prop("string", "only strings containing this")},
+                {"offset", prop("integer", "skip this many matches (paging)")},
+                {"limit", prop("integer", "at most this many (default 200)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::string filter = arg_str(args, "filter");
+            page p = make_page(args, 200);
+            size_t i = 0;
+            for (const string_item& st : db->an.strings) {
+                if (!util::icontains(st.text, filter))
+                    continue;
+                p.add(i++, hexa(st.addr) + "  " + (st.wide ? "L" : "") + "\"" + util::escape(st.text, 300) + "\"");
+            }
+            out = p.finish(filter.empty() ? "strings" : "strings containing \"" + filter + "\"");
+            return true;
+        });
+
+    add("list_imports", "Imported functions (library and name) with the address of their slot.",
+        schema({{"filter", prop("string", "only names containing this")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::string filter = arg_str(args, "filter");
+            size_t n = 0;
+            for (const import_entry& e : db->bin.imports)
+                if (util::icontains(e.name, filter) && n++ < 3000)
+                    out += hexa(e.slot) + "  " + (e.lib.empty() ? std::string("?") : e.lib) + "!" + e.name + "\n";
+            if (!n)
+                out = "no imports" + (filter.empty() ? std::string() : " matching \"" + filter + "\"") + "\n";
+            return true;
+        });
+
+    add("list_exports", "Exported symbols with their addresses.",
+        schema({{"filter", prop("string", "only names containing this")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::string filter = arg_str(args, "filter");
+            size_t n = 0;
+            for (const export_entry& e : db->bin.exports)
+                if (util::icontains(e.name, filter) && n++ < 3000)
+                    out += (e.forward.empty() ? hexa(e.addr) : std::string("forward")) + "  " + e.name +
+                           (e.forward.empty() ? std::string() : " -> " + e.forward) + "\n";
+            if (!n)
+                out = "no exports" + (filter.empty() ? std::string() : " matching \"" + filter + "\"") + "\n";
+            return true;
+        });
+
+    add("read_bytes", "Bytes of the file as loaded, shown as a hex + ascii view.",
+        schema({{"address", prop("string", "hex address or name")},
+                {"length", prop("integer", "how many bytes (default 128, at most 4096)")}},
+               {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "address", a, out))
+                return false;
+            std::vector<uint8_t> buf((size_t)arg_int(args, "length", 128, 1, 4096));
+            size_t n = db->bin.read(a, buf.data(), buf.size());
+            if (!n) {
+                out = hexa(a) + " is not in the file";
+                return false;
+            }
+            out = byte_view(a, buf.data(), n);
+            return true;
+        });
+
+    add("search_bytes",
+        "Find a byte pattern in the file, like \"48 8b ?? 05\" (?? matches any byte). Good for constants: crypto "
+        "tables, magic numbers, known instruction sequences.",
+        schema({{"pattern", prop("string", "hex bytes separated by spaces, ?? for any byte")}}, {"pattern"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::vector<uint64_t> hits = db->find_bytes(arg_str(args, "pattern"), 0, 300);
+            for (uint64_t h : hits)
+                out += hexa(h) + "  " + db->location(h) + "\n";
+            if (hits.empty())
+                out = "no matches (or a malformed pattern)\n";
+            return true;
+        });
+
+    add("lookup",
+        "What is at an address, or who has a name: the address, the name, the function it is in, its segment, and "
+        "whether it is an import, an export or a string.",
+        schema({{"what", prop("string", "hex address or name")}}, {"what"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "what", a, out))
+                return false;
+            out = "address   " + hexa(a) + "\n";
+            std::string n = db->name_at(a);
+            if (!n.empty())
+                out += "name      " + n + "\n";
+            out += "location  " + db->location(a) + "\n";
+            std::string sg = db->seg_name(a);
+            out += "segment   " + (sg.empty() ? std::string("(not in the file)") : sg) + "\n";
+            if (const function* f = db->an.func_containing(a))
+                out += util::fmt("function  %s at %s, size 0x%llx\n", db->name_at(f->start).c_str(),
+                                 hexa(f->start).c_str(), (unsigned long long)(f->end - f->start));
+            for (const import_entry& e : db->bin.imports)
+                if (e.slot == a)
+                    out += "import    " + e.lib + "!" + e.name + "\n";
+            for (const string_item& st : db->an.strings)
+                if (st.addr == a)
+                    out += "string    \"" + util::escape(st.text, 300) + "\"\n";
+            std::string c = db->comment_at(a);
+            if (!c.empty())
+                out += "comment   " + c + "\n";
+            return true;
+        });
+
+    add("diff_binary",
+        "Compare the open file with another one on disk at the function level and report what changed - "
+        "which functions are identical, which changed (with a similarity score), which were added or "
+        "removed. Matching ignores load addresses, so it works across builds.",
+        schema({{"path", prop("string", "path to the other file to compare against")},
+                {"limit", prop("integer", "at most this many entries per section (default 60)")}},
+               {"path"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::string path = arg_str(args, "path"), err;
+            load_options lo;
+            std::unique_ptr<database> other = open_database(path, lo, nullptr, err);
+            if (!other) {
+                out = "can't open " + path + ": " + err;
+                return false;
+            }
+            int limit = arg_int(args, "limit", 60, 1, 1000);
+            diff_result d = diff_databases(*db, *other);
+            out = util::fmt("this file: %zu functions, %s: %zu functions\n", d.funcs_a, other->bin.name.c_str(),
+                            d.funcs_b);
+            out += util::fmt("identical %zu, changed %zu, added %zu, removed %zu\n", d.identical.size(),
+                             d.changed.size(), d.added.size(), d.removed.size());
+            int n = 0;
+            if (!d.changed.empty())
+                out += "\nchanged (most different first):\n";
+            for (const diff_pair& p : d.changed) {
+                if (n++ >= limit) {
+                    out += util::fmt("... %zu more\n", d.changed.size() - (size_t)limit);
+                    break;
+                }
+                out += util::fmt("  %3.0f%%  %-28s  %s -> %s\n", p.similarity * 100, p.name.c_str(),
+                                 hexa(p.a).c_str(), hexa(p.b).c_str());
+            }
+            n = 0;
+            if (!d.added.empty())
+                out += "\nadded (only in the other file):\n";
+            for (uint64_t x : d.added) {
+                if (n++ >= limit)
+                    break;
+                out += "  " + hexa(x) + "  " + other->location(x) + "\n";
+            }
+            n = 0;
+            if (!d.removed.empty())
+                out += "\nremoved (only in this file):\n";
+            for (uint64_t x : d.removed) {
+                if (n++ >= limit)
+                    break;
+                out += "  " + hexa(x) + "  " + db->location(x) + "\n";
+            }
+            cap(out);
+            return true;
+        });
+
+    add("get_basic_blocks", "The control flow graph of a function: its basic blocks and the edges between them.",
+        schema({{"function", prop("string", "name or address of the function")}}, {"function"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "function", a, out))
+                return false;
+            const function* f = db->an.func_containing(a);
+            cfg g;
+            if (!f || !build_cfg(db->bin, db->an, f->start, g)) {
+                out = "no function at " + hexa(a);
+                return false;
+            }
+            static const char* const kinds[] = {"next", "taken", "not_taken", "jump", "table"};
+            for (size_t i = 0; i < g.blocks.size(); i++) {
+                const cfg_block& b = g.blocks[i];
+                out += util::fmt("block %zu  %s - %s  (%zu instructions)", i, hexa(b.start).c_str(),
+                                 hexa(b.end).c_str(), b.insns.size());
+                for (const cfg_edge& e : b.succ)
+                    out += util::fmt("  -> %u %s", e.to, kinds[(int)e.kind]);
+                out += "\n";
+            }
+            if (g.truncated)
+                out += "(truncated)\n";
+            return true;
+        });
+}
+
+} // namespace
+
+namespace {
+
+void add_edit_tools(std::vector<tool>& t)
+{
+    tool rn;
+    rn.name = "rename";
+    rn.description =
+        "Give an address (usually a function or a global) a name. It shows everywhere in ceasta - listing, "
+        "pseudocode, xrefs - and is saved with the user's project. Name functions by what they do "
+        "(parse_config, decrypt_string). An empty name removes the user's name.";
+    rn.schema = schema({{"address", prop("string", "hex address or current name")},
+                        {"name", prop("string", "the new name")}},
+                       {"address", "name"});
+    rn.writes = true;
+    rn.run = [](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t a;
+        if (!db || !arg_addr(*db, args, "address", a, out))
+            return false;
+        std::string old = db->location(a), err;
+        std::string name = util::trim(arg_str(args, "name"));
+        if (!db->set_name(a, name, err)) {
+            out = "can't rename " + old + ": " + err;
+            return false;
+        }
+        db->save(err);
+        if (s.on_changed)
+            s.on_changed();
+        out = name.empty() ? "removed the name at " + hexa(a) : "renamed " + old + " to " + name;
+        return true;
+    };
+    t.push_back(std::move(rn));
+
+    tool cm;
+    cm.name = "set_comment";
+    cm.description =
+        "Put a comment on an address; it shows in the listing next to the instruction and is saved with the "
+        "project. An empty comment removes it.";
+    cm.schema = schema({{"address", prop("string", "hex address or name")},
+                        {"comment", prop("string", "the text")}},
+                       {"address", "comment"});
+    cm.writes = true;
+    cm.run = [](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t a;
+        if (!db || !arg_addr(*db, args, "address", a, out))
+            return false;
+        std::string err;
+        db->set_comment(a, arg_str(args, "comment"));
+        db->save(err);
+        if (s.on_changed)
+            s.on_changed();
+        out = "comment set at " + db->location(a);
+        return true;
+    };
+    t.push_back(std::move(cm));
+
+    tool sp;
+    sp.name = "save_project";
+    sp.description =
+        "Write a project file next to the binary (\"<file>.ceasta\") holding every name, comment and "
+        "breakpoint. It's plain sorted text meant to be committed to version control, so a team - or the "
+        "next session - picks up the work. Once it exists, later renames update it automatically.";
+    sp.schema = schema({});
+    sp.writes = true;
+    sp.run = [](mcp_server& s, const json::value&, std::string& out) {
+        database* db = need_db(s, out);
+        if (!db)
+            return false;
+        std::string err;
+        if (!db->save_project(err)) {
+            out = "can't write the project file: " + err;
+            return false;
+        }
+        out = "wrote " + db->project_path();
+        return true;
+    };
+    t.push_back(std::move(sp));
+
+    tool lua;
+    lua.name = "run_lua";
+    lua.description =
+        "Run Lua with ceasta's scripting api (ceasta.functions(), ceasta.decompile(addr), ceasta.xrefs_to(addr), "
+        "ceasta.read(addr, n), ceasta.rename(addr, name), ceasta.log(...)). Expressions print their value. The "
+        "script can also use Lua's io and os libraries, so it runs with the user's file access.";
+    lua.schema = schema({{"code", prop("string", "lua source")}}, {"code"});
+    lua.lua = true;
+    lua.writes = true;
+    lua.run = [](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        lua_host* L = s.get_lua ? s.get_lua() : nullptr;
+        if (!db || !L) {
+            if (db && !L)
+                out = "lua isn't available here";
+            return false;
+        }
+        std::function<void(const std::string&, int)> old = L->bridge().log;
+        std::string captured;
+        L->bridge().log = [&](const std::string& line, int level) {
+            captured += (level >= 2 ? "error: " : level == 1 ? "warning: " : "") + line + "\n";
+        };
+        bool ok = L->run_console(arg_str(args, "code"));
+        L->bridge().log = old;
+        if (s.on_changed)
+            s.on_changed();
+        out = captured.empty() ? (ok ? "(done, no output)" : "(failed)") : captured;
+        cap(out);
+        return ok;
+    };
+    t.push_back(std::move(lua));
+}
+
+} // namespace
+
+// ------------------------------------------------------------------ debugger tools (opt in)
+
+namespace {
+
+debugger* dbg_of(mcp_server& s) { return s.debug.get ? s.debug.get() : nullptr; }
+
+// a runtime value -> something to recognize it by: a name in the file, module+offset, or a string
+std::string symbolize(mcp_server& s, database& db, debugger& d, uint64_t v)
+{
+    uint64_t st = 0;
+    if (v && s.debug.to_static && s.debug.to_static(v, st)) {
+        std::string loc = db.location(st);
+        if (!loc.empty())
+            return loc;
+    }
+    for (const dbg_module& m : d.modules())
+        if (m.base && v >= m.base && v < m.base + m.size)
+            return m.name + "+0x" + util::hex_lower(v - m.base);
+    if (v > 0x10000) {
+        char buf[72] = {};
+        size_t n = d.read(v, buf, sizeof(buf) - 1);
+        size_t len = 0;
+        while (len < n && buf[len] >= 0x20 && buf[len] < 0x7F)
+            len++;
+        if (len >= 4 && (len < n ? buf[len] == 0 : true))
+            return "\"" + util::escape(std::string(buf, len), 64) + "\"";
+    }
+    return std::string();
+}
+
+std::string where_text(mcp_server& s, database& db, debugger& d, uint64_t pc)
+{
+    uint64_t st = 0;
+    if (s.debug.to_static && s.debug.to_static(pc, st)) {
+        std::string out = db.location(st) + " (static " + hexa(st) + ", runtime " + hexa(pc) + ")";
+        insn in;
+        if (db.decode(st, in))
+            out += "\n  next: " + db.insn_text(in);
+        return out;
+    }
+    std::string sym = symbolize(s, db, d, pc);
+    return hexa(pc) + (sym.empty() ? std::string(" (outside the file)") : " (" + sym + ")");
+}
+
+std::string state_text(mcp_server& s, database& db)
+{
+    debugger* d = dbg_of(s);
+    if (!d || d->state() == dbg_state::none) {
+        if (d && d->exit_code() != 0)
+            return util::fmt("no process (the last one exited with code %d)", d->exit_code());
+        return "no process is being debugged (debug_start starts the file)";
+    }
+    if (d->state() == dbg_state::running)
+        return "running (debug_pause stops it)";
+    return "stopped: " + d->stop_reason() + "\nat " + where_text(s, db, *d, d->pc()) + "\n";
+}
+
+debugger* stopped_dbg(mcp_server& s, std::string& out)
+{
+    debugger* d = dbg_of(s);
+    if (!d || d->state() == dbg_state::none) {
+        out = "no process is being debugged (debug_start starts the file)";
+        return nullptr;
+    }
+    if (d->state() != dbg_state::stopped) {
+        out = "the program is running; debug_pause stops it";
+        return nullptr;
+    }
+    return d;
+}
+
+// after a run command: wait for the stop, then describe where it is
+bool finish_run(mcp_server& s, int timeout_ms, std::string& out)
+{
+    bool stopped = s.wait_stop(timeout_ms);
+    s.run([&] {
+        database* db = s.get_db ? s.get_db() : nullptr;
+        if (!stopped)
+            out = util::fmt("still running after %d ms - it may be waiting for input, in a long loop, or past the "
+                            "part you care about. debug_pause stops it, debug_continue waits more.\n", timeout_ms);
+        else
+            out = db ? state_text(s, *db) : std::string("no file");
+    });
+    return true;
+}
+
+void add_debug_tools(std::vector<tool>& t)
+{
+    auto add = [&](const char* name, const char* desc, json::value sch, tool::run_t fn, bool waits) {
+        tool x;
+        x.name = name;
+        x.description = desc;
+        x.schema = std::move(sch);
+        x.debug = true;
+        x.writes = true;
+        x.owner = !waits; // run/wait tools manage the owner thread themselves
+        x.run = std::move(fn);
+        t.push_back(std::move(x));
+    };
+
+    add("debug_start",
+        "Start the loaded file under the debugger; it stops at its entry point. One process at a time. This runs "
+        "the program on this machine, so treat an untrusted target the way you would running it yourself.",
+        schema({{"args", prop("string", "command line arguments for the program")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            std::string err;
+            bool ok = false;
+            s.run([&] {
+                debugger* d = dbg_of(s);
+                if (d && d->state() != dbg_state::none) {
+                    err = "a process is already being debugged (debug_kill ends it)";
+                    return;
+                }
+                ok = s.debug.start && s.debug.start(arg_str(args, "args"), err);
+            });
+            if (!ok) {
+                out = "can't start: " + err;
+                return false;
+            }
+            return finish_run(s, 20000, out);
+        },
+        true);
+
+    add("debug_status", "Whether a process is being debugged, and if stopped, where and why.", schema({}),
+        [](mcp_server& s, const json::value&, std::string& out) {
+            database* db = s.get_db ? s.get_db() : nullptr;
+            out = db ? state_text(s, *db) : std::string("no file");
+            return true;
+        },
+        false);
+
+    add("debug_continue", "Let the program run until a breakpoint, a fault, its exit, or the timeout.",
+        schema({{"timeout_ms", prop("integer", "how long to wait for a stop (default 15000, at most 120000)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            bool ok = false;
+            std::string err;
+            s.run([&] {
+                if (!stopped_dbg(s, out))
+                    return;
+                ok = s.debug.cont && s.debug.cont(err);
+            });
+            if (!ok) {
+                if (out.empty())
+                    out = "can't continue: " + err;
+                return false;
+            }
+            return finish_run(s, arg_int(args, "timeout_ms", 15000, 100, 120000), out);
+        },
+        true);
+
+    add("debug_step_into", "Execute one instruction, entering calls.",
+        schema({{"count", prop("integer", "how many instructions (default 1, at most 200)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            int n = arg_int(args, "count", 1, 1, 200);
+            for (int i = 0; i < n; i++) {
+                bool ok = false;
+                std::string err;
+                s.run([&] {
+                    if (!stopped_dbg(s, out))
+                        return;
+                    ok = s.debug.step_into && s.debug.step_into(err);
+                });
+                if (!ok)
+                    return i > 0 ? finish_run(s, 1000, out) : (out.empty() ? (out = "can't step: " + err, false) : false);
+                out.clear();
+                if (!s.wait_stop(10000))
+                    break;
+            }
+            return finish_run(s, 1000, out);
+        },
+        true);
+
+    add("debug_step_over", "Execute one instruction; a call runs to its return.",
+        schema({{"count", prop("integer", "how many instructions (default 1, at most 200)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            int n = arg_int(args, "count", 1, 1, 200);
+            for (int i = 0; i < n; i++) {
+                bool ok = false;
+                std::string err;
+                s.run([&] {
+                    if (!stopped_dbg(s, out))
+                        return;
+                    ok = s.debug.step_over && s.debug.step_over(err);
+                });
+                if (!ok)
+                    return i > 0 ? finish_run(s, 1000, out) : (out.empty() ? (out = "can't step: " + err, false) : false);
+                out.clear();
+                if (!s.wait_stop(15000))
+                    break;
+            }
+            return finish_run(s, 1000, out);
+        },
+        true);
+
+    add("debug_run_to", "Run until an address or name is reached (or a breakpoint, or the timeout).",
+        schema({{"address", prop("string", "hex address or name in the file")},
+                {"timeout_ms", prop("integer", "how long to wait (default 15000)")}},
+               {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            bool ok = false;
+            std::string err;
+            s.run([&] {
+                database* db = s.get_db ? s.get_db() : nullptr;
+                uint64_t a;
+                if (!db || !stopped_dbg(s, out))
+                    return;
+                if (!arg_addr(*db, args, "address", a, err))
+                    return;
+                ok = s.debug.run_to && s.debug.run_to(a, err);
+            });
+            if (!ok) {
+                if (out.empty())
+                    out = "can't run: " + err;
+                return false;
+            }
+            return finish_run(s, arg_int(args, "timeout_ms", 15000, 100, 120000), out);
+        },
+        true);
+
+    add("debug_pause", "Stop the running program where it is.", schema({}),
+        [](mcp_server& s, const json::value&, std::string& out) {
+            bool ok = false;
+            std::string err;
+            s.run([&] {
+                debugger* d = dbg_of(s);
+                if (!d || d->state() != dbg_state::running) {
+                    err = "it isn't running";
+                    return;
+                }
+                ok = s.debug.pause && s.debug.pause(err);
+            });
+            if (!ok) {
+                out = "can't pause: " + err;
+                return false;
+            }
+            s.wait_stop(5000);
+            s.run([&] {
+                database* db = s.get_db ? s.get_db() : nullptr;
+                out = db ? state_text(s, *db) : std::string();
+            });
+            return true;
+        },
+        true);
+
+    add("debug_kill", "End the debugged process.", schema({}),
+        [](mcp_server& s, const json::value&, std::string& out) {
+            debugger* d = dbg_of(s);
+            if (!d || d->state() == dbg_state::none) {
+                out = "no process";
+                return true;
+            }
+            if (s.debug.kill)
+                s.debug.kill();
+            out = "killed";
+            return true;
+        },
+        false);
+}
+
+} // namespace
+
+namespace {
+
+void add_debug_inspect_tools(std::vector<tool>& t)
+{
+    auto add = [&](const char* name, const char* desc, json::value sch, tool::run_t fn) {
+        tool x;
+        x.name = name;
+        x.description = desc;
+        x.schema = std::move(sch);
+        x.debug = true;
+        x.writes = true;
+        x.run = std::move(fn);
+        t.push_back(std::move(x));
+    };
+
+    add("debug_set_breakpoint",
+        "Break when execution reaches an address or name of the file. Works before debug_start too; addresses "
+        "follow the program when it loads somewhere else (aslr / pie).",
+        schema({{"address", prop("string", "hex address or name")}}, {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            std::string err;
+            if (!db || !arg_addr(*db, args, "address", a, out))
+                return false;
+            if (!s.debug.add_bp || !s.debug.add_bp(a, err)) {
+                out = "can't set it: " + err;
+                return false;
+            }
+            if (s.on_changed)
+                s.on_changed();
+            out = "breakpoint at " + db->location(a) + " (" + hexa(a) + ")";
+            return true;
+        });
+
+    add("debug_remove_breakpoint", "Remove a breakpoint.",
+        schema({{"address", prop("string", "hex address or name")}}, {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            uint64_t a;
+            if (!db || !arg_addr(*db, args, "address", a, out))
+                return false;
+            bool ok = s.debug.del_bp && s.debug.del_bp(a);
+            if (s.on_changed)
+                s.on_changed();
+            out = ok ? "removed the breakpoint at " + db->location(a) : "no breakpoint at " + db->location(a);
+            return ok;
+        });
+
+    add("debug_list_breakpoints", "The breakpoints (static addresses of the file).", schema({}),
+        [](mcp_server& s, const json::value&, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::vector<uint64_t> b = s.debug.bps ? s.debug.bps() : std::vector<uint64_t>();
+            for (uint64_t a : b)
+                out += hexa(a) + "  " + db->location(a) + "\n";
+            if (b.empty())
+                out = "no breakpoints\n";
+            return true;
+        });
+
+    add("debug_get_registers",
+        "The registers of the stopped thread, each with what it points at when that's recognizable: a name in the "
+        "file, a module+offset, or a string.",
+        schema({}), [](mcp_server& s, const json::value&, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            for (const reg_value& r : d->registers()) {
+                out += util::fmt("%-7s %016llx", r.name.c_str(), (unsigned long long)r.value);
+                if (r.name != "eflags" && r.name != "rflags") {
+                    std::string sym = symbolize(s, *db, *d, r.value);
+                    if (!sym.empty())
+                        out += "  " + sym;
+                }
+                out += "\n";
+            }
+            return true;
+        });
+
+    add("debug_set_register", "Change a register of the stopped thread (e.g. rax, rip, eflags).",
+        schema({{"name", prop("string", "register name")}, {"value", prop("string", "new value, hex")}},
+               {"name", "value"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            debugger* d = stopped_dbg(s, out);
+            uint64_t v;
+            std::string err;
+            if (!d)
+                return false;
+            if (!util::parse_hex(arg_str(args, "value"), v)) {
+                out = "value must be hex";
+                return false;
+            }
+            if (!d->set_register(util::lower(arg_str(args, "name")), v, err)) {
+                out = "can't set it: " + err;
+                return false;
+            }
+            out = arg_str(args, "name") + " = " + hexa(v);
+            return true;
+        });
+
+    add("debug_read_memory",
+        "Read the running program's live memory as a hex + ascii view. Address can be a register name (rsp, rdi), "
+        "a name or address of the file, or a raw runtime address.",
+        schema({{"address", prop("string", "register name, file name/address, or runtime address")},
+                {"length", prop("integer", "how many bytes (default 128, at most 4096)")}},
+               {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            uint64_t a = 0;
+            std::string t = util::lower(util::trim(arg_str(args, "address")));
+            bool got = false;
+            for (const reg_value& r : d->registers())
+                if (!t.empty() && util::lower(r.name) == t) {
+                    a = r.value;
+                    got = true;
+                    break;
+                }
+            if (!got) {
+                if (!arg_addr(*db, args, "address", a, out))
+                    return false;
+                if (db->bin.is_mapped(a) && s.debug.to_runtime)
+                    a = s.debug.to_runtime(a);
+            }
+            std::vector<uint8_t> buf((size_t)arg_int(args, "length", 128, 1, 4096));
+            size_t n = d->read(a, buf.data(), buf.size());
+            if (!n) {
+                out = hexa(a) + " is not readable in the process";
+                return false;
+            }
+            out = byte_view(a, buf.data(), n);
+            return true;
+        });
+
+    add("debug_write_memory", "Write bytes into the running program's memory.",
+        schema({{"address", prop("string", "register name, file name/address, or runtime address")},
+                {"bytes", prop("string", "hex bytes, e.g. \"90 90 c3\"")}},
+               {"address", "bytes"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            uint64_t a = 0;
+            std::string t = util::lower(util::trim(arg_str(args, "address")));
+            bool got = false;
+            for (const reg_value& r : d->registers())
+                if (!t.empty() && util::lower(r.name) == t) {
+                    a = r.value;
+                    got = true;
+                    break;
+                }
+            if (!got) {
+                if (!arg_addr(*db, args, "address", a, out))
+                    return false;
+                if (db->bin.is_mapped(a) && s.debug.to_runtime)
+                    a = s.debug.to_runtime(a);
+            }
+            std::vector<uint8_t> bytes;
+            for (const std::string& tok : util::split(arg_str(args, "bytes"), " ,")) {
+                uint64_t v;
+                if (tok.empty())
+                    continue;
+                if (!util::parse_hex(tok, v) || v > 0xFF) {
+                    out = "bad byte: " + tok;
+                    return false;
+                }
+                bytes.push_back((uint8_t)v);
+            }
+            std::string err;
+            if (bytes.empty() || !d->write(a, bytes.data(), bytes.size(), err)) {
+                out = bytes.empty() ? "no bytes given" : "can't write: " + err;
+                return false;
+            }
+            out = util::fmt("wrote %zu bytes at %s", bytes.size(), hexa(a).c_str());
+            return true;
+        });
+
+    add("debug_call",
+        "Call a function in the stopped program and get its return value, then every register is "
+        "restored. Great for exercising one routine - decrypt a string, validate a key, hash a buffer. "
+        "Each argument is a number (passed as-is), or a string: a name or hex address is passed as that "
+        "(runtime) address, anything else is written into the target as a c string and its pointer is "
+        "passed. 64-bit targets only.",
+        schema({{"function", prop("string", "name or address to call")},
+                {"args", []{ json::value a = prop("array", "arguments, in order"); a["items"] = json::value::make_object(); return a; }()}},
+               {"function"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            uint64_t func;
+            if (!arg_addr(*db, args, "function", func, out))
+                return false;
+            if (db->bin.is_mapped(func) && s.debug.to_runtime)
+                func = s.debug.to_runtime(func);
+            // materialize the arguments; strings that aren't a name/number get written to a
+            // scratch area well below the stack pointer
+            uint64_t sp = d->sp();
+            uint64_t scratch = sp - 0x8000;
+            std::vector<uint64_t> vals;
+            const json::value* av = args.get("args");
+            if (av && av->is_array())
+                for (const json::value& item : *av->a) {
+                    if (item.is_number()) {
+                        vals.push_back((uint64_t)item.n);
+                        continue;
+                    }
+                    std::string t = item.str();
+                    uint64_t v;
+                    if (db->resolve(t, v)) {
+                        vals.push_back(db->bin.is_mapped(v) && s.debug.to_runtime ? s.debug.to_runtime(v) : v);
+                    } else if (util::parse_hex(t, v)) {
+                        vals.push_back(v);
+                    } else {
+                        size_t need = (t.size() + 1 + 15) & ~size_t(15);
+                        scratch -= need;
+                        std::string err;
+                        d->write(scratch, t.c_str(), t.size() + 1, err);
+                        vals.push_back(scratch);
+                    }
+                }
+            uint64_t result = 0;
+            std::string err;
+            if (!d->call(func, vals, result, err)) {
+                out = "the call failed: " + err;
+                return false;
+            }
+            out = "returned 0x" + util::hex_lower(result) + " (" + std::to_string((long long)result) + ")";
+            std::string sym = symbolize(s, *db, *d, result);
+            if (!sym.empty())
+                out += "\n         " + sym;
+            return true;
+        });
+
+    add("debug_trace",
+        "Single-step the stopped program for up to `count` instructions and record the target of "
+        "every indirect call / jump it takes (a call through a pointer, a vtable dispatch, a jump "
+        "table). Those targets become cross-references the static analysis couldn't find, and are "
+        "saved with the project. Stepping is slow, so keep the count modest and set a breakpoint "
+        "first to trace a specific spot.",
+        schema({{"count", prop("integer", "how many instructions to step (default 2000, at most 200000)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            int max = arg_int(args, "count", 2000, 1, 200000);
+            int found = 0;
+            std::string err, list;
+            int stepped = dbg_trace(*d, max, [&](uint64_t from, uint64_t to, bool is_call) {
+                uint64_t sf, st;
+                if (s.debug.to_static && s.debug.to_static(from, sf) && s.debug.to_static(to, st) &&
+                    db->add_xref(sf, st, is_call ? xref_type::call : xref_type::jump)) {
+                    found++;
+                    if (found <= 200)
+                        list += util::fmt("  %-4s %s -> %s\n", is_call ? "call" : "jmp", db->location(sf).c_str(),
+                                          db->location(st).c_str());
+                }
+            }, err);
+            if (s.on_changed && found)
+                s.on_changed();
+            out = util::fmt("stepped %d instructions, found %d new indirect target%s\n", stepped, found,
+                            found == 1 ? "" : "s");
+            out += list;
+            if (d->state() != dbg_state::stopped)
+                out += "(the program is no longer stopped)\n";
+            cap(out);
+            return true;
+        });
+
+    add("debug_decompile_here",
+        "Pseudocode for the function the program is stopped in, with the current line marked, followed "
+        "by the argument registers and their live values (a name in the file, or a string). The fast way "
+        "to see what a routine is doing with the data it actually has right now.",
+        schema({}), [](mcp_server& s, const json::value&, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            uint64_t st = 0;
+            if (!s.debug.to_static || !s.debug.to_static(d->pc(), st)) {
+                out = "the program is stopped outside the loaded file (" + hexa(d->pc()) + ")";
+                return false;
+            }
+            const function* f = db->an.func_containing(st);
+            if (!f) {
+                out = "no function at " + hexa(st);
+                return false;
+            }
+            out = "// " + db->location(f->start) + ", stopped at " + hexa(st) + "\n";
+            out += decompile_text_marked(*db, f->start, st);
+            out += "\nlive registers:\n";
+            for (const reg_value& r : d->registers()) {
+                if (r.name == "eflags" || r.name == "rflags" || r.name == "rsp" || r.name == "rip")
+                    continue;
+                std::string sym = symbolize(s, *db, *d, r.value);
+                if (!sym.empty())
+                    out += util::fmt("  %-5s %016llx  %s\n", r.name.c_str(), (unsigned long long)r.value,
+                                     sym.c_str());
+            }
+            cap(out);
+            return true;
+        });
+
+    add("debug_backtrace", "The call stack of the stopped thread, best-effort from the frame pointers.",
+        schema({{"limit", prop("integer", "how many frames (default 32)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            int limit = arg_int(args, "limit", 32, 1, 256);
+            out = "#0  " + where_text(s, *db, *d, d->pc()) + "\n";
+            uint64_t bp = 0;
+            for (const reg_value& r : d->registers())
+                if (r.name == "rbp" || r.name == "ebp")
+                    bp = r.value;
+            int frame = 1;
+            for (int i = 0; i < limit && bp; i++) {
+                // a frame is [bp] = caller's bp, [bp + ptr] = return address
+                uint64_t next_bp = 0, ret = 0;
+                if (d->is64()) {
+                    if (d->read(bp, &next_bp, 8) < 8 || d->read(bp + 8, &ret, 8) < 8)
+                        break;
+                } else {
+                    uint32_t a = 0, b = 0;
+                    if (d->read(bp, &a, 4) < 4 || d->read(bp + 4, &b, 4) < 4)
+                        break;
+                    next_bp = a;
+                    ret = b;
+                }
+                if (!ret || next_bp <= bp)
+                    break;
+                out += util::fmt("#%d  ", frame++) + where_text(s, *db, *d, ret) + "\n";
+                bp = next_bp;
+            }
+            return true;
+        });
+}
+
+} // namespace
+
+// ------------------------------------------------------------------ the tool registry
+
+const std::vector<mcp_server::tool>& mcp_all_tools()
+{
+    static const std::vector<mcp_server::tool> all = [] {
+        std::vector<mcp_server::tool> t;
+        add_read_tools(t);
+        add_query_tools(t);
+        add_edit_tools(t);
+        add_debug_tools(t);
+        add_debug_inspect_tools(t);
+        return t;
+    }();
+    return all;
+}
+
+std::vector<const mcp_server::tool*> mcp_server::tools() const
+{
+    std::vector<const tool*> out;
+    for (const tool& t : mcp_all_tools()) {
+        if (t.debug && !opts.allow_debug)
+            continue;
+        if (t.lua && !opts.allow_lua)
+            continue;
+        out.push_back(&t);
+    }
+    return out;
+}
+
+// ------------------------------------------------------------------ owner thread + waiting
+
+void mcp_server::run(const std::function<void()>& fn)
+{
+    if (on_owner)
+        on_owner(fn);
+    else
+        fn();
+}
+
+bool mcp_server::wait_stop(int timeout_ms)
+{
+    uint64_t until = os::now_ms() + (uint64_t)timeout_ms;
+    for (;;) {
+        bool done = false;
+        run([&] {
+            if (debug.pump)
+                debug.pump();
+            debugger* d = debug.get ? debug.get() : nullptr;
+            done = !d || d->state() != dbg_state::running;
+        });
+        if (done)
+            return true;
+        if (os::now_ms() >= until)
+            return false;
+        os::sleep_ms(10);
+    }
+}
+
+// ------------------------------------------------------------------ json-rpc / mcp protocol
+
+namespace {
+
+json::value rpc_error(const json::value& id, int code, const std::string& message)
+{
+    json::value r = json::value::make_object();
+    r["jsonrpc"] = "2.0";
+    r["id"] = id.is_null() ? json::value() : id;
+    json::value& e = r["error"];
+    e["code"] = code;
+    e["message"] = message;
+    return r;
+}
+
+json::value rpc_result(const json::value& id, json::value result)
+{
+    json::value r = json::value::make_object();
+    r["jsonrpc"] = "2.0";
+    r["id"] = id;
+    r["result"] = std::move(result);
+    return r;
+}
+
+// a tools/call result: text content, with isError set when the tool failed
+json::value tool_content(const std::string& text, bool is_error)
+{
+    json::value r = json::value::make_object();
+    json::value& content = r["content"];
+    content = json::value::make_array();
+    json::value item = json::value::make_object();
+    item["type"] = "text";
+    item["text"] = text.empty() ? std::string("(no output)") : text;
+    content.push(std::move(item));
+    if (is_error)
+        r["isError"] = true;
+    return r;
+}
+
+} // namespace
+
+json::value mcp_server::call_tool(const json::value& params, std::string& activity)
+{
+    std::string name = params.get("name") ? params.get("name")->str() : std::string();
+    const json::value* a = params.get("arguments");
+    json::value args = a && a->is_object() ? *a : json::value::make_object();
+
+    const tool* found = nullptr;
+    for (const tool* t : tools())
+        if (t->name == name) {
+            found = t;
+            break;
+        }
+    if (!found) {
+        activity = "unknown tool: " + name;
+        return tool_content("unknown tool: " + name + " (call tools/list for the available ones)", true);
+    }
+
+    activity = name;
+    std::string out;
+    bool ok = false;
+    try {
+        if (found->owner)
+            run([&] { ok = found->run(*this, args, out); });
+        else
+            ok = found->run(*this, args, out); // manages the owner thread itself
+    } catch (const std::exception& e) {
+        out = std::string("tool error: ") + e.what();
+        ok = false;
+    } catch (...) {
+        out = "tool error";
+        ok = false;
+    }
+    return tool_content(out, !ok);
+}
+
+json::value mcp_server::dispatch(const json::value& msg)
+{
+    const json::value* idp = msg.get("id");
+    json::value id = idp ? *idp : json::value();
+    std::string method = msg.get("method") ? msg.get("method")->str() : std::string();
+    const json::value* params = msg.get("params");
+    json::value empty = json::value::make_object();
+    const json::value& p = params ? *params : empty;
+    bool is_notification = !idp;
+
+    if (method == "initialize") {
+        const json::value* pv = p.get("protocolVersion");
+        if (pv && pv->is_string() && !pv->s.empty())
+            negotiated_ = pv->s;
+        json::value r = json::value::make_object();
+        r["protocolVersion"] = negotiated_;
+        json::value& caps = r["capabilities"];
+        caps = json::value::make_object();
+        json::value& tcap = caps["tools"];
+        tcap = json::value::make_object();
+        json::value& info = r["serverInfo"];
+        info["name"] = "ceasta";
+        info["version"] = CEASTA_VERSION;
+        r["instructions"] =
+            "ceasta is a reverse engineering tool. These tools inspect the binary the user has open: "
+            "decompile_function and disassemble to read code, list_functions / list_strings / get_xrefs_to to "
+            "navigate, and rename / set_comment to record what you learn. Start with get_binary_info.";
+        return rpc_result(id, std::move(r));
+    }
+    if (method == "notifications/initialized" || method == "notifications/cancelled")
+        return json::value(); // nothing to send back
+    if (method == "ping")
+        return rpc_result(id, json::value::make_object());
+    if (method == "tools/list") {
+        json::value r = json::value::make_object();
+        json::value& list = r["tools"];
+        list = json::value::make_array();
+        for (const tool* t : tools()) {
+            json::value item = json::value::make_object();
+            item["name"] = t->name;
+            item["description"] = t->description;
+            item["inputSchema"] = t->schema;
+            json::value& ann = item["annotations"];
+            ann["readOnlyHint"] = !t->writes;
+            if (t->debug)
+                ann["destructiveHint"] = true;
+            list.push(std::move(item));
+        }
+        return rpc_result(id, std::move(r));
+    }
+    if (method == "tools/call") {
+        std::string activity;
+        json::value result = call_tool(p, activity);
+        if (on_activity)
+            on_activity(activity);
+        return rpc_result(id, std::move(result));
+    }
+    if (method == "resources/list" || method == "prompts/list") {
+        json::value r = json::value::make_object();
+        r[method == "resources/list" ? "resources" : "prompts"] = json::value::make_array();
+        return rpc_result(id, std::move(r));
+    }
+    if (is_notification)
+        return json::value();
+    return rpc_error(id, -32601, "method not found: " + method);
+}
+
+std::string mcp_server::handle(const std::string& message)
+{
+    json::value msg;
+    std::string err;
+    if (!json::parse(message, msg, err))
+        return json::dump(rpc_error(json::value(), -32700, "parse error: " + err));
+
+    if (msg.is_array()) { // a batch
+        json::value out = json::value::make_array();
+        for (const json::value& m : *msg.a) {
+            json::value r = dispatch(m);
+            if (!r.is_null())
+                out.push(std::move(r));
+        }
+        return out.size() ? json::dump(out) : std::string();
+    }
+    if (!msg.is_object())
+        return json::dump(rpc_error(json::value(), -32600, "invalid request"));
+    json::value r = dispatch(msg);
+    return r.is_null() ? std::string() : json::dump(r);
+}

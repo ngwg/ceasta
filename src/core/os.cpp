@@ -1,6 +1,7 @@
 #include "core/os.h"
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -207,6 +208,11 @@ uint64_t now_ms()
 {
     using namespace std::chrono;
     return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void sleep_ms(uint32_t ms)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
 void open_in_shell(const std::string& path)
