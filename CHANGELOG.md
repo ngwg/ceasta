@@ -1,5 +1,31 @@
 # changelog
 
+## v0.6.0 - 2026-09-24
+
+- real binaries now, the mock data is gone
+  - pe loader: exe / dll / sys, 32 + 64 bit, imports (delay load too), exports, .pdata, tls callbacks, relocations, coff symbols
+  - elf loader: x86 / x64, symbols, plt / got imports, pie
+  - raw shellcode (file > open as raw code)
+- disassembly with capstone (x86 only build of it)
+- auto analysis in the background with a progress bar
+  - functions from the entry, exports, symbols, .pdata, calls, pointers in data, prologues
+  - switch tables, xrefs, strings (ascii + utf-16), thunks, noreturn calls
+- ida style listing: names instead of addresses, labels, xref comments, string comments
+- function graph (space), zoom with ctrl + wheel, drag to pan
+- debugger on windows: start / attach, breakpoints, step into / over, run to cursor, pause, registers, stack, live hex. 32 bit programs through wow64, aslr handled
+- lua plugins + lua console, 5 plugins included
+- rename, comments, jump, xrefs, byte search, back / forward. saved per file
+- new simple layout
+  - one window, fixed panels, drag the lines to resize, no floating windows
+  - functions left, listing / graph middle, info + cpu right, output bottom
+  - bigger monospace font, ctrl + / - for text size
+  - every menu item shows its shortcut, tooltips on the toolbar
+  - welcome screen with recent files, drag and drop to open
+- ceasta-cli command line tool
+- cmake build, visual studio solution updated (core / lua / capstone as their own projects)
+- installer (inno setup) + portable zip on the releases page
+- tests: core, fuzzed loaders, headless ui, debugger, installer. ci on linux and windows
+
 ## v0.5 - 2026-09-22
 
 - default dock positions now
