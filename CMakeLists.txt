@@ -77,6 +77,7 @@ add_library(ceasta_core STATIC
     src/core/binary.cpp
     src/core/database.cpp
     src/core/debugger.cpp
+    src/core/debugger_linux.cpp
     src/core/decompiler.cpp
     src/core/disasm.cpp
     src/core/elf.cpp
@@ -87,6 +88,9 @@ target_include_directories(ceasta_core PUBLIC src)
 target_link_libraries(ceasta_core PUBLIC capstone lua Threads::Threads)
 if(WIN32)
     target_link_libraries(ceasta_core PUBLIC shell32)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    # the ptrace based debugger (x64 linux host, debugs 64 and 32 bit programs)
+    target_compile_definitions(ceasta_core PUBLIC CEASTA_LINUX_DEBUGGER)
 endif()
 ceasta_warnings(ceasta_core)
 
@@ -110,7 +114,7 @@ ceasta_warnings(ceasta_ui)
 
 # ---- programs ----
 
-add_executable(ceasta-cli src/cli/main.cpp)
+add_executable(ceasta-cli src/cli/main.cpp src/cli/dbg_repl.cpp)
 target_link_libraries(ceasta-cli PRIVATE ceasta_core)
 ceasta_warnings(ceasta-cli)
 

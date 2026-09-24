@@ -1,3 +1,4 @@
+#include "cli/dbg_repl.h"
 #include "core/database.h"
 #include "core/decompiler.h"
 #include "core/lua_host.h"
@@ -30,8 +31,9 @@ static void usage()
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
            "  run <file> <script.lua>       run a lua script against the file (ceasta.* api)\n"
            "                                with --debug the file is started and stopped at its entry first,\n"
-           "                                so ceasta.dbg.* works (windows)\n"
-           "  debug <exe> [steps]           debugger smoke test: break on entry, step, run to exit (windows)\n\n"
+           "                                so ceasta.dbg.* works (windows x64, linux x64)\n"
+           "  dbg <program> [args...]       interactive debugger (break, step, registers, memory)\n"
+           "  debug <exe> [steps]           debugger smoke test: break on entry, step, run to exit\n\n"
            "options:\n"
            "  --raw32 / --raw64             load the file as raw code\n"
            "  --base <hex>                  base address for raw files\n"
@@ -81,7 +83,7 @@ static int cmd_debug(const std::vector<std::string>& args)
     }
     int steps = args.size() > 2 ? atoi(args[2].c_str()) : 5;
     if (!debugger::supported()) {
-        fprintf(stderr, "debugging is only supported in the windows x64 build\n");
+        fprintf(stderr, "this build has no debugger (it needs windows x64 or linux x64)\n");
         return 1;
     }
     std::string err;
@@ -177,6 +179,11 @@ static int cmd_debug(const std::vector<std::string>& args)
 
 int main(int argc, char** argv)
 {
+    // the interactive debugger takes the target's own arguments verbatim, so it
+    // is dispatched before the flag parsing below
+    if (argc >= 2 && strcmp(argv[1], "dbg") == 0)
+        return cmd_dbg(argc - 2, argv + 2);
+
     std::vector<std::string> args;
     load_options opts;
     bool debug_mode = false;
@@ -355,7 +362,7 @@ int main(int argc, char** argv)
         bool live = false;
         if (debug_mode) {
             if (!debugger::supported()) {
-                fprintf(stderr, "--debug needs the windows x64 build\n");
+                fprintf(stderr, "--debug needs a build with the debugger (windows x64 or linux x64)\n");
                 return 1;
             }
             dbg.on_log = [](const std::string& m) { printf("[dbg] %s\n", m.c_str()); };

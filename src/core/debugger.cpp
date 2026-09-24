@@ -887,7 +887,7 @@ std::vector<process_info> list_processes()
     return out;
 }
 
-#else
+#elif !defined(CEASTA_LINUX_DEBUGGER)
 
 // no debugger on this platform, every call reports that
 

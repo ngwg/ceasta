@@ -47,6 +47,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="..\src\cli\dbg_repl.cpp" />
     <ClCompile Include="..\src\cli\main.cpp" />
   </ItemGroup>
   <ItemGroup>

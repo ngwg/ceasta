@@ -4,7 +4,7 @@
 
 disassembler + debugger in one, c++ with imgui. ida style listing, a decompiler, a function graph, an x64dbg style debugger, and lua plugins.
 
-**runs on windows and linux.** windows gets the full app (gui + debugger). linux gets `ceasta-cli`: the same analysis, disassembly, decompiler and lua scripting from the terminal. both open windows (pe) and linux (elf) binaries.
+**runs on windows and linux.** windows gets the full app (gui + debugger). linux gets `ceasta-cli`: the same analysis, disassembly, decompiler, lua scripting, and a real ptrace debugger in the terminal. both open windows (pe) and linux (elf) binaries.
 
 ![listing](docs/listing.png)
 
@@ -23,7 +23,7 @@ get it from the [releases page](https://github.com/ngwg/ceasta/releases):
 - ida style listing: names instead of addresses, labels, xref and string comments
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
 - decompiler (f5): c-like pseudocode for a function - if / else, while / do, switch, calls with names
-- debugger (windows): start or attach, breakpoints, step into / over, run to cursor, pause, registers, stack, live memory in the hex view. 32 bit programs work too (wow64), aslr is handled
+- debugger: start or attach, breakpoints, step into / over, run to cursor, pause, registers, stack, live memory. windows (win32 debug api, gui + terminal) and linux (ptrace, `ceasta-cli dbg`). 32 bit programs and aslr are handled
 - rename, comments, jump to address or name, xrefs, byte search, back / forward
 - names, comments and breakpoints are saved per file (in `%APPDATA%\ceasta\db`)
 - lua plugins and a lua console
@@ -96,6 +96,7 @@ ceasta-cli decompile file.exe main  pseudocode for a function
 ceasta-cli xrefs file.exe CreateFileW
 ceasta-cli find file.exe "48 8b ?? 05"
 ceasta-cli run file.exe script.lua  run a plugin / script
+ceasta-cli dbg ./program [args]     interactive debugger (linux + windows)
 ```
 
 ## on linux
@@ -110,9 +111,24 @@ cd ceasta-cli-*-linux-x64
 ./ceasta-cli funcs /bin/ls | head           functions
 ./ceasta-cli decompile /bin/ls start        pseudocode for the entry point
 ./ceasta-cli run /bin/ls plugins/hello.lua  run a lua plugin
+./ceasta-cli dbg ./program                  debug it (break, step, registers, memory)
 ```
 
-it reads elf (x86 / x64) and windows pe files alike, so you can look at a windows exe from linux too. the gui and the debugger are windows only for now; everything in the [cli](#cli) and the [lua api](docs/lua.md) works on linux.
+it reads elf (x86 / x64) and windows pe files alike, so you can look at a windows exe from linux too.
+
+the terminal debugger (`dbg`) is a ptrace debugger with ceasta's names and disassembly built in:
+
+```
+(ceasta) b main            break at a name or address
+(ceasta) c                 continue
+(ceasta) ni                step over    si  step into    until <addr>  run to
+(ceasta) r                 registers    k  stack    x <addr>  memory
+(ceasta) u                 disassemble here (with names)
+(ceasta) dec               decompile the function you're stopped in
+(ceasta) lua ...           run lua against the live process
+```
+
+the gui is windows only for now; everything in the [cli](#cli), the debugger, and the [lua api](docs/lua.md) works on linux.
 
 ## build
 

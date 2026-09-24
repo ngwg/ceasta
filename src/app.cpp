@@ -309,16 +309,25 @@ void app_open_dialog_kind(app_state& s, dialog_kind kind, uint64_t addr)
 bool app_can_debug(const app_state& s, std::string* why)
 {
     std::string w;
+#ifdef _WIN32
+    const bin_format native = bin_format::pe;
+    const char* native_name = "a windows .exe";
+#else
+    const bin_format native = bin_format::elf;
+    const char* native_name = "a linux elf executable";
+#endif
     if (s.sandboxed)
         w = "debugging is disabled in this session";
     else if (!debugger::supported())
-        w = "the debugger is only available in the windows x64 build";
+        w = "the debugger isn't available in this build";
     else if (!s.db)
-        w = "open a windows .exe first";
-    else if (s.db->bin.format != bin_format::pe)
-        w = "only windows .exe files can be debugged";
-    else if (s.db->bin.kind == "dll")
-        w = "a dll can't run on its own: start its program, then use attach";
+        w = std::string("open ") + native_name + " first";
+    else if (s.db->bin.format != native)
+        w = std::string("only ") + native_name + " can be debugged here";
+    else if (s.db->bin.kind == "dll" || s.db->bin.kind == "elf shared object")
+        w = "a library can't run on its own: start its program, then use attach";
+    else if (s.db->bin.kind == "elf object" || s.db->bin.kind == "elf core")
+        w = "this elf file isn't a program that can run";
     if (why)
         *why = w;
     return w.empty();
