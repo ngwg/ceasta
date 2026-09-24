@@ -7,8 +7,10 @@
   - nothing reads a register after it changed any more, when an assignment has to be written out early
   - calls get their real arguments: functions in the binary are checked for what they read, and values a compiler keeps in registers across a call to a small function survive it
   - setcc, cmov, div / idiv, mul, rol / ror, bswap, popcnt are lifted (`rax == 5`, `a ? b : c`, `/` and `%`, `__rol(x, 5)`); anything else shows as `__asm { ... }` instead of vanishing
-  - loops with more than one exit, top-tested loops that compute before their test, and tail calls through pointers come out right
+  - loops with more than one exit, top-tested loops that compute before their test, and tail calls (a jump into another function, or through a pointer) come out right
   - switch cases are written inside the switch, and functions whose result no caller reads are `void`
+  - every goto has its label - a jump back to code that was already written had none
+- the pseudocode screenshot shows the new switch output
 - the linux download's release note mentions the terminal debugger
 
 ## v0.8.1 - 2026-09-24

@@ -474,7 +474,8 @@ struct insn_rw {
     uint32_t rd = 0, wr = 0;
     bool flags_rd = false, flags_wr = false;
     bool call = false, ret = false;
-    uint64_t target = 0; // direct call target
+    bool tail = false;   // a jump out of the function (a tail call)
+    uint64_t target = 0; // direct call / tail call target
 };
 
 // ------------------------------------------------------------------ lifter
@@ -884,7 +885,20 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                     }
                     if (r.wr & 1u)
                         call_sets_rax = true;
+                } else if (insn->id == X86_INS_JMP && x.op_count >= 1 && x.operands[0].type == X86_OP_IMM &&
+                           !block_of.count((uint64_t)x.operands[0].imm)) {
+                    // a jump out of the function: a tail call, the callee's result is ours
+                    r.tail = true;
+                    r.target = (uint64_t)x.operands[0].imm;
+                    const callee_info& ci = callee_of(r.target);
+                    for (int i = 0; i < ci.arity && i < (int)arg_bits.size(); i++)
+                        r.rd |= arg_bits[i];
+                    if (ci.clobbers & 1u)
+                        call_sets_rax = true;
                 } else {
+                    if (insn->id == X86_INS_JMP && x.op_count >= 1 && x.operands[0].type == X86_OP_MEM &&
+                        !db_.an.tables.count(a))
+                        r.tail = true; // jmp [ptr]: a tail call through a pointer
                     if (r.wr & 1u)
                         returns_value = true; // rax written somewhere -> assume it returns a value
                     if (!cs_insn_group(cs_, insn, X86_GRP_FPU)) {
@@ -967,12 +981,13 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         std::vector<uint32_t> set_out(nb, 0);
         auto walk = [&](size_t bi, uint32_t s, bool apply) {
             for (insn_rw& r : rws[bi]) {
-                if (r.call) {
+                if (r.call || r.tail) {
                     // a known callee's arguments are already counted
                     bool known = r.target && callee_of(r.target).arity >= 0;
                     for (size_t i = 0; apply && !known && i < arg_bits.size() && (s & arg_bits[i]); i++)
                         r.rd |= arg_bits[i];
-                    s &= ~r.wr;
+                    if (r.call)
+                        s &= ~r.wr;
                 } else {
                     s |= r.wr & arg_mask;
                 }
@@ -1596,7 +1611,24 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                     if (returns_value)
                         ir.cond = reg_read(cur, "rax");
                 } else if (id == X86_INS_JMP) {
-                    if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
+                    if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM &&
+                        !block_of.count((uint64_t)x.operands[0].imm)) {
+                        // a jump out of the function: a tail call
+                        uint64_t t = (uint64_t)x.operands[0].imm;
+                        auto ce = std::make_shared<expr>();
+                        ce->kind = expr::k::call;
+                        std::string nm = db_.name_at(t);
+                        ce->text = nm.empty() ? db_.location(t) : nm;
+                        ce->ref = t;
+                        int known = callee_of(t).arity;
+                        for (size_t i = 0; i < arg_bits.size(); i++) {
+                            if (known >= 0 ? (int)i >= known : !(argset & arg_bits[i]))
+                                break;
+                            ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
+                        }
+                        ir.term = term_kind::indirect;
+                        ir.cond = ce;
+                    } else if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
                         ir.term = term_kind::jump;
                         ir.fall = (uint64_t)x.operands[0].imm;
                     } else {
@@ -1921,7 +1953,9 @@ void structurer::emit_block_stmts(int b, int indent)
 // a small block that returns is repeated where it's needed again, instead of a goto
 bool structurer::repeat_return(int b, int indent, int stop, std::vector<loopctx>& loops)
 {
-    if (b < 0 || blocks[b].term != term_kind::ret || blocks[b].stmts.size() > 2)
+    const block_ir& ib = b < 0 ? blocks[0] : blocks[b];
+    bool tail = ib.term == term_kind::indirect && ib.cond && ib.cond->kind == expr::k::call;
+    if (b < 0 || (ib.term != term_kind::ret && !tail) || ib.stmts.size() > 2)
         return false;
     emit_block_stmts(b, indent);
     emit_term(b, indent, stop, loops);
@@ -1938,7 +1972,13 @@ void structurer::go(int target, int indent, int stop, std::vector<loopctx>& loop
             return;
         }
         if (target == loops.back().header) {
-            line(indent, "continue;");
+            if (loops.back().dowhile) {
+                // continue would test the do-while condition first; this jump doesn't
+                want_label.insert(target);
+                line(indent, "goto " + label_name(target) + ";");
+            } else {
+                line(indent, "continue;");
+            }
             return;
         }
     }
@@ -2072,7 +2112,7 @@ void structurer::emit_term(int b, int indent, int stop, std::vector<loopctx>& lo
                                 lt.compare(0, 5, "goto ") == 0;
                     if (!left)
                         line(indent + 2, "break;");
-                } else {
+                } else if (!(emitted[tb] && repeat_return(tb, indent + 2, merge, loops))) {
                     want_label.insert(tb);
                     line(indent + 2, "goto " + label_name(tb) + ";");
                 }
@@ -2161,6 +2201,8 @@ void structurer::emit(int b, int indent, int stop, std::vector<loopctx>& loops)
         }
 
         emitted[b] = 1;
+        if (want_label.count(b))
+            line(indent, label_name(b) + ":", hb.start);
         loopctx lc;
         lc.header = b;
         lc.follow = loop_follow[b];
@@ -2284,28 +2326,47 @@ void structurer::run(int entry)
             ipdom[i] = (pd[i] == vexit) ? -1 : pd[i];
     }
     find_loops();
-    emitted.assign(blocks.size(), 0);
 
-    std::vector<loopctx> loops;
-    emit(entry, 0, -1, loops);
-    // any block the walk missed (irreducible / unreachable) - append with a label
-    for (int b : rpo)
-        if (!emitted[b]) {
-            want_label.insert(b);
-            line(0, "");
-            emit(b, 0, -1, loops);
-        }
+    // a goto can go back to a block that is already written: a first pass finds every
+    // label that's needed, the next one writes them
+    std::set<int> labels;
+    for (int pass = 0; pass < 4; pass++) {
+        out.clear();
+        emitted.assign(blocks.size(), 0);
+        want_label = labels;
+        std::vector<loopctx> loops;
+        emit(entry, 0, -1, loops);
+        // any block the walk missed (irreducible / unreachable) - append with a label
+        for (int b : rpo)
+            if (!emitted[b]) {
+                want_label.insert(b);
+                line(0, "");
+                emit(b, 0, -1, loops);
+            }
+        if (want_label == labels)
+            break;
+        labels = want_label;
+    }
 }
 
 // tidy up the emitted lines: drop empty then-branches and empty blocks
 std::vector<decomp_line> cleanup(const std::vector<decomp_line>& in)
 {
     std::vector<decomp_line> v;
+    // which line opened the block at each indent, to tell loop bodies from if bodies
+    std::vector<std::string> opener;
     auto is_if = [](const std::string& s) {
         return s.size() > 7 && s.compare(0, 4, "if (") == 0 && s.compare(s.size() - 3, 3, ") {") == 0;
     };
     for (size_t i = 0; i < in.size(); i++) {
         const decomp_line& l = in[i];
+        if (opener.size() <= (size_t)l.indent)
+            opener.resize((size_t)l.indent + 1);
+        if (!l.text.empty() && l.text.back() == '{')
+            opener[(size_t)l.indent] = l.text;
+        if (l.text == "continue;" && l.indent > 0 && i + 1 < in.size() && in[i + 1].indent == l.indent - 1 &&
+            in[i + 1].text == "}" && opener[(size_t)l.indent - 1].compare(0, 6, "while ") == 0)
+            continue;
         if (l.text == "} else {" && i + 1 < in.size() && in[i + 1].indent == l.indent && in[i + 1].text == "}") {
             // empty else: just close the if
             decomp_line nl = l;
