@@ -1,0 +1,45 @@
+#include "ui/status_bar.h"
+#include "core/util.h"
+#include "imgui.h"
+#include "theme.h"
+
+namespace status_bar {
+
+void draw(app_state& s)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetWindowWidth();
+    float h = ImGui::GetFrameHeight();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(ImGuiCol_MenuBarBg));
+    ImGui::SetCursorScreenPos(ImVec2(p.x + ImGui::GetStyle().ItemSpacing.x, p.y));
+    ImGui::AlignTextToFramePadding();
+
+    // state first: what the program is doing right now
+    if (s.job) {
+        ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.4f, 1), "analyzing %d%%", s.job->progress.percent.load());
+    } else if (s.dbg.state() == dbg_state::running) {
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "debugging: running");
+    } else if (s.dbg.state() == dbg_state::stopped) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::pc_arrow), "debugging: stopped (%s)", s.dbg.stop_reason().c_str());
+    } else {
+        ImGui::TextDisabled("ready");
+    }
+    if (s.db) {
+        database& db = *s.db;
+        ImGui::SameLine(0, 24);
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::Text("%s:%s", db.seg_name(s.cursor).c_str(), db.fmt_addr(s.cursor).c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", db.location(s.cursor).c_str());
+        ImGui::SameLine(0, 24);
+        ImGui::TextDisabled("|  %zu functions  %s%s", db.an.funcs.size(), db.dirty ? "  unsaved changes (ctrl+s)" : "",
+            db.breakpoints.empty() ? "" : util::fmt("  %zu breakpoints", db.breakpoints.size()).c_str());
+    }
+    // the dummy makes the status line a real item so the window accounts for it
+    ImGui::SetCursorScreenPos(p);
+    ImGui::Dummy(ImVec2(w, h));
+}
+
+}

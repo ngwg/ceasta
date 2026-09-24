@@ -1,6 +1,6 @@
 #pragma once
 #include "app.h"
 
-namespace status_bar {
+namespace graph_view {
 void draw(app_state& state);
 }
