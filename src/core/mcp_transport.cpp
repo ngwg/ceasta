@@ -13,11 +13,13 @@
 #define DUP _dup
 #define DUP2 _dup2
 #define FILENO _fileno
+#define FDOPEN _fdopen
 #else
 #include <unistd.h>
 #define DUP dup
 #define DUP2 dup2
 #define FILENO fileno
+#define FDOPEN fdopen
 #endif
 
 // ------------------------------------------------------------------ stdio
@@ -87,7 +89,7 @@ int mcp_serve_stdio(mcp_server& server)
     if (saved >= 0) {
         fflush(stdout);
         DUP2(FILENO(stderr), FILENO(stdout));
-        FILE* f = fdopen(saved, "wb");
+        FILE* f = FDOPEN(saved, "wb");
         if (f)
             out = f;
     }

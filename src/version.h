@@ -1,3 +1,3 @@
 #pragma once
 
-#define CEASTA_VERSION "0.8.2"
+#define CEASTA_VERSION "0.9.0"

@@ -1,5 +1,20 @@
 # changelog
 
+## v0.9.0 - 2026-09-24
+
+- a built-in mcp server: connect an ai (claude code / desktop, cursor, ...) to the open binary
+  - `ceasta-cli mcp <file>` (stdio) or `--http <port>`; read, decompile, xrefs, rename, comment
+  - `--allow-debug` adds the debugger tools: breakpoints, stepping, registers, memory, and
+    debug_call (call a function and get its result), debug_trace, debug_decompile_here
+  - `--allow-lua` adds run_lua. see docs/mcp.md
+- call a function in the running program: repl `call`, lua `ceasta.dbg.call`, mcp debug_call
+- live pseudocode: stopped in a function, the current line is marked (repl `dec`, mcp)
+- runtime xrefs: `trace` records the targets of indirect calls / jumps the program takes
+- binary diff: `ceasta-cli diff <old> <new>` and the diff_binary mcp tool
+- library signatures: `sigmake` / `sigapply` name known functions in a stripped binary
+- project files: names / comments / breakpoints save to a committable `<binary>.ceasta`
+- experimental linux gui (glfw + opengl3), off by default (`-DCEASTA_LINUX_GUI=ON`)
+
 ## v0.8.2 - 2026-09-24
 
 - decompiler fixes - it could print code that doesn't do what the program does
