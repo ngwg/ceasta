@@ -659,6 +659,38 @@ std::string database::db_path() const
 // writes to it, so a team (or an ai) can keep names and comments in version control.
 std::string database::project_path() const { return bin.path + ".ceasta"; }
 
+bool database::add_xref(uint64_t from, uint64_t to, xref_type type)
+{
+    if (!bin.is_mapped(from) || !bin.is_mapped(to))
+        return false;
+    xref x{from, to, type};
+    // keep an.xto sorted by (to, from, type)
+    auto to_less = [](const xref& a, const xref& b) {
+        if (a.to != b.to)
+            return a.to < b.to;
+        if (a.from != b.from)
+            return a.from < b.from;
+        return a.type < b.type;
+    };
+    auto it = std::lower_bound(an.xto.begin(), an.xto.end(), x, to_less);
+    if (it != an.xto.end() && it->to == to && it->from == from && it->type == type)
+        return false; // already known
+    an.xto.insert(it, x);
+    // keep an.xfrom sorted by (from, to)
+    auto from_less = [](const xref& a, const xref& b) {
+        return a.from != b.from ? a.from < b.from : a.to < b.to;
+    };
+    an.xfrom.insert(std::lower_bound(an.xfrom.begin(), an.xfrom.end(), x, from_less), x);
+    uint8_t f = an.flags_at(to);
+    bool tail = (f & fl_tail) && !(f & (fl_code | fl_str | fl_data));
+    if (!tail && !(f & (fl_func | fl_label)))
+        an.add_flags(to, fl_label);
+    extra_xrefs.push_back(x);
+    rows_dirty_ = true;
+    dirty = true;
+    return true;
+}
+
 std::string database::serialize() const
 {
     // sorted (user_names / user_comments are std::map, breakpoints std::set), so the file is
@@ -670,6 +702,8 @@ std::string database::serialize() const
         s += "comment " + util::hex(c.first) + " " + escape_line(c.second) + "\n";
     for (uint64_t b : breakpoints)
         s += "bp " + util::hex(b) + "\n";
+    for (const xref& x : extra_xrefs)
+        s += "xref " + util::hex(x.from) + " " + util::hex(x.to) + " " + std::to_string((int)x.type) + "\n";
     return s;
 }
 
@@ -738,6 +772,17 @@ bool database::load_annotations(std::string& err)
             set_comment(a, unescape_line(rest));
         else if (kind == "bp" && bin.is_mapped(a))
             breakpoints.insert(a);
+        else if (kind == "xref") {
+            // "xref <from> <to> <kind>": a runtime-learned cross reference
+            uint64_t to = 0;
+            int k = 0;
+            size_t sp3 = rest.find(' ');
+            if (sp3 != std::string::npos && util::parse_hex(rest.substr(0, sp3), to)) {
+                k = atoi(rest.c_str() + sp3 + 1);
+                if (k >= 0 && k <= (int)xref_type::offset)
+                    add_xref(a, to, (xref_type)k);
+            }
+        }
     }
     dirty = false;
     return true;

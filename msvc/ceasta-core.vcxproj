@@ -46,6 +46,7 @@
     <ClCompile Include="..\src\core\analysis.cpp" />
     <ClCompile Include="..\src\core\binary.cpp" />
     <ClCompile Include="..\src\core\database.cpp" />
+    <ClCompile Include="..\src\core\dbg_trace.cpp" />
     <ClCompile Include="..\src\core\debugger.cpp" />
     <ClCompile Include="..\src\core\decompiler.cpp" />
     <ClCompile Include="..\src\core\diff.cpp" />

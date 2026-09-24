@@ -2,6 +2,7 @@
 
 #include "core/database.h"
 #include "core/debugger.h"
+#include "core/dbg_trace.h"
 #include "core/decompiler.h"
 #include "core/diff.h"
 #include "core/lua_host.h"
@@ -1223,6 +1224,42 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             std::string sym = symbolize(s, *db, *d, result);
             if (!sym.empty())
                 out += "\n         " + sym;
+            return true;
+        });
+
+    add("debug_trace",
+        "Single-step the stopped program for up to `count` instructions and record the target of "
+        "every indirect call / jump it takes (a call through a pointer, a vtable dispatch, a jump "
+        "table). Those targets become cross-references the static analysis couldn't find, and are "
+        "saved with the project. Stepping is slow, so keep the count modest and set a breakpoint "
+        "first to trace a specific spot.",
+        schema({{"count", prop("integer", "how many instructions to step (default 2000, at most 200000)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            int max = arg_int(args, "count", 2000, 1, 200000);
+            int found = 0;
+            std::string err, list;
+            int stepped = dbg_trace(*d, max, [&](uint64_t from, uint64_t to, bool is_call) {
+                uint64_t sf, st;
+                if (s.debug.to_static && s.debug.to_static(from, sf) && s.debug.to_static(to, st) &&
+                    db->add_xref(sf, st, is_call ? xref_type::call : xref_type::jump)) {
+                    found++;
+                    if (found <= 200)
+                        list += util::fmt("  %-4s %s -> %s\n", is_call ? "call" : "jmp", db->location(sf).c_str(),
+                                          db->location(st).c_str());
+                }
+            }, err);
+            if (s.on_changed && found)
+                s.on_changed();
+            out = util::fmt("stepped %d instructions, found %d new indirect target%s\n", stepped, found,
+                            found == 1 ? "" : "s");
+            out += list;
+            if (d->state() != dbg_state::stopped)
+                out += "(the program is no longer stopped)\n";
+            cap(out);
             return true;
         });
 

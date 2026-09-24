@@ -1,6 +1,7 @@
 #include "cli/dbg_repl.h"
 
 #include "core/database.h"
+#include "core/dbg_trace.h"
 #include "core/debugger.h"
 #include "core/decompiler.h"
 #include "core/disasm.h"
@@ -184,6 +185,7 @@ void help()
         "  x <addr> [n]      hex dump memory      k [n]  stack\n"
         "  bt                where am i (pc + function)\n"
         "  call <f> [args]   call a function, print its result (args: number, name, \"string\")\n"
+        "  trace [n]         single-step n insns, record indirect call / jump targets as xrefs\n"
         "  mods              modules              threads / thread <tid>\n"
         "  lua <code>        run lua (ceasta.dbg.* is live)\n"
         "  q                 quit\n");
@@ -366,6 +368,18 @@ int cmd_dbg(int argc, char** argv)
                 printf("= %#" PRIx64 " (%" PRId64 ")\n", result, (int64_t)result);
             else
                 printf("call failed: %s\n", err.c_str());
+        } else if (c == "trace") {
+            int max = tok.size() > 1 ? atoi(tok[1].c_str()) : 2000;
+            int found = 0;
+            int stepped = dbg_trace(g_dbg, max, [&](uint64_t from, uint64_t to, bool is_call) {
+                uint64_t sf, st2;
+                if (in_image(from, sf) && in_image(to, st2) && g_db->add_xref(sf, st2, is_call ? xref_type::call : xref_type::jump)) {
+                    found++;
+                    printf("  %s %s -> %s\n", is_call ? "call" : "jmp ", loc_rt(from).c_str(), loc_rt(to).c_str());
+                }
+            }, err);
+            printf("traced %d instructions, %d new indirect target%s\n", stepped, found, found == 1 ? "" : "s");
+            show_stop();
         } else if (c == "k" || c == "stack") {
             cmd_stack(tok.size() > 1 ? atoi(tok[1].c_str()) : 8);
         } else if (c == "bt" || c == "where") {
