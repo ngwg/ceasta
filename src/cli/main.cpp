@@ -1,4 +1,5 @@
 #include "cli/dbg_repl.h"
+#include "cli/mcp_cmd.h"
 #include "core/database.h"
 #include "core/decompiler.h"
 #include "core/lua_host.h"
@@ -33,6 +34,8 @@ static void usage()
            "                                with --debug the file is started and stopped at its entry first,\n"
            "                                so ceasta.dbg.* works (windows x64, linux x64)\n"
            "  dbg <program> [args...]       interactive debugger (break, step, registers, memory)\n"
+           "  mcp <file> [options]          serve the file to an ai client over the model context\n"
+           "                                protocol (stdio, or --http PORT); ceasta-cli mcp --help\n"
            "  debug <exe> [steps]           debugger smoke test: break on entry, step, run to exit\n\n"
            "options:\n"
            "  --raw32 / --raw64             load the file as raw code\n"
@@ -183,6 +186,9 @@ int main(int argc, char** argv)
     // is dispatched before the flag parsing below
     if (argc >= 2 && strcmp(argv[1], "dbg") == 0)
         return cmd_dbg(argc - 2, argv + 2);
+    // the mcp server takes its own options; keep them out of the flag parsing below
+    if (argc >= 2 && strcmp(argv[1], "mcp") == 0)
+        return cmd_mcp(argc - 2, argv + 2);
 
     std::vector<std::string> args;
     load_options opts;

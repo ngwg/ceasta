@@ -43,12 +43,13 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>shell32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\src\cli\dbg_repl.cpp" />
     <ClCompile Include="..\src\cli\main.cpp" />
+    <ClCompile Include="..\src\cli\mcp_cmd.cpp" />
   </ItemGroup>
   <ItemGroup>
   </ItemGroup>

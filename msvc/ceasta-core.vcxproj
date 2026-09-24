@@ -50,7 +50,10 @@
     <ClCompile Include="..\src\core\decompiler.cpp" />
     <ClCompile Include="..\src\core\disasm.cpp" />
     <ClCompile Include="..\src\core\elf.cpp" />
+    <ClCompile Include="..\src\core\json.cpp" />
     <ClCompile Include="..\src\core\lua_host.cpp" />
+    <ClCompile Include="..\src\core\mcp.cpp" />
+    <ClCompile Include="..\src\core\mcp_transport.cpp" />
     <ClCompile Include="..\src\core\os.cpp" />
     <ClCompile Include="..\src\core\pe.cpp" />
   </ItemGroup>
@@ -61,7 +64,10 @@
     <ClInclude Include="..\src\core\debugger.h" />
     <ClInclude Include="..\src\core\decompiler.h" />
     <ClInclude Include="..\src\core\disasm.h" />
+    <ClInclude Include="..\src\core\json.h" />
     <ClInclude Include="..\src\core\lua_host.h" />
+    <ClInclude Include="..\src\core\mcp.h" />
+    <ClInclude Include="..\src\core\mcp_transport.h" />
     <ClInclude Include="..\src\core\os.h" />
     <ClInclude Include="..\src\core\util.h" />
   </ItemGroup>

@@ -21,6 +21,7 @@ std::string exe_dir();
 std::string user_dir();
 
 uint64_t now_ms();
+void sleep_ms(uint32_t ms);
 // opens a folder or file with the system shell. no-op where unsupported
 void open_in_shell(const std::string& path);
 
