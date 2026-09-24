@@ -1,6 +1,8 @@
+<img src="docs/icon.png" align="left" width="72" height="72" alt="ceasta">
+
 # ceasta
 
-disassembler + debugger in one, c++ with imgui. ida style listing and function graph, an x64dbg style debugger, and lua plugins.
+disassembler + debugger in one, c++ with imgui. ida style listing, a decompiler, a function graph, an x64dbg style debugger, and lua plugins.
 
 ![listing](docs/listing.png)
 
@@ -37,6 +39,10 @@ one window, nothing floating around:
 - drag the lines between panels to resize, the view menu hides panels, ctrl + / ctrl - changes the text size
 
 ![graph](docs/graph.png)
+
+the decompiler (f5):
+
+![pseudocode](docs/pseudo.png)
 
 ## keys
 
