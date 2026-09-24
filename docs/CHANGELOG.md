@@ -1,5 +1,16 @@
 # changelog
 
+## v0.8.2 - 2026-09-24
+
+- decompiler fixes - it could print code that doesn't do what the program does
+  - values a later block reads were dropped: a loop could lose its counter increment, a function its return value
+  - nothing reads a register after it changed any more, when an assignment has to be written out early
+  - calls get their real arguments: functions in the binary are checked for what they read, and values a compiler keeps in registers across a call to a small function survive it
+  - setcc, cmov, div / idiv, mul, rol / ror, bswap, popcnt are lifted (`rax == 5`, `a ? b : c`, `/` and `%`, `__rol(x, 5)`); anything else shows as `__asm { ... }` instead of vanishing
+  - loops with more than one exit, top-tested loops that compute before their test, and tail calls through pointers come out right
+  - switch cases are written inside the switch, and functions whose result no caller reads are `void`
+- the linux download's release note mentions the terminal debugger
+
 ## v0.8.1 - 2026-09-24
 
 - licensed under GPLv3 - the license now ships in the installer, the zip and the linux download
