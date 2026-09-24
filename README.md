@@ -4,6 +4,8 @@
 
 disassembler + debugger in one, c++ with imgui. ida style listing, a decompiler, a function graph, an x64dbg style debugger, and lua plugins.
 
+**runs on windows and linux.** windows gets the full app (gui + debugger). linux gets `ceasta-cli`: the same analysis, disassembly, decompiler and lua scripting from the terminal. both open windows (pe) and linux (elf) binaries.
+
 ![listing](docs/listing.png)
 
 ## download
@@ -12,7 +14,7 @@ get it from the [releases page](https://github.com/ngwg/ceasta/releases):
 
 - `ceasta-x.y.z-setup.exe` - installer for windows 10/11 x64. installs for your user (no admin needed), start menu entry, optional desktop icon, optional "open with ceasta" in the right-click menu of .exe/.dll/.sys files, optional PATH entry for the cli.
 - `ceasta-x.y.z-windows-x64.zip` - portable, unzip and run `ceasta.exe`.
-- `ceasta-cli-x.y.z-linux-x64.tar.gz` - the command line tool for linux.
+- `ceasta-cli-x.y.z-linux-x64.tar.gz` - linux x64: `ceasta-cli` plus the lua plugins. analysis, disassembly, decompiler and scripting, no install needed (see [on linux](#on-linux)).
 
 ## what it does
 
@@ -95,6 +97,22 @@ ceasta-cli xrefs file.exe CreateFileW
 ceasta-cli find file.exe "48 8b ?? 05"
 ceasta-cli run file.exe script.lua  run a plugin / script
 ```
+
+## on linux
+
+grab `ceasta-cli-x.y.z-linux-x64.tar.gz` from the [releases page](https://github.com/ngwg/ceasta/releases), unpack it and run it, nothing else to install:
+
+```
+tar xzf ceasta-cli-*-linux-x64.tar.gz
+cd ceasta-cli-*-linux-x64
+
+./ceasta-cli info /bin/ls                   format, entry, function / import / string counts
+./ceasta-cli funcs /bin/ls | head           functions
+./ceasta-cli decompile /bin/ls start        pseudocode for the entry point
+./ceasta-cli run /bin/ls plugins/hello.lua  run a lua plugin
+```
+
+it reads elf (x86 / x64) and windows pe files alike, so you can look at a windows exe from linux too. the gui and the debugger are windows only for now; everything in the [cli](#cli) and the [lua api](docs/lua.md) works on linux.
 
 ## build
 
