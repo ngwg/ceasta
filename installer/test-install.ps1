@@ -22,7 +22,7 @@ $p = Start-Process -FilePath $Setup -Wait -PassThru -ArgumentList @(
     "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/DIR=`"$dir`"", "/TASKS=`"contextmenu,addtopath`"",
     "/LOG=`"$env:TEMP\ceasta-install.log`"")
 Check ($p.ExitCode -eq 0) "installer exit code $($p.ExitCode)"
-foreach ($f in @("ceasta.exe", "ceasta-cli.exe", "plugins\hello.lua", "plugins\README.md", "README.md", "THIRD_PARTY_NOTICES.md", "unins000.exe")) {
+foreach ($f in @("ceasta.exe", "ceasta-cli.exe", "plugins\hello.lua", "plugins\README.md", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "unins000.exe")) {
     Check (Test-Path (Join-Path $dir $f)) "installed $f"
 }
 $cmd = (Get-ItemProperty -Path "HKCU:\Software\Classes\SystemFileAssociations\.exe\shell\ceasta\command" -ErrorAction SilentlyContinue).'(default)'
