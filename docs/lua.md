@@ -156,7 +156,7 @@ for _, a in ipairs(ceasta.find("48 8b ?? 05")) do ceasta.log(("%X"):format(a)) e
 
 ## api: `ceasta.dbg.*` (debugger)
 
-available on the windows build while a process is loaded under the debugger
+available while a process is loaded under the debugger (windows, or linux with `ceasta-cli dbg` / `run --debug`)
 (start with **F9**, or `ceasta-cli run ... --debug`). addresses here are
 **runtime** addresses.
 

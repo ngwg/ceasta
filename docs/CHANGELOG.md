@@ -1,5 +1,16 @@
 # changelog
 
+## v0.8.0 - 2026-09-24
+
+- linux debugger, built on ptrace - the debugger is no longer windows only
+  - breakpoints, step into / over, run to, pause, registers, stack, live memory
+  - 64 and 32 bit programs, pie / aslr handled, breakpoint bytes hidden from reads
+- `ceasta-cli dbg <program>`: an interactive terminal debugger with ceasta's
+  names, disassembly and decompiler built in (b / c / si / ni / until / r / x /
+  u / dec / k / lua). works on linux and windows
+- `ceasta.dbg.*` and `run --debug` work on linux too
+- the icon is flat and centered now (was clipped)
+
 ## v0.7.0 - 2026-09-24
 
 - decompiler: c-like pseudocode for a function (f5, or the Pseudocode tab)
