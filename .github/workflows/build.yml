@@ -81,6 +81,15 @@ jobs:
           build\Release\ceasta-cli.exe debug tests\fixtures\sample32.exe 5
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: lua plugin driving the debugger (call tracer on a live process)
+        run: |
+          $out = build\Release\ceasta-cli.exe run tests\fixtures\sample64.exe plugins\trace_calls.lua --debug 2>&1
+          $out | Select-Object -First 60
+          $out | Select-Object -Last 5
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not ($out -match "traced \d+ step")) { exit 1 }
+          if (-not ($out -match " -> ")) { exit 1 }
+
       - uses: microsoft/setup-msbuild@v2
 
       - name: the visual studio solution builds too

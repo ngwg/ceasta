@@ -27,6 +27,8 @@ static void usage()
            "  xrefs <file> <where>          references to an address\n"
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
            "  run <file> <script.lua>       run a lua script against the file (ceasta.* api)\n"
+           "                                with --debug the file is started and stopped at its entry first,\n"
+           "                                so ceasta.dbg.* works (windows)\n"
            "  debug <exe> [steps]           debugger smoke test: break on entry, step, run to exit (windows)\n\n"
            "options:\n"
            "  --raw32 / --raw64             load the file as raw code\n"
@@ -175,6 +177,7 @@ int main(int argc, char** argv)
 {
     std::vector<std::string> args;
     load_options opts;
+    bool debug_mode = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--raw32" || a == "--raw64") {
@@ -185,6 +188,8 @@ int main(int argc, char** argv)
                 fprintf(stderr, "bad base address\n");
                 return 2;
             }
+        } else if (a == "--debug") {
+            debug_mode = true;
         } else if (a == "-h" || a == "--help") {
             usage();
             return 0;
@@ -331,13 +336,45 @@ int main(int argc, char** argv)
             usage();
             return 2;
         }
+        debugger dbg;
+        uint64_t delta = 0;
+        bool live = false;
+        if (debug_mode) {
+            if (!debugger::supported()) {
+                fprintf(stderr, "--debug needs the windows x64 build\n");
+                return 1;
+            }
+            dbg.on_log = [](const std::string& m) { printf("[dbg] %s\n", m.c_str()); };
+            if (!dbg.start(b.path, "", "", err)) {
+                fprintf(stderr, "can't start %s: %s\n", b.path.c_str(), err.c_str());
+                return 1;
+            }
+            uint64_t until = os::now_ms() + 15000;
+            while (dbg.state() == dbg_state::running && os::now_ms() < until)
+                dbg.poll(50);
+            if (dbg.state() != dbg_state::stopped) {
+                fprintf(stderr, "the program didn't stop at its entry point\n");
+                dbg.kill();
+                return 1;
+            }
+            delta = dbg.image_base() - b.base;
+            live = true;
+        }
         lua_host lua;
         lua_bridge br;
         br.db = &db;
-        br.log = [](const std::string& s, int level) { fprintf(level > 0 ? stderr : stdout, "%s\n", s.c_str()); };
+        br.dbg = debug_mode ? &dbg : nullptr;
+        br.log = [](const std::string& s, int level) { fprintf(level > 1 ? stderr : stdout, "%s\n", s.c_str()); };
         uint64_t here = b.has_entry ? b.entry : b.min_addr();
         br.here = [&]() { return here; };
         br.jump = [&](uint64_t a) { here = a; };
+        br.to_runtime = [&](uint64_t a) { return live ? a + delta : a; };
+        br.to_static = [&](uint64_t a, uint64_t& out) {
+            if (!live || !b.is_mapped(a - delta))
+                return false;
+            out = a - delta;
+            return true;
+        };
         lua.init(br);
         lua.fire("load");
         bool ok = lua.run_file(args[2]);
@@ -346,6 +383,8 @@ int main(int argc, char** argv)
             printf("--- %s\n", lua.commands()[i].name.c_str());
             ok = lua.run_command(i) && ok;
         }
+        if (dbg.state() != dbg_state::none)
+            dbg.kill();
         return ok ? 0 : 1;
     }
     usage();

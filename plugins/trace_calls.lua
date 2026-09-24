@@ -10,6 +10,13 @@
 local MAX_STEPS = 4000
 local tracing = false
 
+-- calls we don't follow: imports, indirect calls, and thunks that jump to an import
+local function external(target)
+    if not target or not ceasta.is_code(target) then return true end
+    local first = ceasta.disasm(target)
+    return first ~= nil and first.flow == "jump" and first.target == nil
+end
+
 local function trace()
     local dbg = ceasta.dbg
     if dbg.state() ~= "stopped" then
@@ -31,10 +38,10 @@ local function trace()
             local dst = ins.target and ceasta.location(ins.target) or "(indirect)"
             ceasta.log(("%s%s -> %s"):format(("  "):rep(math.min(depth, 8)), string.format("%X", pc), dst))
             calls = calls + 1
-            if ins.target and ceasta.is_code(ins.target) then
-                depth = depth + 1
-            else
+            if external(ins.target) then
                 step = dbg.step_over -- imports and indirect calls run at full speed
+            else
+                depth = depth + 1
             end
         elseif ins.flow == "ret" then
             depth = math.max(0, depth - 1)
