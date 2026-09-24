@@ -81,7 +81,7 @@ ceasta.register_command("Count calls", function()
 end)
 ```
 
-the whole api is in [plugins/README.md](plugins/README.md). the output panel has a lua prompt too, try `ceasta.name(ceasta.here())`.
+the whole api is in the [lua scripting guide](docs/lua.md). the output panel has a lua prompt too, try `ceasta.name(ceasta.here())`.
 
 ## cli
 
@@ -104,10 +104,10 @@ windows:
 - or cmake: `cmake -S . -B build` then `cmake --build build --config Release`
 - release files (zip + installer, needs [inno setup 6](https://jrsoftware.org/isinfo.php)): `powershell -ExecutionPolicy Bypass -File installer\package.ps1`
 
-linux builds the core, the cli and the tests (the gui is windows only):
+linux builds the core and the cli (the gui is windows only):
 
 ```
-cmake -S . -B build && cmake --build build -j && ctest --test-dir build
+cmake -S . -B build && cmake --build build -j
 ```
 
 everything needed is in the repo, nothing to install besides the compiler.
@@ -121,7 +121,7 @@ everything needed is in the repo, nothing to install besides the compiler.
 - `src/cli/` - ceasta-cli
 - `src/main.cpp` - the win32 + directx 11 window
 - `plugins/` - lua plugins that ship with it
-- `tests/` - core tests with fuzzed inputs, headless ui tests, test binaries
-- `installer/` - inno setup script, packaging and install test scripts
+- `docs/` - the [lua guide](docs/lua.md), the [changelog](docs/CHANGELOG.md), third party licenses, screenshots
+- `installer/` - inno setup script and packaging
 - `msvc/` - visual studio projects for the libraries
-- `third_party/` - imgui, capstone (x86 only), lua 5.4. licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+- `third_party/` - imgui, capstone (x86 only), lua 5.4. licenses in [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md)

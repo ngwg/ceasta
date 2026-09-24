@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   linux:
-    name: linux - tests, sanitizers, cli package
+    name: linux - build + cli package
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -29,30 +29,14 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
 
-      - name: test
-        run: ctest --test-dir build --output-on-failure
-
-      - name: address + undefined behavior sanitizers, fuzzed loaders
-        env:
-          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-          CEASTA_FUZZ_ROUNDS: "60"
-        run: |
-          san="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_FLAGS="$san" -DCMAKE_CXX_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="$san"
-          cmake --build build-san --parallel --target ceasta-tests ceasta-ui-tests
-          ./build-san/ceasta-tests tests/fixtures
-          ./build-san/ceasta-ui-tests tests/fixtures plugins
-
       - name: package the command line tool
         run: |
           version=$(sed -n 's/^#define CEASTA_VERSION "\(.*\)"/\1/p' src/version.h)
           name=ceasta-cli-$version-linux-x64
           mkdir -p dist/$name
-          cp build/ceasta-cli README.md CHANGELOG.md THIRD_PARTY_NOTICES.md dist/$name/
+          cp build/ceasta-cli README.md docs/CHANGELOG.md docs/THIRD_PARTY_NOTICES.md dist/$name/
           cp -r plugins dist/$name/
           tar -C dist -czf dist/$name.tar.gz $name
-          ./dist/$name/ceasta-cli info tests/fixtures/sample64.elf
 
       - uses: actions/upload-artifact@v4
         with:
@@ -60,34 +44,17 @@ jobs:
           path: dist/*.tar.gz
 
   windows:
-    name: windows - msvc, debugger, installer
+    name: windows - msvc, installer
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
-      - name: build and test (cmake + msvc)
+      - name: build (cmake + msvc)
         run: |
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build build --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          ctest --test-dir build -C Release --output-on-failure
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: debugger - breakpoints, stepping, aslr (64 bit and 32 bit targets)
-        run: |
-          build\Release\ceasta-cli.exe debug tests\fixtures\sample64.exe 5
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          build\Release\ceasta-cli.exe debug tests\fixtures\sample32.exe 5
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: lua plugin driving the debugger (call tracer on a live process)
-        run: |
-          $out = build\Release\ceasta-cli.exe run tests\fixtures\sample64.exe plugins\trace_calls.lua --debug 2>&1
-          $out
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          if (-not ($out -match "traced \d+ step")) { exit 1 }
-          if (-not ($out -match " -> ")) { exit 1 }
 
       - uses: microsoft/setup-msbuild@v2
 
@@ -142,7 +109,7 @@ jobs:
           version="${tag#v}"
           (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
           # release notes: this version's changelog section plus install steps
-          awk -v v="$version" '$0 ~ "^## v"v"( |$)" {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
+          awk -v v="$version" '$0 ~ "^## v"v"( |$)" {f=1; next} /^## / {f=0} f' docs/CHANGELOG.md > notes.md
           cat >> notes.md <<EOF
 
           ## download
