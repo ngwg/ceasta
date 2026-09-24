@@ -1,6 +1,7 @@
 #include "cli/dbg_repl.h"
 #include "cli/mcp_cmd.h"
 #include "core/database.h"
+#include "core/diff.h"
 #include "core/decompiler.h"
 #include "core/lua_host.h"
 #include "core/debugger.h"
@@ -30,6 +31,7 @@ static void usage()
            "  graph <file> <where>          basic blocks and edges of a function\n"
            "  xrefs <file> <where>          references to an address\n"
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
+           "  diff <old> <new>              match functions between two files, show what changed\n"
            "  run <file> <script.lua>       run a lua script against the file (ceasta.* api)\n"
            "                                with --debug the file is started and stopped at its entry first,\n"
            "                                so ceasta.dbg.* works (windows x64, linux x64)\n"
@@ -180,6 +182,51 @@ static int cmd_debug(const std::vector<std::string>& args)
     return failures ? 1 : 0;
 }
 
+// diff two analyzed files at the function level
+static int cmd_diff(const std::vector<std::string>& args, const load_options& opts)
+{
+    if (args.size() < 3) {
+        fprintf(stderr, "usage: ceasta-cli diff <old-file> <new-file>\n");
+        return 2;
+    }
+    std::string ea, eb;
+    std::unique_ptr<database> a = open_database(args[1], opts, nullptr, ea);
+    std::unique_ptr<database> b = open_database(args[2], opts, nullptr, eb);
+    if (!a) {
+        fprintf(stderr, "can't open %s: %s\n", args[1].c_str(), ea.c_str());
+        return 1;
+    }
+    if (!b) {
+        fprintf(stderr, "can't open %s: %s\n", args[2].c_str(), eb.c_str());
+        return 1;
+    }
+    diff_result d = diff_databases(*a, *b);
+    printf("a: %s  (%zu functions)\n", a->bin.name.c_str(), d.funcs_a);
+    printf("b: %s  (%zu functions)\n", b->bin.name.c_str(), d.funcs_b);
+    printf("identical %zu, changed %zu, added %zu, removed %zu\n\n", d.identical.size(), d.changed.size(),
+           d.added.size(), d.removed.size());
+
+    if (!d.changed.empty()) {
+        printf("changed (most different first):\n");
+        for (const diff_pair& p : d.changed)
+            printf("  %3.0f%%  %-30s  %s -> %s\n", p.similarity * 100, p.name.c_str(),
+                   a->fmt_addr(p.a).c_str(), b->fmt_addr(p.b).c_str());
+        printf("\n");
+    }
+    if (!d.added.empty()) {
+        printf("added (only in b):\n");
+        for (uint64_t x : d.added)
+            printf("  %s  %s\n", b->fmt_addr(x).c_str(), b->location(x).c_str());
+        printf("\n");
+    }
+    if (!d.removed.empty()) {
+        printf("removed (only in a):\n");
+        for (uint64_t x : d.removed)
+            printf("  %s  %s\n", a->fmt_addr(x).c_str(), a->location(x).c_str());
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     // the interactive debugger takes the target's own arguments verbatim, so it
@@ -222,6 +269,8 @@ int main(int argc, char** argv)
     const std::string& cmd = args[0];
     if (cmd == "debug")
         return cmd_debug(args);
+    if (cmd == "diff")
+        return cmd_diff(args, opts);
 
     std::string err;
     std::unique_ptr<database> dbp = open_database(args[1], opts, nullptr, err);

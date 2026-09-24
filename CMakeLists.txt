@@ -79,6 +79,7 @@ add_library(ceasta_core STATIC
     src/core/debugger.cpp
     src/core/debugger_linux.cpp
     src/core/decompiler.cpp
+    src/core/diff.cpp
     src/core/disasm.cpp
     src/core/elf.cpp
     src/core/json.cpp

@@ -3,6 +3,7 @@
 #include "core/database.h"
 #include "core/debugger.h"
 #include "core/decompiler.h"
+#include "core/diff.h"
 #include "core/lua_host.h"
 #include "core/os.h"
 #include "core/util.h"
@@ -521,6 +522,61 @@ void add_query_tools(std::vector<tool>& t)
             std::string c = db->comment_at(a);
             if (!c.empty())
                 out += "comment   " + c + "\n";
+            return true;
+        });
+
+    add("diff_binary",
+        "Compare the open file with another one on disk at the function level and report what changed - "
+        "which functions are identical, which changed (with a similarity score), which were added or "
+        "removed. Matching ignores load addresses, so it works across builds.",
+        schema({{"path", prop("string", "path to the other file to compare against")},
+                {"limit", prop("integer", "at most this many entries per section (default 60)")}},
+               {"path"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::string path = arg_str(args, "path"), err;
+            load_options lo;
+            std::unique_ptr<database> other = open_database(path, lo, nullptr, err);
+            if (!other) {
+                out = "can't open " + path + ": " + err;
+                return false;
+            }
+            int limit = arg_int(args, "limit", 60, 1, 1000);
+            diff_result d = diff_databases(*db, *other);
+            out = util::fmt("this file: %zu functions, %s: %zu functions\n", d.funcs_a, other->bin.name.c_str(),
+                            d.funcs_b);
+            out += util::fmt("identical %zu, changed %zu, added %zu, removed %zu\n", d.identical.size(),
+                             d.changed.size(), d.added.size(), d.removed.size());
+            int n = 0;
+            if (!d.changed.empty())
+                out += "\nchanged (most different first):\n";
+            for (const diff_pair& p : d.changed) {
+                if (n++ >= limit) {
+                    out += util::fmt("... %zu more\n", d.changed.size() - (size_t)limit);
+                    break;
+                }
+                out += util::fmt("  %3.0f%%  %-28s  %s -> %s\n", p.similarity * 100, p.name.c_str(),
+                                 hexa(p.a).c_str(), hexa(p.b).c_str());
+            }
+            n = 0;
+            if (!d.added.empty())
+                out += "\nadded (only in the other file):\n";
+            for (uint64_t x : d.added) {
+                if (n++ >= limit)
+                    break;
+                out += "  " + hexa(x) + "  " + other->location(x) + "\n";
+            }
+            n = 0;
+            if (!d.removed.empty())
+                out += "\nremoved (only in this file):\n";
+            for (uint64_t x : d.removed) {
+                if (n++ >= limit)
+                    break;
+                out += "  " + hexa(x) + "  " + db->location(x) + "\n";
+            }
+            cap(out);
             return true;
         });
 
