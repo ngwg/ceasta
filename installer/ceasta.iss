@@ -59,6 +59,7 @@ Source: "{#SourceDir}\ceasta.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\ceasta-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\plugins\*"; DestDir: "{app}\plugins"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 

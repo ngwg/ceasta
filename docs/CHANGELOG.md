@@ -1,5 +1,11 @@
 # changelog
 
+## v0.8.1 - 2026-09-24
+
+- licensed under GPLv3 - the license now ships in the installer, the zip and the linux download
+- reworked readme: badges, "one function, three ways", a download table, clearer platform notes
+- a contributing guide and issue templates for bug reports / feature requests
+
 ## v0.8.0 - 2026-09-24
 
 - linux debugger, built on ptrace - the debugger is no longer windows only

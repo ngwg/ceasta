@@ -34,7 +34,7 @@ jobs:
           version=$(sed -n 's/^#define CEASTA_VERSION "\(.*\)"/\1/p' src/version.h)
           name=ceasta-cli-$version-linux-x64
           mkdir -p dist/$name
-          cp build/ceasta-cli README.md docs/CHANGELOG.md docs/THIRD_PARTY_NOTICES.md dist/$name/
+          cp build/ceasta-cli README.md LICENSE docs/CHANGELOG.md docs/THIRD_PARTY_NOTICES.md dist/$name/
           cp -r plugins dist/$name/
           tar -C dist -czf dist/$name.tar.gz $name
 

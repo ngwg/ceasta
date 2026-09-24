@@ -33,7 +33,7 @@ $stage = Join-Path $dist "ceasta"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $dist | Out-Null
 Invoke-Checked cmake @("--install", "build", "--config", "Release", "--prefix", $stage)
-foreach ($f in @("ceasta.exe", "ceasta-cli.exe", "plugins\hello.lua", "THIRD_PARTY_NOTICES.md")) {
+foreach ($f in @("ceasta.exe", "ceasta-cli.exe", "plugins\hello.lua", "LICENSE", "THIRD_PARTY_NOTICES.md")) {
     if (-not (Test-Path (Join-Path $stage $f))) { throw "missing $f in $stage" }
 }
 
