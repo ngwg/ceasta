@@ -20,6 +20,13 @@
 //#define IM_ASSERT(_EXPR)  MyAssert(_EXPR)
 //#define IM_ASSERT(_EXPR)  ((void)(_EXPR))     // Disable asserts
 
+// ceasta: the ui tests build imgui with asserts that abort with a message in every build type
+#ifdef CEASTA_IMGUI_ASSERTS
+#include <stdio.h>
+#include <stdlib.h>
+#define IM_ASSERT(_EXPR) do { if (!(_EXPR)) { fprintf(stderr, "imgui assert failed: %s  (%s:%d)\n", #_EXPR, __FILE__, __LINE__); abort(); } } while (0)
+#endif
+
 //---- Define attributes of all API symbols declarations, e.g. for DLL under Windows
 // Using Dear ImGui via a shared library is not recommended, because of function call overhead and because we don't guarantee backward nor forward ABI compatibility.
 // - Windows DLL users: heaps and globals are not shared across DLL boundaries! You will need to call SetCurrentContext() + SetAllocatorFunctions()
