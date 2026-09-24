@@ -599,6 +599,8 @@ static void shortcuts(app_state& s)
         dialogs::open(s, dialog_kind::xrefs, s.cursor);
     if (plain_key(ImGuiKey_Space))
         s.view = s.view == center_view::listing ? center_view::graph : center_view::listing;
+    if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
+        s.view = s.view == center_view::pseudo ? center_view::listing : center_view::pseudo;
     if (plain_key(ImGuiKey_Escape))
         app_back(s);
     if (plain_key(ImGuiKey_Enter) || plain_key(ImGuiKey_KeypadEnter))

@@ -1,5 +1,15 @@
 # changelog
 
+## v0.7.0 - 2026-09-24
+
+- decompiler: c-like pseudocode for a function (f5, or the Pseudocode tab)
+  - lifts x86 / x64 to expressions, recovers conditions from the flags
+  - structures the control flow: if / else, while, do / while, switch, gotos only where needed
+  - names calls, arguments from the calling convention, string and global names
+  - `ceasta-cli decompile <file> <where>` and `ceasta.decompile(addr)` in lua
+- cleaner, calmer look and a light theme (View > Theme), square edges, panel headers
+- a real icon
+
 ## v0.6.0 - 2026-09-24
 
 - real binaries now, the mock data is gone

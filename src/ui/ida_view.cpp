@@ -4,6 +4,7 @@
 #include "theme.h"
 #include "ui/dialogs.h"
 #include "ui/graph_view.h"
+#include "ui/pseudo_view.h"
 #include "widgets/nav_band.h"
 #include <algorithm>
 
@@ -275,14 +276,17 @@ static void header(app_state& s)
         ImGui::TextDisabled("%s", db.location(s.cursor).c_str());
     }
     float right = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
-    float bw = ImGui::CalcTextSize("Listing").x + ImGui::CalcTextSize("Graph").x + ImGui::GetStyle().FramePadding.x * 4 +
-               ImGui::GetStyle().ItemSpacing.x + ImGui::GetFrameHeight() * 2;
+    float bw = ImGui::CalcTextSize("Listing").x + ImGui::CalcTextSize("Graph").x + ImGui::CalcTextSize("Pseudocode").x +
+               ImGui::GetStyle().FramePadding.x * 6 + ImGui::GetStyle().ItemSpacing.x * 2 + ImGui::GetFrameHeight() * 3;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX(), right - bw));
     if (ImGui::RadioButton("Listing", s.view == center_view::listing))
         s.view = center_view::listing;
     ImGui::SameLine();
     if (ImGui::RadioButton("Graph", s.view == center_view::graph))
         s.view = center_view::graph;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Pseudocode", s.view == center_view::pseudo))
+        s.view = center_view::pseudo;
 }
 
 void draw(app_state& s)
@@ -299,6 +303,8 @@ void draw(app_state& s)
     header(s);
     if (s.view == center_view::graph)
         graph_view::draw(s);
+    else if (s.view == center_view::pseudo)
+        pseudo_view::draw(s);
     else
         listing(s);
 }

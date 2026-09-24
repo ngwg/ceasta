@@ -24,6 +24,12 @@ constexpr ImU32 func = IM_COL32(255, 230, 140, 255);
 constexpr ImU32 segment = IM_COL32(140, 150, 170, 255);
 constexpr ImU32 unknown = IM_COL32(150, 130, 110, 255);
 
+// pseudocode tokens
+constexpr ImU32 kw = IM_COL32(198, 149, 230, 255);      // if / while / return ...
+constexpr ImU32 ctype = IM_COL32(120, 200, 165, 255);   // int / char / void
+constexpr ImU32 number = IM_COL32(230, 185, 140, 255);
+constexpr ImU32 punct = IM_COL32(150, 156, 168, 255);
+
 // row backgrounds
 constexpr ImU32 row_selected = IM_COL32(52, 72, 110, 255);
 constexpr ImU32 row_pc = IM_COL32(110, 90, 30, 255);

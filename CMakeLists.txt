@@ -78,6 +78,7 @@ add_library(ceasta_core STATIC
     src/core/binary.cpp
     src/core/database.cpp
     src/core/debugger.cpp
+    src/core/decompiler.cpp
     src/core/disasm.cpp
     src/core/elf.cpp
     src/core/lua_host.cpp
@@ -100,6 +101,7 @@ set(ui_sources
     src/ui/graph_view.cpp
     src/ui/ida_view.cpp
     src/ui/left_panel.cpp
+    src/ui/pseudo_view.cpp
     src/ui/right_panel.cpp
     src/ui/status_bar.cpp
     src/ui/top_bar.cpp)
@@ -156,6 +158,7 @@ if(CEASTA_BUILD_TESTS)
 
     add_test(NAME cli_info COMMAND ceasta-cli info ${fixtures}/sample64.exe)
     add_test(NAME cli_disasm COMMAND ceasta-cli disasm ${fixtures}/sample32.exe start 30)
+    add_test(NAME cli_decompile COMMAND ceasta-cli decompile ${fixtures}/sample64.elf classify)
     foreach(plugin hello find_crypto name_wrappers strings_report)
         add_test(NAME plugin_${plugin}
             COMMAND ceasta-cli run ${fixtures}/sample64.exe ${CMAKE_CURRENT_SOURCE_DIR}/plugins/${plugin}.lua)

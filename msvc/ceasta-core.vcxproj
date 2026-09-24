@@ -47,6 +47,7 @@
     <ClCompile Include="..\src\core\binary.cpp" />
     <ClCompile Include="..\src\core\database.cpp" />
     <ClCompile Include="..\src\core\debugger.cpp" />
+    <ClCompile Include="..\src\core\decompiler.cpp" />
     <ClCompile Include="..\src\core\disasm.cpp" />
     <ClCompile Include="..\src\core\elf.cpp" />
     <ClCompile Include="..\src\core\lua_host.cpp" />
@@ -58,6 +59,7 @@
     <ClInclude Include="..\src\core\binary.h" />
     <ClInclude Include="..\src\core\database.h" />
     <ClInclude Include="..\src\core\debugger.h" />
+    <ClInclude Include="..\src\core\decompiler.h" />
     <ClInclude Include="..\src\core\disasm.h" />
     <ClInclude Include="..\src\core\lua_host.h" />
     <ClInclude Include="..\src\core\os.h" />

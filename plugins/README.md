@@ -56,6 +56,7 @@ ceasta.on("load", function() ceasta.log("analysis finished") end)
 - `name(addr)` · `location(addr)` · `set_name(addr, name)` → ok[,err] · `resolve(text)` → addr|nil
 - `comment(addr)` · `set_comment(addr, text)`
 - `disasm(addr)` → `{ addr, size, mnemonic, operands, text, flow, target? }` · `next_addr(addr)`
+- `decompile(addr)` → a string of c-like pseudocode for the function containing `addr`
   (`flow` is `"normal"`, `"jump"`, `"cond"`, `"call"`, `"ret"` or `"stop"`, `target` is set for direct branches)
 - `functions()` · `imports()` · `exports()` · `strings()` · `xrefs_to(addr)` — arrays of tables
 - `find(pattern [,from [,max]])` — byte search like `"48 8b ?? 05"`, returns addresses

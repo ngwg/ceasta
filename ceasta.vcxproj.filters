@@ -45,6 +45,9 @@
     <ClCompile Include="src\ui\left_panel.cpp">
       <Filter>src\ui</Filter>
     </ClCompile>
+    <ClCompile Include="src\ui\pseudo_view.cpp">
+      <Filter>src\ui</Filter>
+    </ClCompile>
     <ClCompile Include="src\ui\right_panel.cpp">
       <Filter>src\ui</Filter>
     </ClCompile>
@@ -99,6 +102,9 @@
       <Filter>src\ui</Filter>
     </ClInclude>
     <ClInclude Include="src\ui\left_panel.h">
+      <Filter>src\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\pseudo_view.h">
       <Filter>src\ui</Filter>
     </ClInclude>
     <ClInclude Include="src\ui\right_panel.h">

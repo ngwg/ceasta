@@ -1,4 +1,5 @@
 #include "core/database.h"
+#include "core/decompiler.h"
 #include "core/lua_host.h"
 #include "core/debugger.h"
 #include "core/os.h"
@@ -23,6 +24,7 @@ static void usage()
            "  strings <file>                strings found by the analysis\n"
            "  disasm <file> [where] [n]     n listing lines starting at where (default: entry)\n"
            "  func <file> <where>           listing of one function\n"
+           "  decompile <file> <where>      pseudocode for one function\n"
            "  graph <file> <where>          basic blocks and edges of a function\n"
            "  xrefs <file> <where>          references to an address\n"
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
@@ -289,6 +291,18 @@ int main(int argc, char** argv)
             i--;
         for (; i < rows.size() && rows[i].addr < f->end; i++)
             printf("%s\n", line_for(db, rows[i]).c_str());
+        return 0;
+    }
+    if (cmd == "decompile" || cmd == "pseudo") {
+        uint64_t a;
+        if (!where(db, args, 2, a))
+            return 1;
+        const function* f = db.an.func_containing(a);
+        if (!f) {
+            fprintf(stderr, "no function at %s\n", db.fmt_addr(a).c_str());
+            return 1;
+        }
+        printf("%s", decompile_text(db, f->start).c_str());
         return 0;
     }
     if (cmd == "graph") {

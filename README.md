@@ -18,6 +18,7 @@ get it from the [releases page](https://github.com/ngwg/ceasta/releases):
 - auto analysis: functions (entry, exports, symbols, .pdata, tls callbacks, calls, pointers in data), switch tables, xrefs, strings (ascii + utf-16), imports / exports, thunks, noreturn calls
 - ida style listing: names instead of addresses, labels, xref and string comments
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
+- decompiler (f5): c-like pseudocode for a function - if / else, while / do, switch, calls with names
 - debugger (windows): start or attach, breakpoints, step into / over, run to cursor, pause, registers, stack, live memory in the hex view. 32 bit programs work too (wow64), aslr is handled
 - rename, comments, jump to address or name, xrefs, byte search, back / forward
 - names, comments and breakpoints are saved per file (in `%APPDATA%\ceasta\db`)
@@ -49,6 +50,7 @@ one window, nothing floating around:
 | ; | comment |
 | x | references to here |
 | space | listing / graph |
+| f5 | pseudocode (decompiler) |
 | alt+b | search bytes |
 | f9 | start debugging / continue |
 | f7 / f8 | step into / step over |
@@ -82,6 +84,7 @@ ceasta-cli info file.exe            format, entry, segments
 ceasta-cli funcs file.exe           functions
 ceasta-cli disasm file.exe main 40  listing from a name or address
 ceasta-cli graph file.exe start     basic blocks of a function
+ceasta-cli decompile file.exe main  pseudocode for a function
 ceasta-cli xrefs file.exe CreateFileW
 ceasta-cli find file.exe "48 8b ?? 05"
 ceasta-cli run file.exe script.lua  run a plugin / script

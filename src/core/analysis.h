@@ -49,6 +49,8 @@ struct jump_table {
     uint32_t entry_size = 0;
     uint32_t entries = 0;
     std::vector<uint64_t> targets; // unique case targets
+    std::vector<uint64_t> cases;   // target of each entry, by index
+    unsigned index_reg = 0;        // capstone reg id of the switch index, 0 if unknown
 };
 
 struct analysis_progress {

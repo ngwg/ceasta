@@ -2,6 +2,7 @@
 // usage: ceasta-tests <fixtures-dir>
 #include "core/analysis.h"
 #include "core/database.h"
+#include "core/decompiler.h"
 #include "core/disasm.h"
 #include "core/lua_host.h"
 #include "core/os.h"
@@ -281,6 +282,48 @@ static void test_cfg(const std::string& file)
     CHECK(edges_ok, "all cfg edges are in range");
 }
 
+static bool contains(const std::string& hay, const std::string& needle)
+{
+    return hay.find(needle) != std::string::npos;
+}
+
+static void test_decompile(const std::string& file)
+{
+    group("decompiler");
+    auto dbp = load(file);
+    if (!dbp)
+        return;
+    database& db = *dbp;
+
+    // every function decompiles without crashing and produces output
+    size_t ok = 0, empty = 0;
+    for (const function& f : db.an.funcs) {
+        std::string code = decompile_text(db, f.start);
+        if (code.empty())
+            empty++;
+        else
+            ok++;
+    }
+    CHECK(empty == 0, "all %zu functions produced pseudocode", ok);
+
+    // structural checks on the symbol-rich elf fixtures
+    const function* add = find_func(db, "ceasta_add");
+    if (add) {
+        std::string c = decompile_text(db, add->start);
+        CHECK(contains(c, "return") && contains(c, "+"), "ceasta_add returns a sum:\n%s", c.c_str());
+    }
+    const function* chk = find_func(db, "checksum");
+    if (chk) {
+        std::string c = decompile_text(db, chk->start);
+        CHECK(contains(c, "while") || contains(c, "for"), "checksum has a loop:\n%s", c.c_str());
+    }
+    const function* cls = find_func(db, "classify");
+    if (cls) {
+        std::string c = decompile_text(db, cls->start);
+        CHECK(contains(c, "switch") && contains(c, "case"), "classify has a switch:\n%s", c.c_str());
+    }
+}
+
 static void test_lua()
 {
     group("lua host");
@@ -406,6 +449,12 @@ int main(int argc, char** argv)
     test_find("sample64.elf");
     test_cfg("sample64.elf");
     test_cfg("sample64.exe");
+
+    test_decompile("sample64.elf");
+    test_decompile("sample32.elf");
+    test_decompile("sample64.exe");
+    test_decompile("sample32.exe");
+    test_decompile("sample64.dll");
 
     test_lua();
     test_lua_api("sample64.elf");

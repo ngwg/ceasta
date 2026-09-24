@@ -441,6 +441,7 @@ struct worker {
                 an.data_sizes[ea] = (uint8_t)es;
             }
         }
+        std::vector<uint64_t> cases = targets;
         std::sort(targets.begin(), targets.end());
         targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
         add_xref(j.addr, table, xref_type::read);
@@ -456,6 +457,8 @@ struct worker {
         jt.entry_size = es;
         jt.entries = n;
         jt.targets = std::move(targets);
+        jt.cases = std::move(cases);
+        jt.index_reg = idx;
         an.tables[j.addr] = std::move(jt);
     }
 

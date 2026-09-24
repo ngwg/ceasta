@@ -32,7 +32,7 @@ struct load_job {
     std::string path;
 };
 
-enum class center_view { listing, graph };
+enum class center_view { listing, graph, pseudo };
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, open_raw, attach, run_args, about, shortcuts };
 

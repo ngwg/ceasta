@@ -1,6 +1,7 @@
 #include "core/lua_host.h"
 #include "core/database.h"
 #include "core/debugger.h"
+#include "core/decompiler.h"
 #include "core/os.h"
 #include "core/util.h"
 
@@ -278,6 +279,15 @@ int api_next_addr(lua_State* L)
     database* db = need_db(L);
     uint64_t a = check_addr(L, 1);
     push_addr(L, a + std::max<uint32_t>(db->an.item_size(a), 1));
+    return 1;
+}
+
+int api_decompile(lua_State* L)
+{
+    database* db = need_db(L);
+    uint64_t a = check_addr(L, 1);
+    const function* f = db->an.func_containing(a);
+    lua_pushstring(L, decompile_text(*db, f ? f->start : a).c_str());
     return 1;
 }
 
@@ -676,7 +686,7 @@ static const luaL_Reg api_funcs[] = {
     {"is_mapped", api_is_mapped}, {"is_code", api_is_code},
     {"name", api_name}, {"location", api_location}, {"set_name", api_set_name}, {"resolve", api_resolve},
     {"comment", api_comment}, {"set_comment", api_set_comment},
-    {"disasm", api_disasm}, {"next_addr", api_next_addr},
+    {"disasm", api_disasm}, {"next_addr", api_next_addr}, {"decompile", api_decompile},
     {"functions", api_functions}, {"imports", api_imports}, {"exports", api_exports},
     {"strings", api_strings}, {"xrefs_to", api_xrefs_to}, {"find", api_find},
     {"here", api_here}, {"goto_addr", api_goto},

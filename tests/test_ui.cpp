@@ -105,6 +105,32 @@ static void exercise_file(app_state& s, const std::string& path)
             app_jump(s, best->start);
         snap(s, (base + "-graph").c_str());
     }
+
+    // pseudocode view
+    s.view = center_view::pseudo;
+    {
+        const function* pick = nullptr;
+        for (const char* nm : {"classify", "checksum", "main"}) {
+            uint64_t a;
+            if (s.db->resolve(nm, a)) {
+                pick = s.db->an.func_containing(a);
+                if (pick)
+                    break;
+            }
+        }
+        if (!pick && !s.db->an.funcs.empty())
+            pick = &s.db->an.funcs[0];
+        if (pick)
+            app_jump(s, pick->start);
+        frames(s, 3);
+        snap(s, (base + "-pseudo").c_str());
+    }
+    // decompile the first 40 functions in the view (must not crash)
+    for (size_t i = 0; i < s.db->an.funcs.size() && i < 40; i++) {
+        app_jump(s, s.db->an.funcs[i].start);
+        frames(s, 2);
+    }
+    EXPECT(true, "pseudocode view drew 40 functions");
     for (size_t i = 0; i < s.db->an.funcs.size() && i < 40; i++) {
         app_jump(s, s.db->an.funcs[i].start);
         frames(s, 2);
