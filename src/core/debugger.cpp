@@ -843,6 +843,13 @@ bool debugger::write(uint64_t addr, const void* in, size_t n, std::string& err)
     return true;
 }
 
+bool debugger::call(uint64_t, const std::vector<uint64_t>&, uint64_t&, std::string& err)
+{
+    // TODO: drive a synchronous call through the win32 debug loop, like the linux backend does
+    err = "calling a function in the target isn't available on windows yet";
+    return false;
+}
+
 bool debugger::is64() const { return !d->wow64; }
 uint64_t debugger::image_base() const { return d->image_base; }
 uint32_t debugger::pid() const { return d->pid; }
@@ -956,6 +963,11 @@ bool debugger::set_register(const std::string&, uint64_t, std::string& err)
 }
 size_t debugger::read(uint64_t, void*, size_t) const { return 0; }
 bool debugger::write(uint64_t, const void*, size_t, std::string& err)
+{
+    err = unsupported;
+    return false;
+}
+bool debugger::call(uint64_t, const std::vector<uint64_t>&, uint64_t&, std::string& err)
 {
     err = unsupported;
     return false;

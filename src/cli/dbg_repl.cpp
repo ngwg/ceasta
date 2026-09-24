@@ -183,6 +183,7 @@ void help()
         "  u [addr] [n]      disassemble          dec [addr]  decompile the function\n"
         "  x <addr> [n]      hex dump memory      k [n]  stack\n"
         "  bt                where am i (pc + function)\n"
+        "  call <f> [args]   call a function, print its result (args: number, name, \"string\")\n"
         "  mods              modules              threads / thread <tid>\n"
         "  lua <code>        run lua (ceasta.dbg.* is live)\n"
         "  q                 quit\n");
@@ -329,6 +330,35 @@ int cmd_dbg(int argc, char** argv)
             if (tok.size() < 2 || !resolve_rt(tok[1], rt)) { printf("need an address\n"); continue; }
             int n = tok.size() > 2 ? atoi(tok[2].c_str()) : 64;
             cmd_mem(rt, n);
+        } else if (c == "call") {
+            uint64_t func;
+            if (tok.size() < 2 || !resolve_rt(tok[1], func)) { printf("usage: call <func> [args...]  (args: number, name, or \"string\")\n"); continue; }
+            uint64_t scratch = g_dbg.sp() - 0x8000;
+            std::vector<uint64_t> vals;
+            for (size_t i = 2; i < tok.size(); i++) {
+                const std::string& a = tok[i];
+                uint64_t v, st;
+                if (a.size() >= 2 && a.front() == '"' && a.back() == '"') {
+                    std::string str = a.substr(1, a.size() - 2);
+                    size_t need = (str.size() + 1 + 15) & ~size_t(15);
+                    scratch -= need;
+                    g_dbg.write(scratch, str.c_str(), str.size() + 1, err);
+                    vals.push_back(scratch);
+                } else if (g_db && g_db->resolve(a, st)) {
+                    vals.push_back(g_db->bin.is_mapped(st) ? to_rt(st) : st);
+                } else if (util::parse_hex(a, v)) {
+                    vals.push_back(v);
+                } else {
+                    printf("bad argument: %s\n", a.c_str());
+                    vals.clear();
+                    break;
+                }
+            }
+            uint64_t result = 0;
+            if (g_dbg.call(func, vals, result, err))
+                printf("= %#" PRIx64 " (%" PRId64 ")\n", result, (int64_t)result);
+            else
+                printf("call failed: %s\n", err.c_str());
         } else if (c == "k" || c == "stack") {
             cmd_stack(tok.size() > 1 ? atoi(tok[1].c_str()) : 8);
         } else if (c == "bt" || c == "where") {

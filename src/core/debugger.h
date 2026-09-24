@@ -59,6 +59,11 @@ public:
 
     uint64_t pc() const;
     uint64_t sp() const;
+    // call a function in the stopped target: set the arguments per the abi, run it, return its
+    // result (rax), then restore every register. 64-bit targets only. args are raw values;
+    // write a string into memory first and pass its address. our breakpoints are lifted for the
+    // duration, and a fault or breakpoint inside the call is an error (registers still restored).
+    bool call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err);
     std::vector<reg_value> registers() const;
     bool set_register(const std::string& name, uint64_t value, std::string& err);
     // live memory, our breakpoint bytes are hidden

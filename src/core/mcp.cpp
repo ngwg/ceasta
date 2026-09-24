@@ -147,7 +147,7 @@ std::string byte_view(uint64_t addr, const uint8_t* p, size_t n)
 
 // paging for the list tools
 struct page {
-    int offset, limit;
+    int offset = 0, limit = 0;
     size_t total = 0, shown = 0;
     std::string body;
     void add(size_t index, const std::string& line)
@@ -172,7 +172,10 @@ struct page {
 
 page make_page(const json::value& args, int def_limit)
 {
-    return page{arg_int(args, "offset", 0, 0, 1 << 30), arg_int(args, "limit", def_limit, 1, 2000)};
+    page p;
+    p.offset = arg_int(args, "offset", 0, 0, 1 << 30);
+    p.limit = arg_int(args, "limit", def_limit, 1, 2000);
+    return p;
 }
 
 const char* const xref_kinds[] = {"call", "jump", "read", "write", "offset"};
@@ -1084,6 +1087,64 @@ void add_debug_inspect_tools(std::vector<tool>& t)
                 return false;
             }
             out = util::fmt("wrote %zu bytes at %s", bytes.size(), hexa(a).c_str());
+            return true;
+        });
+
+    add("debug_call",
+        "Call a function in the stopped program and get its return value, then every register is "
+        "restored. Great for exercising one routine - decrypt a string, validate a key, hash a buffer. "
+        "Each argument is a number (passed as-is), or a string: a name or hex address is passed as that "
+        "(runtime) address, anything else is written into the target as a c string and its pointer is "
+        "passed. 64-bit targets only.",
+        schema({{"function", prop("string", "name or address to call")},
+                {"args", []{ json::value a = prop("array", "arguments, in order"); a["items"] = json::value::make_object(); return a; }()}},
+               {"function"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            uint64_t func;
+            if (!arg_addr(*db, args, "function", func, out))
+                return false;
+            if (db->bin.is_mapped(func) && s.debug.to_runtime)
+                func = s.debug.to_runtime(func);
+            // materialize the arguments; strings that aren't a name/number get written to a
+            // scratch area well below the stack pointer
+            uint64_t sp = d->sp();
+            uint64_t scratch = sp - 0x8000;
+            std::vector<uint64_t> vals;
+            const json::value* av = args.get("args");
+            if (av && av->is_array())
+                for (const json::value& item : *av->a) {
+                    if (item.is_number()) {
+                        vals.push_back((uint64_t)item.n);
+                        continue;
+                    }
+                    std::string t = item.str();
+                    uint64_t v;
+                    if (db->resolve(t, v)) {
+                        vals.push_back(db->bin.is_mapped(v) && s.debug.to_runtime ? s.debug.to_runtime(v) : v);
+                    } else if (util::parse_hex(t, v)) {
+                        vals.push_back(v);
+                    } else {
+                        size_t need = (t.size() + 1 + 15) & ~size_t(15);
+                        scratch -= need;
+                        std::string err;
+                        d->write(scratch, t.c_str(), t.size() + 1, err);
+                        vals.push_back(scratch);
+                    }
+                }
+            uint64_t result = 0;
+            std::string err;
+            if (!d->call(func, vals, result, err)) {
+                out = "the call failed: " + err;
+                return false;
+            }
+            out = "returned 0x" + util::hex_lower(result) + " (" + std::to_string((long long)result) + ")";
+            std::string sym = symbolize(s, *db, *d, result);
+            if (!sym.empty())
+                out += "\n         " + sym;
             return true;
         });
 
