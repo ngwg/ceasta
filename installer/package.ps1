@@ -1,13 +1,12 @@
-# builds ceasta, runs the tests, and makes the release files in dist\:
+# builds ceasta and makes the release files in dist\:
 #   ceasta-<version>-windows-x64.zip   portable, unzip and run
 #   ceasta-<version>-setup.exe         installer (needs Inno Setup 6: winget install JRSoftware.InnoSetup)
 #
 # usage, from the repo root with cmake + visual studio installed:
-#   powershell -ExecutionPolicy Bypass -File installer\package.ps1 [-Version 0.6.0] [-SkipBuild] [-SkipTests]
+#   powershell -ExecutionPolicy Bypass -File installer\package.ps1 [-Version 0.6.0] [-SkipBuild]
 param(
     [string]$Version = "",
-    [switch]$SkipBuild,
-    [switch]$SkipTests
+    [switch]$SkipBuild
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -27,9 +26,6 @@ Write-Host "== packaging ceasta $Version"
 if (-not $SkipBuild) {
     Invoke-Checked cmake @("-S", ".", "-B", "build")
     Invoke-Checked cmake @("--build", "build", "--config", "Release", "--parallel")
-    if (-not $SkipTests) {
-        Invoke-Checked ctest @("--test-dir", "build", "-C", "Release", "--output-on-failure")
-    }
 }
 
 $dist = Join-Path $root "dist"

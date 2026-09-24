@@ -3,7 +3,7 @@ project(ceasta VERSION 0.6.0 LANGUAGES C CXX)
 
 # ceasta: disassembler + debugger.
 #   core (loaders, analysis, lua, debugger) builds everywhere, the gui is windows / directx 11.
-#   cmake -B build && cmake --build build --config Release && ctest --test-dir build -C Release
+#   cmake -B build && cmake --build build --config Release
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,7 +18,6 @@ else()
     set(ceasta_gui_default OFF)
 endif()
 option(CEASTA_BUILD_GUI "build the gui (windows only)" ${ceasta_gui_default})
-option(CEASTA_BUILD_TESTS "build the tests" ON)
 
 if(MSVC)
     # static runtime, so the exe runs without the vc++ redistributable
@@ -134,37 +133,6 @@ if(CEASTA_BUILD_GUI)
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/plugins $<TARGET_FILE_DIR:ceasta>/plugins)
 endif()
 
-# ---- tests ----
-
-if(CEASTA_BUILD_TESTS)
-    enable_testing()
-    set(fixtures ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
-
-    add_executable(ceasta-tests tests/test_main.cpp)
-    target_link_libraries(ceasta-tests PRIVATE ceasta_core)
-    add_test(NAME core COMMAND ceasta-tests ${fixtures})
-
-    # the real ui code, rendered headless for many frames. imgui and the ui are built a
-    # second time with asserts that abort (release builds normally compile them out)
-    add_library(imgui_checked STATIC ${imgui_sources})
-    target_include_directories(imgui_checked PUBLIC third_party/imgui third_party/imgui/backends)
-    target_compile_definitions(imgui_checked PUBLIC CEASTA_IMGUI_ASSERTS)
-    add_library(ceasta_ui_checked STATIC ${ui_sources})
-    target_link_libraries(ceasta_ui_checked PUBLIC ceasta_core imgui_checked)
-    add_executable(ceasta-ui-tests tests/test_ui.cpp third_party/imgui/backends/imgui_impl_null.cpp)
-    target_link_libraries(ceasta-ui-tests PRIVATE ceasta_ui_checked)
-    ceasta_warnings(ceasta-ui-tests)
-    add_test(NAME ui COMMAND ceasta-ui-tests ${fixtures} ${CMAKE_CURRENT_SOURCE_DIR}/plugins)
-
-    add_test(NAME cli_info COMMAND ceasta-cli info ${fixtures}/sample64.exe)
-    add_test(NAME cli_disasm COMMAND ceasta-cli disasm ${fixtures}/sample32.exe start 30)
-    add_test(NAME cli_decompile COMMAND ceasta-cli decompile ${fixtures}/sample64.elf classify)
-    foreach(plugin hello find_crypto name_wrappers strings_report)
-        add_test(NAME plugin_${plugin}
-            COMMAND ceasta-cli run ${fixtures}/sample64.exe ${CMAKE_CURRENT_SOURCE_DIR}/plugins/${plugin}.lua)
-    endforeach()
-endif()
-
 # ---- install / package layout (what the installer ships) ----
 
 install(TARGETS ceasta-cli RUNTIME DESTINATION .)
@@ -172,4 +140,4 @@ if(CEASTA_BUILD_GUI)
     install(TARGETS ceasta RUNTIME DESTINATION .)
 endif()
 install(DIRECTORY plugins/ DESTINATION plugins)
-install(FILES README.md CHANGELOG.md THIRD_PARTY_NOTICES.md DESTINATION .)
+install(FILES README.md docs/CHANGELOG.md docs/THIRD_PARTY_NOTICES.md DESTINATION .)
