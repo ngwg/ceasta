@@ -4,3 +4,5 @@ x64/
 Debug/
 Release/
 *.user
+dist/
+out/

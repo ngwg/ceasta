@@ -14,6 +14,7 @@
     <VCProjectVersion>17.0</VCProjectVersion>
     <ProjectGuid>{CEA57A01-7B2E-4F1A-9C3D-2E4F5A6B7C8D}</ProjectGuid>
     <RootNamespace>ceasta</RootNamespace>
+    <ProjectName>ceasta</ProjectName>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -27,88 +28,84 @@
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
-    <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
-  <ImportGroup Label="ExtensionSettings">
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+    <Import Project="msvc\ceasta.props" />
   </ImportGroup>
-  <ImportGroup Label="Shared">
-  </ImportGroup>
-  <PropertyGroup Label="UserMacros" />
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <OutDir>$(SolutionDir)build\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)build\$(Configuration)\obj\</IntDir>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <OutDir>$(SolutionDir)build\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)build\$(Configuration)\obj\</IntDir>
-  </PropertyGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+  <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <Optimization>Disabled</Optimization>
       <SDLCheck>true</SDLCheck>
-      <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>src;third_party\imgui;third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;third_party\imgui;third_party\imgui\backends;third_party\capstone\include;third_party\lua;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dwmapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;comdlg32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
-  </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <ClCompile>
-      <WarningLevel>Level3</WarningLevel>
-      <Optimization>MaxSpeed</Optimization>
-      <FunctionLevelLinking>true</FunctionLevelLinking>
-      <IntrinsicFunctions>true</IntrinsicFunctions>
-      <SDLCheck>true</SDLCheck>
-      <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>src;third_party\imgui;third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-    </ClCompile>
-    <Link>
-      <SubSystem>Console</SubSystem>
-      <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dwmapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
-    </Link>
+    <PostBuildEvent>
+      <Command>xcopy /Y /I /Q "$(CeastaRoot)plugins\*.lua" "$(OutDir)plugins\" &gt;nul</Command>
+      <Message>copy plugins next to the program</Message>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\app.cpp" />
-    <ClCompile Include="src\ui\top_bar.cpp" />
-    <ClCompile Include="src\ui\left_panel.cpp" />
-    <ClCompile Include="src\ui\ida_view.cpp" />
-    <ClCompile Include="src\ui\right_panel.cpp" />
-    <ClCompile Include="src\ui\cpu_panel.cpp" />
     <ClCompile Include="src\ui\bottom_panel.cpp" />
+    <ClCompile Include="src\ui\cpu_panel.cpp" />
+    <ClCompile Include="src\ui\dialogs.cpp" />
+    <ClCompile Include="src\ui\graph_view.cpp" />
+    <ClCompile Include="src\ui\ida_view.cpp" />
+    <ClCompile Include="src\ui\left_panel.cpp" />
+    <ClCompile Include="src\ui\right_panel.cpp" />
+    <ClCompile Include="src\ui\status_bar.cpp" />
+    <ClCompile Include="src\ui\top_bar.cpp" />
     <ClCompile Include="third_party\imgui\imgui.cpp" />
     <ClCompile Include="third_party\imgui\imgui_draw.cpp" />
     <ClCompile Include="third_party\imgui\imgui_tables.cpp" />
     <ClCompile Include="third_party\imgui\imgui_widgets.cpp" />
-    <ClCompile Include="third_party\imgui\imgui_demo.cpp" />
     <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\app.h" />
     <ClInclude Include="src\theme.h" />
-    <ClInclude Include="src\data\mock_data.h" />
-    <ClInclude Include="src\widgets\nav_band.h" />
-    <ClInclude Include="src\ui\top_bar.h" />
-    <ClInclude Include="src\ui\left_panel.h" />
-    <ClInclude Include="src\ui\ida_view.h" />
-    <ClInclude Include="src\ui\right_panel.h" />
-    <ClInclude Include="src\ui\cpu_panel.h" />
+    <ClInclude Include="src\version.h" />
     <ClInclude Include="src\ui\bottom_panel.h" />
+    <ClInclude Include="src\ui\cpu_panel.h" />
+    <ClInclude Include="src\ui\dialogs.h" />
+    <ClInclude Include="src\ui\graph_view.h" />
+    <ClInclude Include="src\ui\ida_view.h" />
+    <ClInclude Include="src\ui\left_panel.h" />
+    <ClInclude Include="src\ui\right_panel.h" />
     <ClInclude Include="src\ui\status_bar.h" />
+    <ClInclude Include="src\ui\top_bar.h" />
+    <ClInclude Include="src\widgets\nav_band.h" />
+    <ClInclude Include="src\widgets\splitter.h" />
+    <ClInclude Include="third_party\imgui\imgui.h" />
+    <ClInclude Include="third_party\imgui\imconfig.h" />
+    <ClInclude Include="third_party\imgui\imgui_internal.h" />
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="src\ceasta.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="src\ceasta.ico" />
     <None Include="README.md" />
     <None Include="CHANGELOG.md" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="msvc\ceasta-core.vcxproj">
+      <Project>{E98319E1-35C4-5F63-8073-B8B073D5567C}</Project>
+    </ProjectReference>
+    <ProjectReference Include="msvc\capstone.vcxproj">
+      <Project>{4714AAF6-F11B-50ED-B8E1-BE550FC7E0CA}</Project>
+    </ProjectReference>
+    <ProjectReference Include="msvc\lua.vcxproj">
+      <Project>{26598459-873D-54F0-87A0-7CC55DE773F0}</Project>
+    </ProjectReference>
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <ImportGroup Label="ExtensionTargets">
-  </ImportGroup>
 </Project>

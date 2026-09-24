@@ -2,22 +2,22 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="src">
-      <UniqueIdentifier>{A1B2C3D4-1111-4AAA-AAAA-000000000001}</UniqueIdentifier>
+      <UniqueIdentifier>{AB3ACC96-A342-564C-8E7B-C1580C4C06BC}</UniqueIdentifier>
     </Filter>
     <Filter Include="src\ui">
-      <UniqueIdentifier>{A1B2C3D4-1112-4AAA-AAAA-000000000011}</UniqueIdentifier>
+      <UniqueIdentifier>{496A6376-9DF4-5C8B-A295-5090119EB9B7}</UniqueIdentifier>
     </Filter>
     <Filter Include="src\widgets">
-      <UniqueIdentifier>{A1B2C3D4-1113-4AAA-AAAA-000000000012}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="src\data">
-      <UniqueIdentifier>{A1B2C3D4-1114-4AAA-AAAA-000000000013}</UniqueIdentifier>
+      <UniqueIdentifier>{100994F0-0A8F-5BE1-99A0-916CAF55A64F}</UniqueIdentifier>
     </Filter>
     <Filter Include="third_party">
-      <UniqueIdentifier>{A1B2C3D4-2222-4AAA-AAAA-000000000002}</UniqueIdentifier>
+      <UniqueIdentifier>{E345F343-8D41-5947-9BA7-F806C413B25D}</UniqueIdentifier>
     </Filter>
     <Filter Include="third_party\imgui">
-      <UniqueIdentifier>{A1B2C3D4-3333-4AAA-AAAA-000000000003}</UniqueIdentifier>
+      <UniqueIdentifier>{D99D1841-4A68-5293-85A1-D9F74E67C6DB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="resources">
+      <UniqueIdentifier>{D4A5EAA1-87E1-5CA8-8EB7-DAC8F13766E4}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -27,22 +27,31 @@
     <ClCompile Include="src\app.cpp">
       <Filter>src</Filter>
     </ClCompile>
-    <ClCompile Include="src\ui\top_bar.cpp">
-      <Filter>src\ui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ui\left_panel.cpp">
-      <Filter>src\ui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ui\ida_view.cpp">
-      <Filter>src\ui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ui\right_panel.cpp">
+    <ClCompile Include="src\ui\bottom_panel.cpp">
       <Filter>src\ui</Filter>
     </ClCompile>
     <ClCompile Include="src\ui\cpu_panel.cpp">
       <Filter>src\ui</Filter>
     </ClCompile>
-    <ClCompile Include="src\ui\bottom_panel.cpp">
+    <ClCompile Include="src\ui\dialogs.cpp">
+      <Filter>src\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\graph_view.cpp">
+      <Filter>src\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\ida_view.cpp">
+      <Filter>src\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\left_panel.cpp">
+      <Filter>src\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\right_panel.cpp">
+      <Filter>src\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\status_bar.cpp">
+      <Filter>src\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\top_bar.cpp">
       <Filter>src\ui</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\imgui.cpp">
@@ -55,9 +64,6 @@
       <Filter>third_party\imgui</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\imgui_widgets.cpp">
-      <Filter>third_party\imgui</Filter>
-    </ClCompile>
-    <ClCompile Include="third_party\imgui\imgui_demo.cpp">
       <Filter>third_party\imgui</Filter>
     </ClCompile>
     <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp">
@@ -74,32 +80,58 @@
     <ClInclude Include="src\theme.h">
       <Filter>src</Filter>
     </ClInclude>
-    <ClInclude Include="src\data\mock_data.h">
-      <Filter>src\data</Filter>
+    <ClInclude Include="src\version.h">
+      <Filter>src</Filter>
     </ClInclude>
-    <ClInclude Include="src\widgets\nav_band.h">
-      <Filter>src\widgets</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ui\top_bar.h">
-      <Filter>src\ui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ui\left_panel.h">
-      <Filter>src\ui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ui\ida_view.h">
-      <Filter>src\ui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ui\right_panel.h">
+    <ClInclude Include="src\ui\bottom_panel.h">
       <Filter>src\ui</Filter>
     </ClInclude>
     <ClInclude Include="src\ui\cpu_panel.h">
       <Filter>src\ui</Filter>
     </ClInclude>
-    <ClInclude Include="src\ui\bottom_panel.h">
+    <ClInclude Include="src\ui\dialogs.h">
+      <Filter>src\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\graph_view.h">
+      <Filter>src\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\ida_view.h">
+      <Filter>src\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\left_panel.h">
+      <Filter>src\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\right_panel.h">
       <Filter>src\ui</Filter>
     </ClInclude>
     <ClInclude Include="src\ui\status_bar.h">
       <Filter>src\ui</Filter>
     </ClInclude>
+    <ClInclude Include="src\ui\top_bar.h">
+      <Filter>src\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\widgets\nav_band.h">
+      <Filter>src\widgets</Filter>
+    </ClInclude>
+    <ClInclude Include="src\widgets\splitter.h">
+      <Filter>src\widgets</Filter>
+    </ClInclude>
+    <ClInclude Include="third_party\imgui\imgui.h">
+      <Filter>third_party\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="third_party\imgui\imconfig.h">
+      <Filter>third_party\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="third_party\imgui\imgui_internal.h">
+      <Filter>third_party\imgui</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\ceasta.rc">
+      <Filter>resources</Filter>
+    </ResourceCompile>
+    <Image Include="src\ceasta.ico">
+      <Filter>resources</Filter>
+    </Image>
   </ItemGroup>
 </Project>

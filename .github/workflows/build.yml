@@ -1,0 +1,152 @@
+name: build
+
+# every push: build + test on linux and windows, make the installer and try it.
+# a v* tag (or a manual run with release_tag set) also publishes a github release.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "publish a release with this tag, like v0.6.0 (leave empty to only build)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux - tests, sanitizers, cli package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: address + undefined behavior sanitizers, fuzzed loaders
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          CEASTA_FUZZ_ROUNDS: "200"
+        run: |
+          san="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_FLAGS="$san" -DCMAKE_CXX_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="$san"
+          cmake --build build-san --parallel --target ceasta-tests ceasta-ui-tests
+          ./build-san/ceasta-tests tests/fixtures
+          ./build-san/ceasta-ui-tests tests/fixtures plugins
+
+      - name: package the command line tool
+        run: |
+          version=$(sed -n 's/^#define CEASTA_VERSION "\(.*\)"/\1/p' src/version.h)
+          name=ceasta-cli-$version-linux-x64
+          mkdir -p dist/$name
+          cp build/ceasta-cli README.md CHANGELOG.md THIRD_PARTY_NOTICES.md dist/$name/
+          cp -r plugins dist/$name/
+          tar -C dist -czf dist/$name.tar.gz $name
+          ./dist/$name/ceasta-cli info tests/fixtures/sample64.elf
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceasta-linux
+          path: dist/*.tar.gz
+
+  windows:
+    name: windows - msvc, debugger, installer
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and test (cmake + msvc)
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: debugger - breakpoints, stepping, aslr (64 bit and 32 bit targets)
+        run: |
+          build\Release\ceasta-cli.exe debug tests\fixtures\sample64.exe 5
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          build\Release\ceasta-cli.exe debug tests\fixtures\sample32.exe 5
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: the visual studio solution builds too
+        run: |
+          msbuild ceasta.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path build\msvc\Release\ceasta.exe)) { exit 1 }
+          if (-not (Test-Path build\msvc\Release\plugins\hello.lua)) { exit 1 }
+
+      - name: install inno setup if the image doesn't have it
+        run: |
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: package (portable zip + installer)
+        run: powershell -ExecutionPolicy Bypass -File installer\package.ps1 -SkipBuild
+
+      - name: test the installer (silent install, checks, uninstall)
+        run: powershell -ExecutionPolicy Bypass -File installer\test-install.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceasta-windows
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+
+  release:
+    name: publish github release
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then tag="$GITHUB_REF_NAME"; fi
+          version="${tag#v}"
+          (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          # release notes: this version's changelog section plus install steps
+          awk -v v="$version" '$0 ~ "^## v"v"( |$)" {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ## download
+
+          - **ceasta-$version-setup.exe** - installer for windows 10/11 x64. installs for your user without admin rights, adds a start menu entry and (optionally) "open with ceasta" to the right-click menu.
+          - **ceasta-$version-windows-x64.zip** - portable, unzip and run \`ceasta.exe\`.
+          - **ceasta-cli-$version-linux-x64.tar.gz** - the command line tool for linux (analysis + lua scripting, no gui / debugger).
+
+          checksums are in SHA256SUMS.txt.
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "ceasta $version" --notes-file notes.md --target "$GITHUB_SHA"
+          fi

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{4714AAF6-F11B-50ED-B8E1-BE550FC7E0CA}</ProjectGuid>
+    <RootNamespace>capstone</RootNamespace>
+    <ProjectName>capstone</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+    <Import Project="..\msvc\ceasta.props" />
+  </ImportGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+      <ConformanceMode>false</ConformanceMode>
+      <PreprocessorDefinitions>CAPSTONE_HAS_X86;CAPSTONE_USE_SYS_DYN_MEM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\third_party\capstone\include;..\third_party\capstone;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\third_party\capstone\MCInst.c" />
+    <ClCompile Include="..\third_party\capstone\MCInstrDesc.c" />
+    <ClCompile Include="..\third_party\capstone\MCRegisterInfo.c" />
+    <ClCompile Include="..\third_party\capstone\Mapping.c" />
+    <ClCompile Include="..\third_party\capstone\SStream.c" />
+    <ClCompile Include="..\third_party\capstone\cs.c" />
+    <ClCompile Include="..\third_party\capstone\utils.c" />
+    <ClCompile Include="..\third_party\capstone\arch\X86\X86ATTInstPrinter.c" />
+    <ClCompile Include="..\third_party\capstone\arch\X86\X86Disassembler.c" />
+    <ClCompile Include="..\third_party\capstone\arch\X86\X86DisassemblerDecoder.c" />
+    <ClCompile Include="..\third_party\capstone\arch\X86\X86InstPrinterCommon.c" />
+    <ClCompile Include="..\third_party\capstone\arch\X86\X86IntelInstPrinter.c" />
+    <ClCompile Include="..\third_party\capstone\arch\X86\X86Mapping.c" />
+    <ClCompile Include="..\third_party\capstone\arch\X86\X86Module.c" />
+  </ItemGroup>
+  <ItemGroup>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

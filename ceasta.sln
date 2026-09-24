@@ -1,8 +1,17 @@
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ceasta", "ceasta.vcxproj", "{CEA57A01-7B2E-4F1A-9C3D-2E4F5A6B7C8D}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ceasta-cli", "msvc\ceasta-cli.vcxproj", "{965F1CE0-2295-53BD-B85F-F542ABBC4523}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ceasta-core", "msvc\ceasta-core.vcxproj", "{E98319E1-35C4-5F63-8073-B8B073D5567C}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "capstone", "msvc\capstone.vcxproj", "{4714AAF6-F11B-50ED-B8E1-BE550FC7E0CA}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "lua", "msvc\lua.vcxproj", "{26598459-873D-54F0-87A0-7CC55DE773F0}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -14,6 +23,22 @@ Global
 		{CEA57A01-7B2E-4F1A-9C3D-2E4F5A6B7C8D}.Debug|x64.Build.0 = Debug|x64
 		{CEA57A01-7B2E-4F1A-9C3D-2E4F5A6B7C8D}.Release|x64.ActiveCfg = Release|x64
 		{CEA57A01-7B2E-4F1A-9C3D-2E4F5A6B7C8D}.Release|x64.Build.0 = Release|x64
+		{965F1CE0-2295-53BD-B85F-F542ABBC4523}.Debug|x64.ActiveCfg = Debug|x64
+		{965F1CE0-2295-53BD-B85F-F542ABBC4523}.Debug|x64.Build.0 = Debug|x64
+		{965F1CE0-2295-53BD-B85F-F542ABBC4523}.Release|x64.ActiveCfg = Release|x64
+		{965F1CE0-2295-53BD-B85F-F542ABBC4523}.Release|x64.Build.0 = Release|x64
+		{E98319E1-35C4-5F63-8073-B8B073D5567C}.Debug|x64.ActiveCfg = Debug|x64
+		{E98319E1-35C4-5F63-8073-B8B073D5567C}.Debug|x64.Build.0 = Debug|x64
+		{E98319E1-35C4-5F63-8073-B8B073D5567C}.Release|x64.ActiveCfg = Release|x64
+		{E98319E1-35C4-5F63-8073-B8B073D5567C}.Release|x64.Build.0 = Release|x64
+		{4714AAF6-F11B-50ED-B8E1-BE550FC7E0CA}.Debug|x64.ActiveCfg = Debug|x64
+		{4714AAF6-F11B-50ED-B8E1-BE550FC7E0CA}.Debug|x64.Build.0 = Debug|x64
+		{4714AAF6-F11B-50ED-B8E1-BE550FC7E0CA}.Release|x64.ActiveCfg = Release|x64
+		{4714AAF6-F11B-50ED-B8E1-BE550FC7E0CA}.Release|x64.Build.0 = Release|x64
+		{26598459-873D-54F0-87A0-7CC55DE773F0}.Debug|x64.ActiveCfg = Debug|x64
+		{26598459-873D-54F0-87A0-7CC55DE773F0}.Debug|x64.Build.0 = Debug|x64
+		{26598459-873D-54F0-87A0-7CC55DE773F0}.Release|x64.ActiveCfg = Release|x64
+		{26598459-873D-54F0-87A0-7CC55DE773F0}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
