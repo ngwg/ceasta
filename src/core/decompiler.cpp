@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,9 +27,10 @@ struct expr;
 using ep = std::shared_ptr<expr>;
 
 struct expr {
-    enum class k { num, sym, reg, mem, un, bin, call } kind = k::num;
+    enum class k { num, sym, reg, mem, un, bin, call, tern } kind = k::num;
     uint64_t num = 0;
     bool sgn = false;
+    bool indirect = false; // call through a pointer: kids[0] is the target
     int width = 0;       // mem access width in bytes
     std::string text;    // sym/reg identifier, un/bin operator, call name
     uint64_t ref = 0;    // address a sym/call names, 0 = none
@@ -82,6 +84,22 @@ ep e_mem(ep addr, int width)
     e->kids = {std::move(addr)};
     return e;
 }
+ep e_tern(ep c, ep a, ep b)
+{
+    auto e = std::make_shared<expr>();
+    e->kind = expr::k::tern;
+    e->kids = {std::move(c), std::move(a), std::move(b)};
+    return e;
+}
+// an instruction with no c operator, shown as a call: __rol(x, 5)
+ep e_intr(const std::string& name, std::vector<ep> args)
+{
+    auto e = std::make_shared<expr>();
+    e->kind = expr::k::call;
+    e->text = name;
+    e->kids = std::move(args);
+    return e;
+}
 
 int node_count(const ep& e)
 {
@@ -95,6 +113,8 @@ int node_count(const ep& e)
 
 int prec(const expr& e)
 {
+    if (e.kind == expr::k::tern)
+        return 1;
     if (e.kind != expr::k::bin)
         return 100;
     const std::string& o = e.text;
@@ -191,16 +211,112 @@ std::string print(const ep& e, int parent_prec = 0)
         return p < parent_prec ? "(" + s + ")" : s;
     }
     case expr::k::call: {
-        std::string s = e->text + "(";
-        for (size_t i = 0; i < e->kids.size(); i++) {
-            if (i)
+        size_t first = e->indirect && !e->kids.empty() ? 1 : 0;
+        std::string s = first ? "(*" + print(e->kids[0], 90) + ")(" : e->text + "(";
+        for (size_t i = first; i < e->kids.size(); i++) {
+            if (i > first)
                 s += ", ";
             s += print(e->kids[i], 0);
         }
         return s + ")";
     }
+    case expr::k::tern: {
+        std::string s = print(e->kids[0], 2) + " ? " + print(e->kids[1], 2) + " : " + print(e->kids[2], 1);
+        return 1 < parent_prec ? "(" + s + ")" : s;
+    }
     }
     return "?";
+}
+
+// does `text` contain `word` as a whole identifier?
+bool mentions(const std::string& text, const std::string& word)
+{
+    auto ident = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+    for (size_t at = text.find(word); at != std::string::npos; at = text.find(word, at + 1)) {
+        bool left = at == 0 || !ident(text[at - 1]);
+        bool right = at + word.size() >= text.size() || !ident(text[at + word.size()]);
+        if (left && right)
+            return true;
+    }
+    return false;
+}
+
+// does e read register `name`? the subtree `skip` is left out
+bool refs_name(const ep& e, const std::string& name, const expr* skip)
+{
+    if (!e || e.get() == skip)
+        return false;
+    if (e->kind == expr::k::reg && e->text == name)
+        return true;
+    for (const ep& k : e->kids)
+        if (refs_name(k, name, skip))
+            return true;
+    return false;
+}
+
+bool has_mem(const ep& e)
+{
+    if (!e)
+        return false;
+    if (e->kind == expr::k::mem)
+        return true;
+    for (const ep& k : e->kids)
+        if (has_mem(k))
+            return true;
+    return false;
+}
+
+bool contains(const ep& e, const expr* node)
+{
+    if (!e)
+        return false;
+    if (e.get() == node)
+        return true;
+    for (const ep& k : e->kids)
+        if (contains(k, node))
+            return true;
+    return false;
+}
+
+// copy-on-write rewrites. memo maps an old node to its new copy, so a subtree shared by
+// several expressions stays shared (the same node) after the rewrite.
+using rewrite_memo = std::unordered_map<const expr*, ep>;
+
+template <class F>
+ep rewrite_tree(const ep& e, F&& hit, rewrite_memo& memo)
+{
+    if (!e)
+        return e;
+    if (ep r = hit(e))
+        return r;
+    auto it = memo.find(e.get());
+    if (it != memo.end())
+        return it->second;
+    ep out = e;
+    for (size_t i = 0; i < e->kids.size(); i++) {
+        ep k = rewrite_tree(e->kids[i], hit, memo);
+        if (k != e->kids[i]) {
+            if (out == e)
+                out = std::make_shared<expr>(*e);
+            out->kids[i] = k;
+        }
+    }
+    memo[e.get()] = out;
+    return out;
+}
+
+// replace one node (by identity) with `to`
+ep replace_node(const ep& e, const expr* node, const ep& to, rewrite_memo& memo)
+{
+    return rewrite_tree(e, [&](const ep& x) { return x.get() == node ? to : ep(); }, memo);
+}
+
+// replace every read of register `name` with `to`
+ep replace_reg(const ep& e, const std::string& name, const ep& to, rewrite_memo& memo)
+{
+    return rewrite_tree(e, [&](const ep& x) {
+        return x->kind == expr::k::reg && x->text == name ? to : ep();
+    }, memo);
 }
 
 // ------------------------------------------------------------------ registers
@@ -274,6 +390,59 @@ const char* arg_reg_at(int index, bool is64, bin_format fmt)
     return index >= 0 && index < 6 ? sysv[index] : nullptr;
 }
 
+// register family for a reg_bit index
+const char* fam_name(int b)
+{
+    static const char* names[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                    "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+    return b >= 0 && b < 16 ? names[b] : "";
+}
+
+int low_bit(uint32_t m)
+{
+    for (int b = 0; b < 32; b++)
+        if (m & (1u << b))
+            return b;
+    return -1;
+}
+
+// the jcc that tests the same condition as a setcc / cmovcc, 0 if none
+unsigned jcc_for(unsigned id, bool& is_set)
+{
+    is_set = true;
+    switch (id) {
+    case X86_INS_SETE: return X86_INS_JE;
+    case X86_INS_SETNE: return X86_INS_JNE;
+    case X86_INS_SETG: return X86_INS_JG;
+    case X86_INS_SETGE: return X86_INS_JGE;
+    case X86_INS_SETL: return X86_INS_JL;
+    case X86_INS_SETLE: return X86_INS_JLE;
+    case X86_INS_SETA: return X86_INS_JA;
+    case X86_INS_SETAE: return X86_INS_JAE;
+    case X86_INS_SETB: return X86_INS_JB;
+    case X86_INS_SETBE: return X86_INS_JBE;
+    case X86_INS_SETS: return X86_INS_JS;
+    case X86_INS_SETNS: return X86_INS_JNS;
+    default: break;
+    }
+    is_set = false;
+    switch (id) {
+    case X86_INS_CMOVE: return X86_INS_JE;
+    case X86_INS_CMOVNE: return X86_INS_JNE;
+    case X86_INS_CMOVG: return X86_INS_JG;
+    case X86_INS_CMOVGE: return X86_INS_JGE;
+    case X86_INS_CMOVL: return X86_INS_JL;
+    case X86_INS_CMOVLE: return X86_INS_JLE;
+    case X86_INS_CMOVA: return X86_INS_JA;
+    case X86_INS_CMOVAE: return X86_INS_JAE;
+    case X86_INS_CMOVB: return X86_INS_JB;
+    case X86_INS_CMOVBE: return X86_INS_JBE;
+    case X86_INS_CMOVS: return X86_INS_JS;
+    case X86_INS_CMOVNS: return X86_INS_JNS;
+    default: return 0;
+    }
+}
+
 // ------------------------------------------------------------------ block ir
 
 struct stmt {
@@ -299,6 +468,16 @@ struct flag_state {
     ep a, b, res;
 };
 
+// what one instruction reads and writes: register families as reg_bit masks, and
+// whether it tests or changes the status flags
+struct insn_rw {
+    uint32_t rd = 0, wr = 0;
+    bool flags_rd = false, flags_wr = false;
+    bool call = false, ret = false;
+    bool tail = false;   // a jump out of the function (a tail call)
+    uint64_t target = 0; // direct call / tail call target
+};
+
 // ------------------------------------------------------------------ lifter
 
 class lifter {
@@ -313,13 +492,224 @@ private:
     bool is64_;
     std::set<std::string> params_;
 
+    // what a call to a function of this binary does with registers
+    struct callee_info {
+        int arity = -1;        // argument registers it reads, -1 when unknown
+        uint32_t clobbers = 0; // scratch registers it may change
+    };
+    std::unordered_map<uint64_t, callee_info> callees_;
+
     std::string disp(const std::string& fam) { return reg_display(fam, is64_); }
+    uint32_t scratch() const;
+    uint32_t access(cs_insn* in, uint32_t& wr);
+    const function* local_fn(uint64_t target);
+    const callee_info& callee_of(uint64_t target);
+    int result_used(uint64_t func);
     ep reg_read(std::unordered_map<std::string, ep>& cur, const std::string& fam);
     ep sym_for(uint64_t a);
     ep mem_address(const x86_op_mem& m, std::unordered_map<std::string, ep>& cur, uint64_t rip);
     ep operand_expr(cs_insn* in, const cs_x86_op& op, std::unordered_map<std::string, ep>& cur);
     ep build_cond(const flag_state& fs, unsigned cc_id, bool& ok);
 };
+
+// registers a call may change: rax (the result) and the other scratch registers
+uint32_t lifter::scratch() const
+{
+    uint32_t m = (1u << reg_bit("rax")) | (1u << reg_bit("rcx")) | (1u << reg_bit("rdx"));
+    if (is64_) {
+        for (const char* r : {"r8", "r9", "r10", "r11"})
+            m |= 1u << reg_bit(r);
+        if (db_.bin.format != bin_format::pe)
+            m |= (1u << reg_bit("rsi")) | (1u << reg_bit("rdi"));
+    }
+    return m;
+}
+
+// register families an instruction reads (returned) and writes (wr), as reg_bit masks
+uint32_t lifter::access(cs_insn* in, uint32_t& wr)
+{
+    uint32_t rd = 0;
+    wr = 0;
+    cs_regs r, w;
+    uint8_t nr = 0, nw = 0;
+    if (cs_regs_access(cs_, in, r, &nr, w, &nw) == CS_ERR_OK) {
+        for (uint8_t i = 0; i < nr; i++) {
+            int b = reg_bit(reg_family(cs_reg_name(cs_, r[i])));
+            if (b >= 0)
+                rd |= 1u << b;
+        }
+        for (uint8_t i = 0; i < nw; i++) {
+            int b = reg_bit(reg_family(cs_reg_name(cs_, w[i])));
+            if (b >= 0)
+                wr |= 1u << b;
+        }
+    }
+    // xor eax, eax / sub eax, eax only write
+    const cs_x86& x = in->detail->x86;
+    if ((in->id == X86_INS_XOR || in->id == X86_INS_SUB) && x.op_count >= 2 &&
+        x.operands[0].type == X86_OP_REG && x.operands[1].type == X86_OP_REG &&
+        x.operands[0].reg == x.operands[1].reg) {
+        int b = reg_bit(reg_family(cs_reg_name(cs_, x.operands[0].reg)));
+        if (b >= 0)
+            rd &= ~(1u << b);
+    }
+    // push reg: a save (or a dummy push that aligns the stack), not a use of the value
+    if (in->id == X86_INS_PUSH && x.op_count >= 1 && x.operands[0].type == X86_OP_REG) {
+        int b = reg_bit(reg_family(cs_reg_name(cs_, x.operands[0].reg)));
+        if (b >= 0 && b != reg_bit("rsp"))
+            rd &= ~(1u << b);
+    }
+    if (in->id == X86_INS_CALL)
+        wr |= scratch();
+    return rd;
+}
+
+// the function of this binary a call lands in (through a thunk), or null
+const function* lifter::local_fn(uint64_t target)
+{
+    const function* fn = db_.an.func_containing(target);
+    if (!fn || fn->start != target)
+        return nullptr;
+    if (fn->thunk) {
+        const function* to = fn->thunk_target ? db_.an.func_containing(fn->thunk_target) : nullptr;
+        fn = to && to->start == fn->thunk_target && !to->thunk ? to : nullptr;
+    }
+    return fn;
+}
+
+// what a call to `target` reads and changes. for a function of this binary: the argument
+// registers it reads, and the scratch registers it writes - compilers keep values in the
+// others across such a call. anything else reads unknown arguments and changes all scratch.
+const lifter::callee_info& lifter::callee_of(uint64_t target)
+{
+    auto hit = callees_.find(target);
+    if (hit != callees_.end())
+        return hit->second;
+    callee_info& ci = callees_[target];
+    uint32_t all = scratch();
+    ci.clobbers = all;
+    const function* fn = local_fn(target);
+    cfg g;
+    if (!fn || !build_cfg(db_.bin, db_.an, fn->start, g, 400))
+        return ci;
+    cs_insn* in = cs_malloc(cs_);
+    if (!in)
+        return ci;
+    size_t nb = g.blocks.size();
+    std::vector<uint32_t> use(nb, 0), def(nb, 0), live(nb, 0);
+    int entry = 0;
+    uint32_t w = 0;
+    for (size_t bi = 0; bi < nb; bi++) {
+        if (g.blocks[bi].start == fn->start)
+            entry = (int)bi;
+        for (uint64_t a : g.blocks[bi].insns) {
+            uint8_t code[16];
+            size_t n = db_.bin.read(a, code, sizeof(code));
+            const uint8_t* p = code;
+            size_t left = n;
+            uint64_t addr = a;
+            if (!cs_disasm_iter(cs_, &p, &left, &addr, in)) {
+                w |= all;
+                continue;
+            }
+            uint32_t wr = 0, rd = access(in, wr); // a call in there changes all scratch
+            const cs_x86& x = in->detail->x86;
+            if (in->id == X86_INS_JMP && !(x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) &&
+                !db_.an.tables.count(a))
+                wr |= all; // an indirect jump could go anywhere
+            use[bi] |= rd & ~def[bi];
+            def[bi] |= wr;
+            w |= wr;
+        }
+    }
+    cs_free(in, 1);
+    ci.clobbers = w & all;
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < 20000) {
+        changed = false;
+        for (size_t bi = 0; bi < nb; bi++) {
+            uint32_t o = 0;
+            for (const cfg_edge& e : g.blocks[bi].succ)
+                o |= live[e.to];
+            uint32_t v = use[bi] | (o & ~def[bi]);
+            if (v != live[bi]) {
+                live[bi] = v;
+                changed = true;
+            }
+        }
+    }
+    // variadic (system v): al holds the number of vector registers and every argument
+    // register gets spilled, so the count says nothing
+    if (!is64_ || (db_.bin.format != bin_format::pe && (live[entry] & 1u)))
+        return ci;
+    // the last argument register it reads sets the count (an unused first one still exists)
+    ci.arity = 0;
+    for (int i = 0; arg_reg_at(i, is64_, db_.bin.format); i++)
+        if (live[entry] & (1u << reg_bit(arg_reg_at(i, is64_, db_.bin.format))))
+            ci.arity = i + 1;
+    return ci;
+}
+
+// do callers read rax after calling `func`? 1 yes, 0 no (every call site overwrites or
+// drops it), -1 no call sites to look at
+int lifter::result_used(uint64_t func)
+{
+    auto refs = db_.an.refs_to(func);
+    const function* self = db_.an.func_containing(func);
+    cs_insn* in = cs_malloc(cs_);
+    if (!in)
+        return -1;
+    int sites = 0;
+    bool used = false;
+    for (const xref* x = refs.first; x != refs.second && !used; ++x) {
+        if (x->type == xref_type::jump) {
+            // a tail jump from another function hands the result on
+            const function* from = db_.an.func_containing(x->from);
+            if (from && from != self) {
+                sites++;
+                used = true;
+            }
+            continue;
+        }
+        if (x->type != xref_type::call)
+            continue;
+        sites++;
+        uint64_t pc = x->from;
+        bool first = true;
+        for (int i = 0; i < 16; i++) {
+            uint8_t code[16];
+            size_t n = db_.bin.read(pc, code, sizeof(code));
+            const uint8_t* p = code;
+            size_t left = n;
+            uint64_t addr = pc;
+            if (!cs_disasm_iter(cs_, &p, &left, &addr, in)) {
+                used = true; // can't tell
+                break;
+            }
+            pc = addr;
+            if (first) { // the call itself
+                first = false;
+                continue;
+            }
+            uint32_t wr = 0, rd = access(in, wr);
+            if (rd & 1u) {
+                used = true;
+                break;
+            }
+            if (wr & 1u)
+                break; // overwritten, or clobbered by the next call
+            if (cs_insn_group(cs_, in, X86_GRP_JUMP) || cs_insn_group(cs_, in, X86_GRP_RET)) {
+                used = true; // it leaves the block: assume it's used
+                break;
+            }
+        }
+    }
+    cs_free(in, 1);
+    if (!sites)
+        return -1;
+    return used ? 1 : 0;
+}
 
 ep lifter::reg_read(std::unordered_map<std::string, ep>& cur, const std::string& fam)
 {
@@ -426,97 +816,513 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
     if (!insn)
         return false;
 
+    size_t nb = g.blocks.size();
     out.clear();
-    out.resize(g.blocks.size());
+    out.resize(nb);
     std::unordered_map<uint64_t, int> block_of;
-    for (size_t i = 0; i < g.blocks.size(); i++)
+    for (size_t i = 0; i < nb; i++)
         block_of[g.blocks[i].start] = (int)i;
     bin_format fmt = db_.bin.format;
     returns_value = false;
+    bool call_sets_rax = false;
+    int entry = block_of.count(func_start) ? block_of[func_start] : 0;
 
-    // pass 1: def / use per block
-    for (size_t bi = 0; bi < g.blocks.size(); bi++) {
+    auto bit = [](const std::string& fam) -> uint32_t {
+        int b = reg_bit(fam);
+        return b >= 0 ? (1u << b) : 0u;
+    };
+    // registers a call may change (rax carries the result), and the argument registers
+    uint32_t scratch = this->scratch();
+    std::vector<uint32_t> arg_bits;
+    uint32_t arg_mask = 0;
+    if (is64_) {
+        for (int i = 0; arg_reg_at(i, is64_, fmt); i++) {
+            arg_bits.push_back(bit(arg_reg_at(i, is64_, fmt)));
+            arg_mask |= arg_bits.back();
+        }
+    }
+    const uint64_t flag_tests = X86_EFLAGS_TEST_OF | X86_EFLAGS_TEST_SF | X86_EFLAGS_TEST_ZF |
+                                X86_EFLAGS_TEST_PF | X86_EFLAGS_TEST_CF | X86_EFLAGS_TEST_AF;
+    const uint64_t flag_writes =
+        X86_EFLAGS_MODIFY_OF | X86_EFLAGS_MODIFY_SF | X86_EFLAGS_MODIFY_ZF | X86_EFLAGS_MODIFY_PF |
+        X86_EFLAGS_MODIFY_CF | X86_EFLAGS_MODIFY_AF | X86_EFLAGS_RESET_OF | X86_EFLAGS_RESET_SF |
+        X86_EFLAGS_RESET_ZF | X86_EFLAGS_RESET_PF | X86_EFLAGS_RESET_CF | X86_EFLAGS_RESET_AF |
+        X86_EFLAGS_SET_OF | X86_EFLAGS_SET_SF | X86_EFLAGS_SET_ZF | X86_EFLAGS_SET_PF |
+        X86_EFLAGS_SET_CF | X86_EFLAGS_SET_AF | X86_EFLAGS_UNDEFINED_OF | X86_EFLAGS_UNDEFINED_SF |
+        X86_EFLAGS_UNDEFINED_ZF | X86_EFLAGS_UNDEFINED_PF | X86_EFLAGS_UNDEFINED_CF |
+        X86_EFLAGS_UNDEFINED_AF;
+
+    auto same_regs = [&](const cs_x86& x) {
+        return x.op_count >= 2 && x.operands[0].type == X86_OP_REG && x.operands[1].type == X86_OP_REG &&
+               x.operands[0].reg == x.operands[1].reg;
+    };
+
+    // pass 1: what each instruction reads and writes
+    std::vector<std::vector<insn_rw>> rws(nb);
+    for (size_t bi = 0; bi < nb; bi++) {
         const cfg_block& cb = g.blocks[bi];
-        block_ir& ir = out[bi];
-        ir.start = cb.start;
-        ir.end = cb.end;
+        out[bi].start = cb.start;
+        out[bi].end = cb.end;
         for (uint64_t a : cb.insns) {
+            insn_rw r;
             uint8_t code[16];
             size_t n = db_.bin.read(a, code, sizeof(code));
             const uint8_t* p = code;
             size_t left = n;
             uint64_t addr = a;
-            if (!cs_disasm_iter(cs_, &p, &left, &addr, insn))
-                continue;
-            cs_regs rd, wr;
-            uint8_t nrd = 0, nwr = 0;
-            if (cs_regs_access(cs_, insn, rd, &nrd, wr, &nwr) == CS_ERR_OK) {
-                for (uint8_t i = 0; i < nrd; i++) {
-                    int b = reg_bit(reg_family(cs_reg_name(cs_, rd[i])));
-                    if (b >= 0 && !(ir.def & (1u << b)))
-                        ir.use |= (1u << b);
+            if (cs_disasm_iter(cs_, &p, &left, &addr, insn)) {
+                r.rd = access(insn, r.wr);
+                const cs_x86& x = insn->detail->x86;
+                if (insn->id == X86_INS_CALL) {
+                    r.call = true;
+                    r.flags_wr = true;
+                    if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
+                        r.target = (uint64_t)x.operands[0].imm;
+                        const callee_info& ci = callee_of(r.target);
+                        r.wr = (r.wr & ~scratch) | ci.clobbers;
+                        for (int i = 0; i < ci.arity && i < (int)arg_bits.size(); i++)
+                            r.rd |= arg_bits[i]; // it reads its arguments
+                    }
+                    if (r.wr & 1u)
+                        call_sets_rax = true;
+                } else if (insn->id == X86_INS_JMP && x.op_count >= 1 && x.operands[0].type == X86_OP_IMM &&
+                           !block_of.count((uint64_t)x.operands[0].imm)) {
+                    // a jump out of the function: a tail call, the callee's result is ours
+                    r.tail = true;
+                    r.target = (uint64_t)x.operands[0].imm;
+                    const callee_info& ci = callee_of(r.target);
+                    for (int i = 0; i < ci.arity && i < (int)arg_bits.size(); i++)
+                        r.rd |= arg_bits[i];
+                    if (ci.clobbers & 1u)
+                        call_sets_rax = true;
+                } else {
+                    if (insn->id == X86_INS_JMP && x.op_count >= 1 && x.operands[0].type == X86_OP_MEM &&
+                        !db_.an.tables.count(a))
+                        r.tail = true; // jmp [ptr]: a tail call through a pointer
+                    if (r.wr & 1u)
+                        returns_value = true; // rax written somewhere -> assume it returns a value
+                    if (!cs_insn_group(cs_, insn, X86_GRP_FPU)) {
+                        uint64_t ef = insn->detail->x86.eflags;
+                        r.flags_rd = (ef & flag_tests) != 0;
+                        r.flags_wr = (ef & flag_writes) != 0;
+                    }
                 }
-                for (uint8_t i = 0; i < nwr; i++) {
-                    int b = reg_bit(reg_family(cs_reg_name(cs_, wr[i])));
-                    if (b >= 0)
-                        ir.def |= (1u << b);
-                }
+                r.ret = cs_insn_group(cs_, insn, X86_GRP_RET);
             }
+            rws[bi].push_back(r);
         }
-        if (out[bi].def & 1u)
-            returns_value = true; // rax written somewhere -> assume it returns a value
     }
+    // callers settle whether there is a result: rax read after the call. without callers,
+    // guess from rax being written
+    int used = result_used(func_start);
+    if (used >= 0)
+        returns_value = used == 1 && (returns_value || call_sets_rax); // nothing sets rax: void
+    // a ret reads the return value
+    if (returns_value)
+        for (auto& v : rws)
+            if (!v.empty() && v.back().ret)
+                v.back().rd |= 1u;
 
-    // liveness fixpoint
-    std::vector<std::vector<int>> succ(g.blocks.size());
-    for (size_t bi = 0; bi < g.blocks.size(); bi++)
-        for (const cfg_edge& e : g.blocks[bi].succ)
+    std::vector<std::vector<int>> succ(nb), pred(nb);
+    for (size_t bi = 0; bi < nb; bi++)
+        for (const cfg_edge& e : g.blocks[bi].succ) {
             succ[bi].push_back((int)e.to);
-    bool changed = true;
-    int guard = 0;
-    while (changed && guard++ < 20000) {
-        changed = false;
-        for (size_t bi = 0; bi < g.blocks.size(); bi++) {
-            uint32_t o = 0;
-            for (int s : succ[bi])
-                o |= out[s].live_in;
-            uint32_t in = out[bi].use | (o & ~out[bi].def);
-            if (o != out[bi].live_out || in != out[bi].live_in) {
-                out[bi].live_out = o;
-                out[bi].live_in = in;
-                changed = true;
+            pred[e.to].push_back((int)bi);
+        }
+    auto liveness = [&]() {
+        for (size_t bi = 0; bi < nb; bi++) {
+            uint32_t def = 0, use = 0;
+            for (const insn_rw& r : rws[bi]) {
+                use |= r.rd & ~def;
+                def |= r.wr;
+            }
+            out[bi].def = def;
+            out[bi].use = use;
+            out[bi].live_in = out[bi].live_out = 0;
+        }
+        bool changed = true;
+        int guard = 0;
+        while (changed && guard++ < 20000) {
+            changed = false;
+            for (size_t bi = 0; bi < nb; bi++) {
+                uint32_t o = 0;
+                for (int s : succ[bi])
+                    o |= out[s].live_in;
+                uint32_t in = out[bi].use | (o & ~out[bi].def);
+                if (o != out[bi].live_out || in != out[bi].live_in) {
+                    out[bi].live_out = o;
+                    out[bi].live_in = in;
+                    changed = true;
+                }
             }
         }
+    };
+    liveness();
+
+    // parameters: up to the last argument register read before being written (one that is
+    // only passed along still counts as a parameter)
+    int nparams = 0;
+    for (int i = 0; arg_reg_at(i, is64_, fmt); i++)
+        if (out[entry].live_in & bit(arg_reg_at(i, is64_, fmt)))
+            nparams = i + 1;
+    for (int i = 0; i < nparams; i++) {
+        params_.insert(arg_reg_at(i, is64_, fmt));
+        params.push_back(disp(arg_reg_at(i, is64_, fmt)));
     }
 
-    // parameters: arg regs live-in at entry (as a prefix)
-    int entry = block_of.count(func_start) ? block_of[func_start] : 0;
-    for (int i = 0;; i++) {
-        const char* ar = arg_reg_at(i, is64_, fmt);
-        if (!ar)
-            break;
-        int b = reg_bit(ar);
-        if (b >= 0 && (out[entry].live_in & (1u << b))) {
-            params_.insert(ar);
-            params.push_back(disp(ar));
-        } else {
-            break;
+    // call arguments: the argument registers something set since the last call (a
+    // parameter counts as set), as a prefix. calls read them, so the values survive until
+    // the call even across a block boundary.
+    std::vector<uint32_t> set_in(nb, 0);
+    if (!arg_bits.empty()) {
+        uint32_t param_bits = 0;
+        for (const std::string& pr : params_)
+            param_bits |= bit(pr);
+        std::vector<uint32_t> set_out(nb, 0);
+        auto walk = [&](size_t bi, uint32_t s, bool apply) {
+            for (insn_rw& r : rws[bi]) {
+                if (r.call || r.tail) {
+                    // a known callee's arguments are already counted
+                    bool known = r.target && callee_of(r.target).arity >= 0;
+                    for (size_t i = 0; apply && !known && i < arg_bits.size() && (s & arg_bits[i]); i++)
+                        r.rd |= arg_bits[i];
+                    if (r.call)
+                        s &= ~r.wr;
+                } else {
+                    s |= r.wr & arg_mask;
+                }
+            }
+            return s;
+        };
+        bool changed = true;
+        int guard = 0;
+        while (changed && guard++ < 20000) {
+            changed = false;
+            for (size_t bi = 0; bi < nb; bi++) {
+                uint32_t in = (int)bi == entry ? param_bits : 0;
+                for (int p : pred[bi])
+                    in |= set_out[p];
+                uint32_t o = walk(bi, in, false);
+                if (in != set_in[bi] || o != set_out[bi]) {
+                    set_in[bi] = in;
+                    set_out[bi] = o;
+                    changed = true;
+                }
+            }
         }
+        for (size_t bi = 0; bi < nb; bi++)
+            walk(bi, set_in[bi], true);
+        liveness();
     }
 
-    // pass 2: statements with block-local propagation
-    for (size_t bi = 0; bi < g.blocks.size(); bi++) {
+    // pass 2: statements. a register's new value stays pending - an expression, not yet a
+    // statement - until it has to be written out: a later block reads it, it grew big, a
+    // call or store may change memory it reads, or its register is about to change while
+    // another pending value still reads the old one. pending expressions always mean the
+    // registers as the statements printed so far left them.
+    int temps = 0;
+    for (size_t bi = 0; bi < nb; bi++) {
         const cfg_block& cb = g.blocks[bi];
         block_ir& ir = out[bi];
+        const std::vector<insn_rw>& rw = rws[bi];
+        size_t ni = cb.insns.size();
+
         std::unordered_map<std::string, ep> cur;
+        std::unordered_map<std::string, size_t> born; // instruction that set a pending value
         for (const std::string& pr : params_)
             cur[pr] = e_reg(disp(pr));
         flag_state fs;
+        uint32_t argset = set_in[bi];
 
+        // liveness after each instruction, and whether the flags are still to be tested
+        std::vector<uint32_t> live_after(ni, 0);
+        std::vector<char> flags_after(ni, 0);
+        {
+            uint32_t live = ir.live_out;
+            bool fl = false;
+            for (size_t k = ni; k-- > 0;) {
+                live_after[k] = live;
+                flags_after[k] = fl;
+                live = (live & ~rw[k].wr) | rw[k].rd;
+                if (rw[k].flags_rd)
+                    fl = true;
+                else if (rw[k].flags_wr)
+                    fl = false;
+            }
+        }
+
+        struct asg {
+            std::string fam;
+            ep val;
+        };
         auto line = [&](uint64_t at, const std::string& s) { ir.stmts.push_back({at, s}); };
+        auto pending = [&](const std::string& fam) {
+            if (fam == "rsp")
+                return false;
+            auto it = cur.find(fam);
+            if (it == cur.end() || !it->second)
+                return false;
+            return !(it->second->kind == expr::k::reg && it->second->text == disp(fam));
+        };
 
-        for (size_t ii = 0; ii < cb.insns.size(); ii++) {
-            uint64_t a = cb.insns[ii];
+        // write `todo` out as statements. the values are parallel - each is what it was before
+        // any of them is assigned - and `readers` (expressions printed or kept after this) keep
+        // their meaning. `spare` are dead values a reader may still contain: naming one can
+        // break a conflict, a temp is the last resort. returns the registers assigned.
+        auto emit_batch = [&](uint64_t at, std::vector<asg> todo, std::vector<ep*> readers,
+                              std::vector<asg> spare) {
+            std::vector<std::string> done;
+            auto age = [&](const std::string& f) {
+                auto it = born.find(f);
+                return it == born.end() ? (size_t)0 : it->second;
+            };
+            std::stable_sort(todo.begin(), todo.end(),
+                             [&](const asg& x, const asg& y) { return age(x.fam) < age(y.fam); });
+            auto rewrite = [&](auto f) {
+                std::vector<ep*> hs;
+                for (asg& t : todo)
+                    hs.push_back(&t.val);
+                for (asg& s : spare)
+                    hs.push_back(&s.val);
+                for (ep* r : readers)
+                    hs.push_back(r);
+                std::vector<ep> keep; // old trees stay alive while the memo points into them
+                for (ep* h : hs)
+                    keep.push_back(*h);
+                rewrite_memo memo;
+                for (ep* h : hs)
+                    *h = f(*h, memo);
+            };
+            // would assigning a's register change what another value reads?
+            auto conflicts = [&](const asg& a) {
+                std::string nm = disp(a.fam);
+                for (const asg& t : todo)
+                    if (&t != &a && refs_name(t.val, nm, a.val.get()))
+                        return true;
+                for (ep* r : readers)
+                    if (refs_name(*r, nm, a.val.get()))
+                        return true;
+                return false;
+            };
+            auto commit = [&](asg a) {
+                std::string nm = disp(a.fam);
+                line(at, nm + " = " + print(a.val) + ";");
+                done.push_back(a.fam);
+                // dead values that read the old register can't be named any more
+                spare.erase(std::remove_if(spare.begin(), spare.end(),
+                                           [&](const asg& s) { return refs_name(s.val, nm, a.val.get()); }),
+                            spare.end());
+                ep named = e_reg(nm);
+                const expr* node = a.val.get();
+                rewrite([&](const ep& e, rewrite_memo& memo) { return replace_node(e, node, named, memo); });
+            };
+            while (!todo.empty()) {
+                size_t pick = todo.size();
+                for (size_t k = 0; k < todo.size() && pick == todo.size(); k++)
+                    if (!conflicts(todo[k]))
+                        pick = k;
+                if (pick < todo.size()) {
+                    asg a = todo[pick];
+                    todo.erase(todo.begin() + (std::ptrdiff_t)pick);
+                    commit(a);
+                    continue;
+                }
+                size_t sp = spare.size();
+                for (size_t k = 0; k < spare.size() && sp == spare.size(); k++) {
+                    bool held = false;
+                    for (const asg& t : todo)
+                        held = held || contains(t.val, spare[k].val.get());
+                    for (ep* r : readers)
+                        held = held || contains(*r, spare[k].val.get());
+                    if (held && !conflicts(spare[k]))
+                        sp = k;
+                }
+                if (sp < spare.size()) {
+                    asg a = spare[sp];
+                    spare.erase(spare.begin() + (std::ptrdiff_t)sp);
+                    commit(a);
+                    continue;
+                }
+                // a cycle: keep the old value of the first register in a temp
+                std::string nm = disp(todo[0].fam);
+                std::string t = "tmp" + std::to_string(++temps);
+                line(at, t + " = " + nm + ";");
+                ep tv = e_reg(t);
+                rewrite([&](const ep& e, rewrite_memo& memo) { return replace_reg(e, nm, tv, memo); });
+            }
+            return done;
+        };
+
+        // write out the pending values of `fams` at instruction k. live pending values that
+        // read one of them, or a register in `clobber` (about to be changed by a statement the
+        // caller prints next), are written out with them. `extra` are more readers.
+        auto settle = [&](size_t k, const std::vector<std::string>& fams, const std::vector<std::string>& clobber,
+                          std::vector<ep*> extra) {
+            uint32_t live = live_after[k];
+            std::set<std::string> in(fams.begin(), fams.end());
+            std::vector<std::string> changing = clobber;
+            changing.insert(changing.end(), fams.begin(), fams.end());
+            for (bool grew = true; grew;) {
+                grew = false;
+                for (auto& kv : cur) {
+                    if (in.count(kv.first) || !pending(kv.first) || !(live & bit(kv.first)))
+                        continue;
+                    for (const std::string& c : changing)
+                        if (refs_name(kv.second, disp(c), nullptr)) {
+                            in.insert(kv.first);
+                            changing.push_back(kv.first);
+                            grew = true;
+                            break;
+                        }
+                }
+            }
+            std::vector<asg> todo, spare;
+            std::vector<ep*> readers = std::move(extra);
+            if (flags_after[k])
+                for (ep* f : {&fs.a, &fs.b, &fs.res})
+                    if (*f)
+                        readers.push_back(f);
+            for (auto& kv : cur) {
+                if (!pending(kv.first))
+                    continue;
+                if (in.count(kv.first))
+                    todo.push_back({kv.first, kv.second});
+                else if (live & bit(kv.first))
+                    readers.push_back(&kv.second);
+                else
+                    spare.push_back({kv.first, kv.second});
+            }
+            if (todo.empty())
+                return;
+            std::vector<std::string> done = emit_batch(cb.insns[k], todo, readers, spare);
+            for (const std::string& f : done) {
+                cur[f] = e_reg(disp(f));
+                born.erase(f);
+            }
+            // dead values that read a register that just changed are stale now
+            for (auto it = cur.begin(); it != cur.end();) {
+                bool stale = false;
+                if (pending(it->first) && !(live & bit(it->first)))
+                    for (const std::string& f : done)
+                        stale = stale || refs_name(it->second, disp(f), nullptr);
+                it = stale ? cur.erase(it) : std::next(it);
+            }
+        };
+
+        // flags still to be tested must not read memory about to change (mem) or a register
+        // about to change (clobber): those parts are computed into temps now
+        auto pin_flags = [&](size_t k, const std::vector<std::string>& clobber, bool mem) {
+            if (!flags_after[k])
+                return;
+            std::vector<std::pair<const expr*, ep>> made;
+            for (ep* f : {&fs.a, &fs.b, &fs.res}) {
+                if (!*f)
+                    continue;
+                bool bad = mem && has_mem(*f);
+                for (const std::string& c : clobber)
+                    bad = bad || refs_name(*f, disp(c), nullptr);
+                if (!bad)
+                    continue;
+                ep t;
+                for (auto& m : made)
+                    if (m.first == f->get())
+                        t = m.second;
+                if (!t) {
+                    std::string nm = "tmp" + std::to_string(++temps);
+                    line(cb.insns[k], nm + " = " + print(*f) + ";");
+                    t = e_reg(nm);
+                    made.push_back({f->get(), t});
+                }
+                *f = t;
+            }
+        };
+
+        // new register values at instruction k (all read before any is set)
+        auto assign_all = [&](size_t k, const std::vector<asg>& vals) {
+            std::vector<std::string> big;
+            for (const asg& v : vals) {
+                if (v.fam.empty() || !v.val)
+                    continue;
+                // the stack pointer, and rbp as a frame pointer, are always shown by name
+                bool frame = v.fam == "rbp" && v.val->kind == expr::k::reg && v.val->text == disp("rsp");
+                if (v.fam == "rsp" || frame) {
+                    cur.erase(v.fam);
+                    continue;
+                }
+                cur[v.fam] = v.val;
+                born[v.fam] = k;
+                if (node_count(v.val) > 6 && (live_after[k] & bit(v.fam)))
+                    big.push_back(v.fam);
+            }
+            if (!big.empty())
+                settle(k, big, {}, {});
+        };
+        auto assign = [&](size_t k, const std::string& fam, ep v) { assign_all(k, {{fam, std::move(v)}}); };
+
+        // a store or a call may change memory: pending values that read it go out first
+        auto barrier = [&](size_t k, std::vector<ep*> extra) {
+            std::vector<std::string> fams;
+            for (auto& kv : cur)
+                if (pending(kv.first) && (live_after[k] & bit(kv.first)) && has_mem(kv.second))
+                    fams.push_back(kv.first);
+            settle(k, fams, {}, std::move(extra));
+            pin_flags(k, {}, true);
+            for (auto it = cur.begin(); it != cur.end();) {
+                bool stale = pending(it->first) && !(live_after[k] & bit(it->first)) && has_mem(it->second);
+                it = stale ? cur.erase(it) : std::next(it);
+            }
+        };
+        auto store = [&](size_t k, ep dst, const std::string& op, ep src) {
+            barrier(k, {&dst, &src});
+            line(cb.insns[k], print(dst) + " " + op + " " + print(src) + ";");
+            return dst;
+        };
+
+        // an instruction the lifter doesn't model: printed as is, after the registers it
+        // reads hold their values and nothing pending reads a register it changes
+        auto opaque = [&](size_t k, cs_insn* in) {
+            const insn_rw& r = rw[k];
+            std::vector<std::string> reads, writes;
+            for (int b = 0; b < 16; b++) {
+                std::string fam = fam_name(b);
+                if (fam == "rsp")
+                    continue;
+                if ((r.rd & (1u << b)) && pending(fam))
+                    reads.push_back(fam);
+                if (r.wr & (1u << b))
+                    writes.push_back(fam);
+            }
+            for (const std::string& w : writes)
+                if (!(r.rd & bit(w)))
+                    cur.erase(w); // overwritten without being read
+            bool writes_mem = false;
+            const cs_x86& xx = in->detail->x86;
+            for (uint8_t i = 0; i < xx.op_count; i++)
+                if (xx.operands[i].type == X86_OP_MEM && (xx.operands[i].access & CS_AC_WRITE))
+                    writes_mem = true;
+            if (writes_mem)
+                barrier(k, {});
+            settle(k, reads, writes, {});
+            pin_flags(k, writes, false);
+            std::string text = std::string("__asm { ") + in->mnemonic;
+            if (in->op_str[0])
+                text += std::string(" ") + in->op_str;
+            line(in->address, text + " }");
+            for (const std::string& w : writes) {
+                cur[w] = e_reg(disp(w));
+                born.erase(w);
+            }
+            for (auto it = cur.begin(); it != cur.end();) {
+                bool stale = false;
+                if (pending(it->first))
+                    for (const std::string& w : writes)
+                        stale = stale || refs_name(it->second, disp(w), nullptr);
+                it = stale ? cur.erase(it) : std::next(it);
+            }
+        };
+
+        for (size_t k = 0; k < ni; k++) {
+            uint64_t a = cb.insns[k];
             uint8_t code[16];
             size_t n = db_.bin.read(a, code, sizeof(code));
             const uint8_t* p = code;
@@ -526,39 +1332,42 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 continue;
             cs_x86& x = insn->detail->x86;
             unsigned id = insn->id;
-            bool last = ii + 1 == cb.insns.size();
+            bool last = k + 1 == ni;
+            // flags this instruction replaces without reading are dead from here on
+            if (rw[k].flags_wr && !rw[k].flags_rd)
+                fs = {};
+            bool fs_set = false;
 
-            auto set_reg = [&](const cs_x86_op& dst, ep val) {
-                std::string fam = reg_family(cs_reg_name(cs_, dst.reg));
-                if (fam.empty())
-                    return;
-                if (fam == "rsp" || fam == "rbp") {
-                    cur[fam] = val;
-                    return;
-                }
-                int b = reg_bit(fam);
-                bool live = b >= 0 && (ir.live_out & (1u << b));
-                // materialise a line when the value is big or leaves the block
-                if (node_count(val) > 6 || (live && last)) {
-                    line(a, disp(fam) + " = " + print(val) + ";");
-                    cur[fam] = e_reg(disp(fam));
-                } else {
-                    cur[fam] = val;
-                }
+            auto reg_of = [&](const cs_x86_op& op) {
+                return op.type == X86_OP_REG ? reg_family(cs_reg_name(cs_, op.reg)) : std::string();
             };
-            auto arith = [&](const char* op) {
-                if (x.op_count < 2)
-                    return;
-                ep d = operand_expr(insn, x.operands[0], cur);
-                ep s = operand_expr(insn, x.operands[1], cur);
-                ep r = e_bin(op, d, s);
+            auto val = [&](const cs_x86_op& op) { return operand_expr(insn, op, cur); };
+            auto result_flags = [&](ep r) {
                 fs = {};
                 fs.valid = true;
-                fs.res = r;
-                if (x.operands[0].type == X86_OP_REG)
-                    set_reg(x.operands[0], r);
-                else if (x.operands[0].type == X86_OP_MEM)
-                    line(a, print(d) + " " + op + "= " + print(s) + ";");
+                fs.res = std::move(r);
+                fs_set = true;
+            };
+            auto arith = [&](const char* op) {
+                if (x.op_count < 1)
+                    return;
+                ep d = val(x.operands[0]);
+                ep s = x.op_count >= 2 ? val(x.operands[1]) : e_num(1);
+                if (x.operands[0].type == X86_OP_REG) {
+                    ep r = e_bin(op, d, s);
+                    result_flags(r);
+                    assign(k, reg_of(x.operands[0]), r);
+                } else if (x.operands[0].type == X86_OP_MEM) {
+                    result_flags(store(k, d, std::string(op) + "=", s)); // the result is in memory now
+                }
+            };
+            // one-operand mul / imul / div / idiv work on rdx:rax
+            auto wide = [&](bool div) {
+                ep v = reg_read(cur, "rax"), s = val(x.operands[0]);
+                if (div)
+                    assign_all(k, {{"rax", e_bin("/", v, s)}, {"rdx", e_bin("%", v, s)}});
+                else
+                    assign_all(k, {{"rax", e_bin("*", v, s)}, {"rdx", e_intr("__mulhi", {v, s})}});
             };
 
             switch (id) {
@@ -568,6 +1377,9 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             case X86_INS_PUSH:
             case X86_INS_POP:
             case X86_INS_LEAVE:
+            case X86_INS_CDQE:
+            case X86_INS_CWDE:
+            case X86_INS_CBW:
                 break;
             case X86_INS_MOV:
             case X86_INS_MOVZX:
@@ -575,145 +1387,248 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             case X86_INS_MOVSXD:
             case X86_INS_MOVABS:
                 if (x.op_count >= 2) {
-                    ep s = operand_expr(insn, x.operands[1], cur);
+                    ep s = val(x.operands[1]);
                     if (x.operands[0].type == X86_OP_REG)
-                        set_reg(x.operands[0], s);
+                        assign(k, reg_of(x.operands[0]), s);
                     else if (x.operands[0].type == X86_OP_MEM)
-                        line(a, print(operand_expr(insn, x.operands[0], cur)) + " = " + print(s) + ";");
+                        store(k, val(x.operands[0]), "=", s);
                 }
                 break;
             case X86_INS_LEA:
-                if (x.op_count >= 2 && x.operands[1].type == X86_OP_MEM) {
-                    uint64_t rip = insn->address + insn->size;
-                    set_reg(x.operands[0], mem_address(x.operands[1].mem, cur, rip));
-                }
+                if (x.op_count >= 2 && x.operands[1].type == X86_OP_MEM)
+                    assign(k, reg_of(x.operands[0]),
+                           mem_address(x.operands[1].mem, cur, insn->address + insn->size));
                 break;
             case X86_INS_ADD: arith("+"); break;
-            case X86_INS_SUB: arith("-"); break;
             case X86_INS_AND: arith("&"); break;
             case X86_INS_OR: arith("|"); break;
             case X86_INS_SHL:
             case X86_INS_SAL: arith("<<"); break;
             case X86_INS_SHR:
             case X86_INS_SAR: arith(">>"); break;
-            case X86_INS_IMUL:
-                if (x.op_count == 3)
-                    set_reg(x.operands[0], e_bin("*", operand_expr(insn, x.operands[1], cur),
-                                                 operand_expr(insn, x.operands[2], cur)));
-                else if (x.op_count == 2)
-                    arith("*");
-                break;
+            case X86_INS_SUB:
             case X86_INS_XOR:
-                if (x.op_count >= 2 && x.operands[0].type == X86_OP_REG &&
-                    x.operands[1].type == X86_OP_REG && x.operands[0].reg == x.operands[1].reg) {
-                    fs = {};
-                    fs.valid = true;
-                    fs.res = e_num(0);
-                    set_reg(x.operands[0], e_num(0));
+                if (same_regs(x)) {
+                    result_flags(e_num(0));
+                    assign(k, reg_of(x.operands[0]), e_num(0));
                 } else {
-                    arith("^");
+                    arith(id == X86_INS_SUB ? "-" : "^");
                 }
+                break;
+            case X86_INS_IMUL:
+                if (x.op_count == 3) {
+                    ep r = e_bin("*", val(x.operands[1]), val(x.operands[2]));
+                    result_flags(r);
+                    assign(k, reg_of(x.operands[0]), r);
+                } else if (x.op_count == 2) {
+                    arith("*");
+                } else if (x.op_count == 1) {
+                    wide(false);
+                }
+                break;
+            case X86_INS_MUL:
+                if (x.op_count == 1)
+                    wide(false);
+                break;
+            case X86_INS_DIV:
+            case X86_INS_IDIV:
+                if (x.op_count == 1)
+                    wide(true);
                 break;
             case X86_INS_INC:
             case X86_INS_DEC:
-                if (x.op_count >= 1 && x.operands[0].type == X86_OP_REG) {
-                    ep r = e_bin(id == X86_INS_INC ? "+" : "-",
-                                 operand_expr(insn, x.operands[0], cur), e_num(1));
-                    fs = {};
-                    fs.valid = true;
-                    fs.res = r;
-                    set_reg(x.operands[0], r);
+                if (x.op_count >= 1) {
+                    const char* op = id == X86_INS_INC ? "+" : "-";
+                    if (x.operands[0].type == X86_OP_REG) {
+                        ep r = e_bin(op, val(x.operands[0]), e_num(1));
+                        result_flags(r);
+                        assign(k, reg_of(x.operands[0]), r);
+                    } else if (x.operands[0].type == X86_OP_MEM) {
+                        result_flags(store(k, val(x.operands[0]), std::string(op) + "=", e_num(1)));
+                    }
                 }
                 break;
             case X86_INS_NEG:
-                if (x.op_count >= 1 && x.operands[0].type == X86_OP_REG)
-                    set_reg(x.operands[0], e_un("-", operand_expr(insn, x.operands[0], cur)));
-                break;
             case X86_INS_NOT:
-                if (x.op_count >= 1 && x.operands[0].type == X86_OP_REG)
-                    set_reg(x.operands[0], e_un("~", operand_expr(insn, x.operands[0], cur)));
-                break;
-            case X86_INS_CMP:
-                if (x.op_count >= 2) {
-                    fs = {};
-                    fs.valid = true;
-                    fs.is_cmp = true;
-                    fs.a = operand_expr(insn, x.operands[0], cur);
-                    fs.b = operand_expr(insn, x.operands[1], cur);
+                if (x.op_count >= 1) {
+                    const char* op = id == X86_INS_NEG ? "-" : "~";
+                    ep d = val(x.operands[0]);
+                    ep r = e_un(op, d);
+                    if (x.operands[0].type == X86_OP_REG) {
+                        if (id == X86_INS_NEG)
+                            result_flags(r);
+                        assign(k, reg_of(x.operands[0]), r);
+                    } else if (x.operands[0].type == X86_OP_MEM) {
+                        ep m = store(k, d, "=", r);
+                        if (id == X86_INS_NEG)
+                            result_flags(m);
+                    }
                 }
                 break;
+            case X86_INS_CMP:
             case X86_INS_TEST:
                 if (x.op_count >= 2) {
                     fs = {};
                     fs.valid = true;
-                    fs.is_test = true;
-                    fs.a = operand_expr(insn, x.operands[0], cur);
-                    fs.b = operand_expr(insn, x.operands[1], cur);
+                    fs.is_cmp = id == X86_INS_CMP;
+                    fs.is_test = id == X86_INS_TEST;
+                    fs.a = val(x.operands[0]);
+                    fs.b = val(x.operands[1]);
+                    fs_set = true;
+                }
+                break;
+            case X86_INS_CDQ:
+            case X86_INS_CQO:
+            case X86_INS_CWD:
+                // the sign of rax into rdx, for a following idiv
+                assign(k, "rdx", e_bin(">>", reg_read(cur, "rax"),
+                                       e_num(id == X86_INS_CQO ? 63 : id == X86_INS_CDQ ? 31 : 15)));
+                break;
+            case X86_INS_XCHG: {
+                std::string fa = x.op_count == 2 ? reg_of(x.operands[0]) : std::string();
+                std::string fb = x.op_count == 2 ? reg_of(x.operands[1]) : std::string();
+                if (!fa.empty() && !fb.empty()) {
+                    if (fa != fb)
+                        assign_all(k, {{fa, reg_read(cur, fb)}, {fb, reg_read(cur, fa)}});
+                } else {
+                    opaque(k, insn);
+                }
+                break;
+            }
+            case X86_INS_ROL:
+            case X86_INS_ROR:
+            case X86_INS_BSWAP:
+                if (x.op_count >= 1 && x.operands[0].type == X86_OP_REG) {
+                    std::vector<ep> args{val(x.operands[0])};
+                    if (id != X86_INS_BSWAP)
+                        args.push_back(x.op_count >= 2 ? val(x.operands[1]) : e_num(1));
+                    const char* nm = id == X86_INS_ROL ? "__rol" : id == X86_INS_ROR ? "__ror" : "__bswap";
+                    assign(k, reg_of(x.operands[0]), e_intr(nm, std::move(args)));
+                } else {
+                    opaque(k, insn);
+                }
+                break;
+            case X86_INS_POPCNT:
+            case X86_INS_LZCNT:
+            case X86_INS_TZCNT:
+            case X86_INS_BSF:
+            case X86_INS_BSR:
+                if (x.op_count >= 2 && x.operands[0].type == X86_OP_REG) {
+                    std::string nm = std::string("__") + insn->mnemonic;
+                    assign(k, reg_of(x.operands[0]), e_intr(nm, {val(x.operands[1])}));
+                } else {
+                    opaque(k, insn);
                 }
                 break;
             case X86_INS_CALL: {
-                uint64_t target = 0;
-                if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM)
-                    target = (uint64_t)x.operands[0].imm;
                 auto ce = std::make_shared<expr>();
                 ce->kind = expr::k::call;
-                if (target) {
+                if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
+                    uint64_t target = (uint64_t)x.operands[0].imm;
                     std::string nm = db_.name_at(target);
                     ce->text = nm.empty() ? db_.location(target) : nm;
                     ce->ref = target;
                 } else if (x.op_count >= 1) {
-                    ce->text = "(*" + print(operand_expr(insn, x.operands[0], cur)) + ")";
+                    ce->indirect = true;
+                    ce->kids.push_back(val(x.operands[0]));
                 } else {
                     ce->text = "(*indirect)";
                 }
-                if (is64_) {
-                    for (int ai = 0;; ai++) {
-                        const char* ar = arg_reg_at(ai, is64_, fmt);
-                        if (!ar)
-                            break;
-                        auto it = cur.find(ar);
-                        if (it == cur.end())
-                            break;
-                        ce->kids.push_back(it->second);
-                    }
+                // arguments: what a known callee reads, else what was set since the last call
+                int known = rw[k].target ? callee_of(rw[k].target).arity : -1;
+                for (size_t i = 0; i < arg_bits.size(); i++) {
+                    if (known >= 0 ? (int)i >= known : !(argset & arg_bits[i]))
+                        break;
+                    ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
                 }
-                std::string rax = is64_ ? "rax" : "eax";
-                bool used = (ir.live_out & 1u) != 0;
-                if (used) {
-                    line(a, rax + " = " + print(ce) + ";");
-                    cur["rax"] = e_reg(rax);
+                ep call = ce;
+                barrier(k, {&call});
+                uint32_t clob = rw[k].wr & scratch;
+                if ((live_after[k] & 1u) && (clob & 1u)) {
+                    // the result is used: "rax = f(...);"
+                    cur["rax"] = call;
+                    born["rax"] = k;
+                    settle(k, {"rax"}, {}, {});
                 } else {
-                    line(a, print(ce) + ";");
-                    cur.erase("rax");
+                    line(a, print(call) + ";");
+                    if (clob & 1u)
+                        cur.erase("rax");
                 }
+                // the callee may change these scratch registers
+                for (auto it = cur.begin(); it != cur.end();) {
+                    bool gone = (bit(it->first) & clob) && it->first != "rax";
+                    it = gone ? cur.erase(it) : std::next(it);
+                }
+                argset &= ~clob;
+                fs = {};
+                fs_set = true;
                 break;
             }
             case X86_INS_RET:
             case X86_INS_RETF:
                 break;
-            default:
-                if (!cs_insn_group(cs_, insn, X86_GRP_JUMP) && !cs_insn_group(cs_, insn, X86_GRP_RET)) {
-                    cs_regs rd, wr;
-                    uint8_t nrd = 0, nwr = 0;
-                    if (cs_regs_access(cs_, insn, rd, &nrd, wr, &nwr) == CS_ERR_OK)
-                        for (uint8_t i = 0; i < nwr; i++) {
-                            std::string fam = reg_family(cs_reg_name(cs_, wr[i]));
-                            if (!fam.empty() && fam != "rsp" && fam != "rbp")
-                                cur[fam] = e_reg(disp(fam));
+            default: {
+                bool is_set = false;
+                unsigned cc = jcc_for(id, is_set);
+                if (cc) {
+                    bool ok = false;
+                    ep c = build_cond(fs, cc, ok);
+                    if (ok && is_set && x.op_count >= 1 && x.operands[0].type == X86_OP_REG) {
+                        assign(k, reg_of(x.operands[0]), c);
+                        break;
+                    }
+                    if (ok && is_set && x.op_count >= 1 && x.operands[0].type == X86_OP_MEM) {
+                        store(k, val(x.operands[0]), "=", c);
+                        break;
+                    }
+                    if (ok && !is_set && x.op_count >= 2 && x.operands[0].type == X86_OP_REG) {
+                        assign(k, reg_of(x.operands[0]), e_tern(c, val(x.operands[1]), val(x.operands[0])));
+                        break;
+                    }
+                }
+                if (cs_insn_group(cs_, insn, X86_GRP_JUMP) || cs_insn_group(cs_, insn, X86_GRP_RET))
+                    break;
+                if (rw[k].wr & ~bit("rsp")) {
+                    opaque(k, insn);
+                } else {
+                    for (uint8_t i = 0; i < x.op_count; i++)
+                        if (x.operands[i].type == X86_OP_MEM && (x.operands[i].access & CS_AC_WRITE)) {
+                            barrier(k, {}); // e.g. an sse store: not shown, but memory changed
+                            break;
                         }
                 }
                 break;
             }
+            }
+            if (rw[k].flags_wr && !fs_set)
+                fs = {};
+            if (!rw[k].call)
+                argset |= rw[k].wr & arg_mask;
 
             if (last) {
                 if (cs_insn_group(cs_, insn, X86_GRP_RET)) {
                     ir.term = term_kind::ret;
-                    if (returns_value) {
-                        auto it = cur.find("rax");
-                        ir.cond = it != cur.end() && it->second ? it->second : e_reg(is64_ ? "rax" : "eax");
-                    }
+                    if (returns_value)
+                        ir.cond = reg_read(cur, "rax");
                 } else if (id == X86_INS_JMP) {
-                    if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
+                    if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM &&
+                        !block_of.count((uint64_t)x.operands[0].imm)) {
+                        // a jump out of the function: a tail call
+                        uint64_t t = (uint64_t)x.operands[0].imm;
+                        auto ce = std::make_shared<expr>();
+                        ce->kind = expr::k::call;
+                        std::string nm = db_.name_at(t);
+                        ce->text = nm.empty() ? db_.location(t) : nm;
+                        ce->ref = t;
+                        int known = callee_of(t).arity;
+                        for (size_t i = 0; i < arg_bits.size(); i++) {
+                            if (known >= 0 ? (int)i >= known : !(argset & arg_bits[i]))
+                                break;
+                            ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
+                        }
+                        ir.term = term_kind::indirect;
+                        ir.cond = ce;
+                    } else if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
                         ir.term = term_kind::jump;
                         ir.fall = (uint64_t)x.operands[0].imm;
                     } else {
@@ -723,14 +1638,24 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                             ir.table = &t->second;
                             std::string fam = t->second.index_reg
                                 ? reg_family(cs_reg_name(cs_, t->second.index_reg)) : std::string();
-                            if (!fam.empty()) {
-                                auto it = cur.find(fam);
-                                ir.cond = it != cur.end() && it->second ? it->second : e_reg(disp(fam));
-                            } else if (x.op_count >= 1) {
-                                ir.cond = operand_expr(insn, x.operands[0], cur);
-                            }
+                            if (!fam.empty())
+                                ir.cond = reg_read(cur, fam);
+                            else if (x.op_count >= 1)
+                                ir.cond = val(x.operands[0]);
                         } else {
                             ir.term = term_kind::indirect;
+                            if (x.op_count >= 1 && x.operands[0].type == X86_OP_MEM) {
+                                // jmp [ptr] leaving the function: a tail call through a pointer
+                                auto ce = std::make_shared<expr>();
+                                ce->kind = expr::k::call;
+                                ce->indirect = true;
+                                ce->kids.push_back(val(x.operands[0]));
+                                for (size_t i = 0; i < arg_bits.size() && (argset & arg_bits[i]); i++)
+                                    ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
+                                ir.cond = ce;
+                            } else if (x.op_count >= 1) {
+                                ir.cond = val(x.operands[0]); // the jump target
+                            }
                         }
                     }
                 } else if (cs_insn_group(cs_, insn, X86_GRP_JUMP)) {
@@ -747,6 +1672,24 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         }
         if (ir.term == term_kind::fallthrough)
             ir.fall = ir.end;
+
+        // values a later block reads become statements at the end of this one
+        {
+            std::vector<asg> todo, spare;
+            for (auto& kv : cur) {
+                if (!pending(kv.first))
+                    continue;
+                if (ir.live_out & bit(kv.first))
+                    todo.push_back({kv.first, kv.second});
+                else
+                    spare.push_back({kv.first, kv.second});
+            }
+            std::vector<ep*> readers;
+            if (ir.cond)
+                readers.push_back(&ir.cond);
+            if (!todo.empty())
+                emit_batch(ni ? cb.insns.back() : cb.start, todo, readers, spare);
+        }
     }
 
     // switch variable: prefer the operand of the guarding "cmp idx, n / ja default"
@@ -768,6 +1711,26 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 sw.cond = lhs;
                 break;
             }
+        }
+    }
+
+    // a switch block computes the table jump's target: assignments that nothing after them
+    // reads are that computation, not worth showing
+    for (block_ir& sw : out) {
+        if (sw.term != term_kind::sw)
+            continue;
+        std::string rest = sw.cond ? print(sw.cond) : std::string();
+        for (size_t i = sw.stmts.size(); i-- > 0;) {
+            const std::string& t = sw.stmts[i].text;
+            size_t eq = t.find(" = ");
+            std::string lhs = eq == std::string::npos ? std::string() : t.substr(0, eq);
+            std::string fam = reg_family(lhs.c_str());
+            if (!fam.empty() && disp(fam) == lhs && !(sw.live_out & (1u << reg_bit(fam))) &&
+                !mentions(rest, lhs)) {
+                sw.stmts.erase(sw.stmts.begin() + (std::ptrdiff_t)i);
+                continue;
+            }
+            rest += " " + t;
         }
     }
 
@@ -793,6 +1756,7 @@ struct structurer {
     std::vector<int> rpo, order, idom, ipdom;
     std::vector<char> is_header;
     std::vector<int> loop_follow, header_of;
+    std::map<int, std::set<int>> bodies; // loop header -> blocks in the loop
     std::vector<char> emitted;
     std::set<int> want_label;
     std::vector<decomp_line> out;
@@ -808,6 +1772,7 @@ struct structurer {
     void compute_dom();
     void find_loops();
     bool dominates(int a, int b);
+    bool repeat_return(int b, int indent, int stop, std::vector<loopctx>& loops);
 
     void emit_block_stmts(int b, int indent);
     void emit_term(int b, int indent, int stop, std::vector<loopctx>& loops);
@@ -964,6 +1929,7 @@ void structurer::find_loops()
                 for (int x : body)
                     if (header_of[x] == -1 || order[header_of[x]] < order[v])
                         header_of[x] = v;
+                bodies[v].insert(body.begin(), body.end());
                 int follow = -1;
                 for (int s : succ[v])
                     if (!body.count(s))
@@ -984,6 +1950,18 @@ void structurer::emit_block_stmts(int b, int indent)
         line(indent, s.text, s.addr);
 }
 
+// a small block that returns is repeated where it's needed again, instead of a goto
+bool structurer::repeat_return(int b, int indent, int stop, std::vector<loopctx>& loops)
+{
+    const block_ir& ib = b < 0 ? blocks[0] : blocks[b];
+    bool tail = ib.term == term_kind::indirect && ib.cond && ib.cond->kind == expr::k::call;
+    if (b < 0 || (ib.term != term_kind::ret && !tail) || ib.stmts.size() > 2)
+        return false;
+    emit_block_stmts(b, indent);
+    emit_term(b, indent, stop, loops);
+    return true;
+}
+
 void structurer::go(int target, int indent, int stop, std::vector<loopctx>& loops)
 {
     if (target < 0)
@@ -994,13 +1972,21 @@ void structurer::go(int target, int indent, int stop, std::vector<loopctx>& loop
             return;
         }
         if (target == loops.back().header) {
-            line(indent, "continue;");
+            if (loops.back().dowhile) {
+                // continue would test the do-while condition first; this jump doesn't
+                want_label.insert(target);
+                line(indent, "goto " + label_name(target) + ";");
+            } else {
+                line(indent, "continue;");
+            }
             return;
         }
     }
     if (target == stop)
         return;
     if (emitted[target]) {
+        if (repeat_return(target, indent, stop, loops))
+            return;
         want_label.insert(target);
         line(indent, "goto " + label_name(target) + ";");
         return;
@@ -1019,7 +2005,18 @@ void structurer::emit_term(int b, int indent, int stop, std::vector<loopctx>& lo
             line(indent, "return;");
         break;
     case term_kind::indirect:
-        line(indent, "return; // indirect jump");
+        if (ib.cond && ib.cond->kind == expr::k::call) {
+            if (returns_value) {
+                line(indent, "return " + print(ib.cond) + "; // tail call", ib.end ? ib.end - 1 : 0);
+            } else {
+                line(indent, print(ib.cond) + "; // tail call", ib.end ? ib.end - 1 : 0);
+                line(indent, "return;");
+            }
+        } else if (ib.cond) {
+            line(indent, "goto *" + print(ib.cond, 90) + "; // indirect jump", ib.end ? ib.end - 1 : 0);
+        } else {
+            line(indent, "return; // indirect jump");
+        }
         break;
     case term_kind::noreturn:
         // the last statement was the noreturn call; nothing flows out
@@ -1033,13 +2030,30 @@ void structurer::emit_term(int b, int indent, int stop, std::vector<loopctx>& lo
     case term_kind::cond: {
         int t = at(ib.taken), f = at(ib.fall);
         std::string c = ib.cond ? print(ib.cond) : "cond";
+        std::string not_c = ib.cond ? print(negate(ib.cond)) : "!(" + c + ")";
         // pick the merge point so the if body is single-entry
         int merge = ipdom.empty() ? -1 : ipdom[b];
+        if (!loops.empty()) {
+            auto lb = bodies.find(loops.back().header);
+            if (lb != bodies.end()) {
+                bool t_out = !lb->second.count(t), f_out = !lb->second.count(f);
+                if (t_out != f_out) {
+                    // one arm leaves the loop: "if (c) { break / return }", then the loop goes on
+                    line(indent, "if (" + (t_out ? c : not_c) + ") {", ib.start);
+                    go(t_out ? t : f, indent + 1, -1, loops);
+                    line(indent, "}");
+                    go(t_out ? f : t, indent, stop, loops);
+                    break;
+                }
+                if (merge >= 0 && !lb->second.count(merge))
+                    merge = -1; // the paths only meet outside the loop
+            }
+        }
         // both arms present
         bool t_is_merge = t == merge, f_is_merge = f == merge;
         if (t_is_merge && !f_is_merge) {
             // only the fall arm has a body: if (!cond) { fall }
-            line(indent, "if (" + (ib.cond ? print(negate(ib.cond)) : "!(" + c + ")") + ") {", ib.start);
+            line(indent, "if (" + not_c + ") {", ib.start);
             go(f, indent + 1, merge, loops);
             line(indent, "}");
             go(merge, indent, stop, loops);
@@ -1067,22 +2081,46 @@ void structurer::emit_term(int b, int indent, int stop, std::vector<loopctx>& lo
     case term_kind::sw: {
         std::string v = ib.cond ? print(ib.cond) : "switch_var";
         line(indent, "switch (" + v + ") {", ib.start);
+        int merge = ipdom.empty() ? -1 : ipdom[b];
         if (ib.table) {
-            // group case indices by target
+            // group case indices by target, in case order
             std::map<uint64_t, std::vector<uint32_t>> by_target;
             for (uint32_t i = 0; i < ib.table->cases.size(); i++)
                 by_target[ib.table->cases[i]].push_back(i);
-            for (auto& kv : by_target) {
-                for (uint32_t ci : kv.second)
+            std::vector<std::pair<uint64_t, std::vector<uint32_t>>> groups(by_target.begin(), by_target.end());
+            std::sort(groups.begin(), groups.end(),
+                      [](const auto& x, const auto& y) { return x.second.front() < y.second.front(); });
+            // inside the switch, "break" leaves the switch (to the merge), never a loop
+            loopctx sc;
+            sc.header = -2;
+            sc.follow = merge;
+            loops.push_back(sc);
+            for (auto& g : groups) {
+                for (uint32_t ci : g.second)
                     line(indent + 1, "case " + std::to_string(ci) + ":");
-                int tb = at(kv.first);
-                if (tb >= 0) {
+                int tb = at(g.first);
+                if (tb < 0)
+                    continue;
+                if (tb == merge) {
+                    line(indent + 2, "break;");
+                } else if (!emitted[tb] && idom[tb] == b) {
+                    // only this switch leads here: the case body goes inline
+                    size_t before = out.size();
+                    go(tb, indent + 2, merge, loops);
+                    const std::string& lt = out.size() > before ? out.back().text : std::string();
+                    bool left = lt.compare(0, 6, "return") == 0 || lt == "break;" || lt == "continue;" ||
+                                lt.compare(0, 5, "goto ") == 0;
+                    if (!left)
+                        line(indent + 2, "break;");
+                } else if (!(emitted[tb] && repeat_return(tb, indent + 2, merge, loops))) {
                     want_label.insert(tb);
                     line(indent + 2, "goto " + label_name(tb) + ";");
                 }
             }
+            loops.pop_back();
         }
         line(indent, "}");
+        go(merge, indent, stop, loops);
         break;
     }
     }
@@ -1113,6 +2151,8 @@ void structurer::emit(int b, int indent, int stop, std::vector<loopctx>& loops)
     }
 
     if (emitted[b]) {
+        if (repeat_return(b, indent, stop, loops))
+            return;
         want_label.insert(b);
         line(indent, "goto " + label_name(b) + ";");
         return;
@@ -1161,22 +2201,32 @@ void structurer::emit(int b, int indent, int stop, std::vector<loopctx>& loops)
         }
 
         emitted[b] = 1;
+        if (want_label.count(b))
+            line(indent, label_name(b) + ":", hb.start);
         loopctx lc;
         lc.header = b;
         lc.follow = loop_follow[b];
         loops.push_back(lc);
         if (top_test) {
-            emit_block_stmts(b, indent);
             int body_entry;
-            std::string cond;
+            ep stay; // the loop goes on while this holds
             if (at(hb.fall) == loop_follow[b]) {
-                cond = hb.cond ? print(hb.cond) : "1";
+                stay = hb.cond;
                 body_entry = at(hb.taken);
             } else {
-                cond = hb.cond ? print(negate(hb.cond)) : "0";
+                stay = hb.cond ? negate(hb.cond) : nullptr;
                 body_entry = at(hb.fall);
             }
-            line(indent, "while (" + cond + ") {", hb.start);
+            if (hb.stmts.empty()) {
+                line(indent, "while (" + (stay ? print(stay) : std::string("1")) + ") {", hb.start);
+            } else {
+                // the header computes something before its test, on every pass
+                line(indent, "while (1) {", hb.start);
+                emit_block_stmts(b, indent + 1);
+                line(indent + 1, "if (" + (stay ? print(negate(stay)) : std::string("0")) + ") {");
+                line(indent + 2, "break;");
+                line(indent + 1, "}");
+            }
             go(body_entry, indent + 1, b, loops);
             line(indent, "}");
         } else {
@@ -1276,28 +2326,55 @@ void structurer::run(int entry)
             ipdom[i] = (pd[i] == vexit) ? -1 : pd[i];
     }
     find_loops();
-    emitted.assign(blocks.size(), 0);
 
-    std::vector<loopctx> loops;
-    emit(entry, 0, -1, loops);
-    // any block the walk missed (irreducible / unreachable) - append with a label
-    for (int b : rpo)
-        if (!emitted[b]) {
-            want_label.insert(b);
-            line(0, "");
-            emit(b, 0, -1, loops);
-        }
+    // a goto can go back to a block that is already written: a first pass finds every
+    // label that's needed, the next one writes them
+    std::set<int> labels;
+    for (int pass = 0; pass < 4; pass++) {
+        out.clear();
+        emitted.assign(blocks.size(), 0);
+        want_label = labels;
+        std::vector<loopctx> loops;
+        emit(entry, 0, -1, loops);
+        // any block the walk missed (irreducible / unreachable) - append with a label
+        for (int b : rpo)
+            if (!emitted[b]) {
+                want_label.insert(b);
+                line(0, "");
+                emit(b, 0, -1, loops);
+            }
+        if (want_label == labels)
+            break;
+        labels = want_label;
+    }
 }
 
 // tidy up the emitted lines: drop empty then-branches and empty blocks
 std::vector<decomp_line> cleanup(const std::vector<decomp_line>& in)
 {
     std::vector<decomp_line> v;
+    // which line opened the block at each indent, to tell loop bodies from if bodies
+    std::vector<std::string> opener;
     auto is_if = [](const std::string& s) {
         return s.size() > 7 && s.compare(0, 4, "if (") == 0 && s.compare(s.size() - 3, 3, ") {") == 0;
     };
     for (size_t i = 0; i < in.size(); i++) {
         const decomp_line& l = in[i];
+        if (opener.size() <= (size_t)l.indent)
+            opener.resize((size_t)l.indent + 1);
+        if (!l.text.empty() && l.text.back() == '{')
+            opener[(size_t)l.indent] = l.text;
+        if (l.text == "continue;" && l.indent > 0 && i + 1 < in.size() && in[i + 1].indent == l.indent - 1 &&
+            in[i + 1].text == "}" && opener[(size_t)l.indent - 1].compare(0, 6, "while ") == 0)
+            continue;
+        if (l.text == "} else {" && i + 1 < in.size() && in[i + 1].indent == l.indent && in[i + 1].text == "}") {
+            // empty else: just close the if
+            decomp_line nl = l;
+            nl.text = "}";
+            v.push_back(nl);
+            i++;
+            continue;
+        }
         if (is_if(l.text) && i + 1 < in.size()) {
             const decomp_line& nx = in[i + 1];
             std::string cond = l.text.substr(4, l.text.size() - 7);

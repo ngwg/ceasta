@@ -19,20 +19,30 @@ ida-style listing, a decompiler, a function graph, an x64dbg-style debugger, and
 ceasta shows the same code from raw bytes up to readable c, so you can drop to whatever level you need:
 
 ```text
-; assembly — the real instructions, with names            ; pseudocode (F5) — reconstructed c
-checksum proc                                             int checksum(int rdi)
-  movzx  ecx, byte ptr [rdi]                              {
-  test   cl, cl                                               if (*(char*)rdi == 0) {
-  je     loc_10016A9                                             return 0x1505;
-  ...                                                          }
-  mov    edx, eax                                             do {
-  shl    edx, 5                                                   rax = rcx + ((rax << 5) + rax);
-  add    edx, eax                                             } while (*(char*)rdi != 0);
-  ...                                                          return rax;
-                                                           }
+; assembly - the real instructions  // pseudocode (f5) - reconstructed c
+
+checksum proc                       int checksum(int rdi)
+  movzx   edx, byte ptr [rdi]       {
+  test    dl, dl                        rdx = *(char*)rdi;
+  je      loc_1191                      if (rdx == 0) {
+  mov     eax, 0x1505                       return 0x1505;
+loc_1179:                               }
+  mov     ecx, eax                      rax = 0x1505;
+  shl     ecx, 5                        do {
+  add     eax, ecx                          rax = rax + (rax << 5) + rdx;
+  add     rdi, 1                            rdi = rdi + 1;
+  movzx   edx, dl                           rdx = *(char*)rdi;
+  add     eax, edx                      } while (rdx != 0);
+  movzx   edx, byte ptr [rdi]           return rax;
+  test    dl, dl                    }
+  jne     loc_1179
+  ret
+loc_1191:
+  mov     eax, 0x1505
+  ret
 ```
 
-the decompiler is best-effort — great for reading a routine quickly, but the listing stays the source of truth.
+that's djb2 (5381 is `0x1505`, and `(h << 5) + h` is `h * 33`). the decompiler is best-effort: no types or structs yet, so you read registers and casts - great for getting a routine quickly, while the listing stays the source of truth.
 
 ## download
 
