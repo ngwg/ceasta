@@ -33,7 +33,8 @@ $startMenu = Join-Path ([Environment]::GetFolderPath("Programs")) "ceasta.lnk"
 Check (Test-Path $startMenu) "start menu shortcut"
 
 # the installed cli runs on its own (static runtime, no extra dlls needed)
-$out = & (Join-Path $dir "ceasta-cli.exe") info tests\fixtures\sample64.exe
+# analyze the program's own exe, so the check needs no extra fixture
+$out = & (Join-Path $dir "ceasta-cli.exe") info (Join-Path $dir "ceasta.exe")
 Check ($LASTEXITCODE -eq 0 -and ($out -join "`n").Contains("pe x64")) "installed ceasta-cli analyzes a file"
 
 Write-Host "== uninstalling"
