@@ -1,7 +1,7 @@
 # ceasta plugins
 
 Plugins are plain [Lua](https://www.lua.org/) scripts. ceasta loads every `.lua`
-file in this folder at startup and again whenever you pick **Plugins → Reload**.
+file in this folder at startup and again whenever you pick **Plugins → Reload plugins**.
 It also loads plugins from your user folder, so you can add your own without
 touching the install:
 
@@ -9,8 +9,12 @@ touching the install:
 - per user: `%APPDATA%\ceasta\plugins\` (Windows), `~/.config/ceasta/plugins/` (Linux)
 
 A plugin usually registers one or more commands. Each command shows up in the
-**Plugins** menu and can be run from the command palette. You can also type Lua
-straight into the **Console** tab at the bottom.
+**Plugins** menu. You can also type Lua straight into the prompt of the
+**Output** tab at the bottom (**Plugins → Lua console** jumps there).
+
+Plugins run without the gui too: `ceasta-cli run file.exe my_plugin.lua` loads
+the file, runs the script and then every command it registered. Add `--debug`
+to start the file under the debugger first (Windows), so `ceasta.dbg.*` works.
 
 ## The files here
 
@@ -46,12 +50,13 @@ ceasta.on("load", function() ceasta.log("analysis finished") end)
 `ceasta.*`
 
 - `log(...)`, `warn(msg)` — write to the output log (`print` also works)
-- `file()` — table describing the loaded binary
+- `file()` — `{ path, name, format, arch, kind, base, entry, has_entry, bits }`
 - `read(addr, n)` → string · `read_u8/16/32/64(addr)` · `read_i32(addr)` · `read_ptr(addr)` · `read_cstr(addr [,max])`
 - `is_mapped(addr)` · `is_code(addr)`
 - `name(addr)` · `location(addr)` · `set_name(addr, name)` → ok[,err] · `resolve(text)` → addr|nil
 - `comment(addr)` · `set_comment(addr, text)`
 - `disasm(addr)` → `{ addr, size, mnemonic, operands, text, flow, target? }` · `next_addr(addr)`
+  (`flow` is `"normal"`, `"jump"`, `"cond"`, `"call"`, `"ret"` or `"stop"`, `target` is set for direct branches)
 - `functions()` · `imports()` · `exports()` · `strings()` · `xrefs_to(addr)` — arrays of tables
 - `find(pattern [,from [,max]])` — byte search like `"48 8b ?? 05"`, returns addresses
 - `here()` · `goto_addr(addr)` — the cursor in the disassembly view
