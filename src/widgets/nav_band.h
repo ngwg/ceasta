@@ -78,7 +78,7 @@ inline void nav_band(app_state& s)
                 counts[(f & fl_code) ? 0 : (f & fl_data) ? 1 : (f & fl_str) ? 2 : 3]++;
             }
             int best = (int)(std::max_element(counts, counts + 4) - counts);
-            static const ImU32 palette[4] = {theme::band_code, theme::band_data, theme::band_string, theme::band_unknown};
+            const ImU32 palette[4] = {theme::band_code, theme::band_data, theme::band_string, theme::band_unknown};
             cache.cols[(size_t)x] = palette[best];
         }
     }

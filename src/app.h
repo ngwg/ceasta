@@ -2,6 +2,7 @@
 #include "core/database.h"
 #include "core/debugger.h"
 #include "core/lua_host.h"
+#include "theme.h"
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -100,6 +101,7 @@ struct app_state {
 
     // view options
     bool show_bytes = true;
+    theme::ui_theme theme = theme::ui_theme::dark;
 
     // main window placement, restored by the host
     int win_w = 0;
@@ -131,6 +133,7 @@ void app_forward(app_state& s);
 bool app_follow(app_state& s, uint64_t addr); // jump to what the line at addr points at
 void app_names_changed(app_state& s);
 void app_set_font_size(app_state& s, float size);
+void app_set_theme(app_state& s, theme::ui_theme t);
 void app_open_dialog_kind(app_state& s, dialog_kind kind, uint64_t addr = 0);
 
 // debugger, addresses are static (listing) unless said otherwise

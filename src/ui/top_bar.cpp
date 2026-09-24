@@ -80,12 +80,23 @@ static void view_menu(app_state& s)
         s.view = center_view::listing;
     if (ImGui::MenuItem("Function graph", "Space", s.view == center_view::graph))
         s.view = center_view::graph;
+    if (ImGui::MenuItem("Pseudocode", "F5", s.view == center_view::pseudo))
+        s.view = center_view::pseudo;
     ImGui::Separator();
     ImGui::MenuItem("Functions panel", nullptr, &s.show_left);
     ImGui::MenuItem("Info and CPU panels", nullptr, &s.show_right);
     ImGui::MenuItem("Output panel", nullptr, &s.show_bottom);
     ImGui::MenuItem("Opcode bytes", nullptr, &s.show_bytes);
     ImGui::Separator();
+    if (ImGui::BeginMenu("Theme")) {
+        if (ImGui::MenuItem("Dark", nullptr, s.theme == theme::ui_theme::dark))
+            app_set_theme(s, theme::ui_theme::dark);
+        if (ImGui::MenuItem("Light", nullptr, s.theme == theme::ui_theme::light))
+            app_set_theme(s, theme::ui_theme::light);
+        if (ImGui::MenuItem("High contrast", nullptr, s.theme == theme::ui_theme::contrast))
+            app_set_theme(s, theme::ui_theme::contrast);
+        ImGui::EndMenu();
+    }
     if (ImGui::MenuItem("Bigger text", "Ctrl+="))
         app_set_font_size(s, s.font_size + 1);
     if (ImGui::MenuItem("Smaller text", "Ctrl+-"))

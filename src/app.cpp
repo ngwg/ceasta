@@ -50,6 +50,10 @@ static void load_settings(app_state& s)
             s.show_bottom = v == "1";
         else if (k == "show_bytes")
             s.show_bytes = v == "1";
+        else if (k == "theme")
+            s.theme = v == "light" ? theme::ui_theme::light
+                    : v == "contrast" ? theme::ui_theme::contrast
+                                      : theme::ui_theme::dark;
         else if (k == "break_on_entry")
             s.dbg.break_on_entry = v == "1";
         else if (k == "debug_args")
@@ -73,6 +77,9 @@ static void save_settings(app_state& s)
     o += util::fmt("show_left=%d\nshow_right=%d\nshow_bottom=%d\nshow_bytes=%d\nbreak_on_entry=%d\n", s.show_left,
         s.show_right, s.show_bottom, s.show_bytes, s.dbg.break_on_entry);
     o += util::fmt("win_w=%d\nwin_h=%d\nwin_max=%d\n", s.win_w, s.win_h, s.win_max);
+    const char* tname = s.theme == theme::ui_theme::light ? "light"
+                      : s.theme == theme::ui_theme::contrast ? "contrast" : "dark";
+    o += std::string("theme=") + tname + "\n";
     o += "debug_args=" + s.debug_args + "\n";
     for (const std::string& r : s.recent)
         o += "recent=" + r + "\n";
@@ -283,6 +290,13 @@ void app_names_changed(app_state& s)
 void app_set_font_size(app_state& s, float size)
 {
     s.font_size = std::min(32.0f, std::max(10.0f, size));
+}
+
+void app_set_theme(app_state& s, theme::ui_theme t)
+{
+    s.theme = t;
+    theme::apply_theme(t);
+    save_settings(s);
 }
 
 void app_open_dialog_kind(app_state& s, dialog_kind kind, uint64_t addr)
@@ -514,6 +528,7 @@ void app_init(app_state& s, const platform_api& platform, const std::vector<std:
     s.platform = platform;
     s.settings_path = os::join(os::user_dir(), "settings.ini");
     load_settings(s);
+    theme::apply_theme(s.theme);
     setup_debugger(s);
     app_log(s, "ceasta " CEASTA_VERSION " - open a file with ctrl+o or drop one on the window. f1 lists the shortcuts.");
     setup_lua(s);

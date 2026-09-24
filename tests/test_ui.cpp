@@ -298,6 +298,11 @@ int main(int argc, char** argv)
 
     static app_state s;
     s.sandboxed = true;
+    if (const char* th = getenv("CEASTA_UI_THEME")) {
+        std::string t = th;
+        s.theme = t == "light" ? theme::ui_theme::light
+                : t == "contrast" ? theme::ui_theme::contrast : theme::ui_theme::dark;
+    }
     platform_api platform;
     std::string next_open = os::join(fixtures, "sample32.exe");
     platform.open_file_dialog = [&](const char*) { return next_open; };
@@ -307,6 +312,12 @@ int main(int argc, char** argv)
         g_snap_dir = d;
     printf("[startup]\n");
     app_init(s, platform, {});
+    if (const char* th = getenv("CEASTA_UI_THEME")) {
+        std::string t = th;
+        s.theme = t == "light" ? theme::ui_theme::light
+                : t == "contrast" ? theme::ui_theme::contrast : theme::ui_theme::dark;
+        theme::apply_theme(s.theme); // snapshot override, after settings load
+    }
     frames(s, 10);
     snap(s, "welcome");
     EXPECT(s.db == nullptr, "starts on the welcome screen");
