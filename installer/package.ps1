@@ -41,11 +41,36 @@ foreach ($f in @("ceasta.exe", "ceasta-cli.exe", "plugins\hello.lua", "THIRD_PAR
     if (-not (Test-Path (Join-Path $stage $f))) { throw "missing $f in $stage" }
 }
 
-# portable zip: a single "ceasta" folder inside
+# portable zip: a single "ceasta" folder inside. written by hand instead of
+# Compress-Archive, which stores "ceasta\ceasta.exe" style names on windows
+# powershell 5.1 - the zip format wants "/" and other unzip tools choke on "\".
 $zip = Join-Path $dist "ceasta-$Version-windows-x64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
-Compress-Archive -Path $stage -DestinationPath $zip
-Write-Host "== portable zip: $zip"
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+$base = (Get-Item -LiteralPath $stage).FullName.TrimEnd('\', '/')
+$archive = [System.IO.Compression.ZipFile]::Open($zip, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($file in Get-ChildItem -LiteralPath $base -Recurse -File) {
+        if (-not $file.FullName.StartsWith($base)) { throw "unexpected path $($file.FullName)" }
+        $name = "ceasta/" + ($file.FullName.Substring($base.Length).TrimStart('\', '/') -replace '\\', '/')
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $name,
+            [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+    }
+} finally {
+    $archive.Dispose()
+}
+$check = [System.IO.Compression.ZipFile]::OpenRead($zip)
+try {
+    $names = @($check.Entries | ForEach-Object { $_.FullName })
+    $bad = @($names | Where-Object { $_ -notmatch '^ceasta/[^\\]+$' })
+    if ($bad.Count -gt 0) { throw "bad names in the zip: $($bad -join ', ')" }
+    foreach ($f in @("ceasta/ceasta.exe", "ceasta/ceasta-cli.exe", "ceasta/plugins/hello.lua")) {
+        if ($names -notcontains $f) { throw "missing $f in the zip" }
+    }
+} finally {
+    $check.Dispose()
+}
+Write-Host "== portable zip: $zip ($($names.Count) files)"
 
 # installer
 $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source

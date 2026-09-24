@@ -153,8 +153,20 @@ jobs:
 
           checksums are in SHA256SUMS.txt.
           EOF
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
+          publish() {
             gh release create "$tag" dist/* --title "ceasta $version" --notes-file notes.md --target "$GITHUB_SHA"
+          }
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            publish
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # a manual re-run replaces the release, so tag, notes and files all come from this commit
+            gh release delete "$tag" --yes --cleanup-tag
+            for i in 1 2 3 4 5; do
+              publish && exit 0
+              sleep $((i * 5))
+              gh release delete "$tag" --yes --cleanup-tag >/dev/null 2>&1 || true # a half made one
+            done
+            exit 1
+          else
+            gh release upload "$tag" dist/* --clobber
           fi
