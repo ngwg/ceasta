@@ -2,6 +2,8 @@
 #include "cli/mcp_cmd.h"
 #include "core/database.h"
 #include "core/diff.h"
+#include "core/os.h"
+#include "core/signatures.h"
 #include "core/decompiler.h"
 #include "core/lua_host.h"
 #include "core/debugger.h"
@@ -33,6 +35,8 @@ static void usage()
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
            "  diff <old> <new>              match functions between two files, show what changed\n"
            "  export <file>                 write a committable project file (<file>.ceasta)\n"
+           "  sigmake <file> [out.sig]      make library signatures from a file that has symbols\n"
+           "  sigapply <file> <in.sig>      name matching functions (--save to keep them)\n"
            "  run <file> <script.lua>       run a lua script against the file (ceasta.* api)\n"
            "                                with --debug the file is started and stopped at its entry first,\n"
            "                                so ceasta.dbg.* works (windows x64, linux x64)\n"
@@ -415,6 +419,42 @@ int main(int argc, char** argv)
             return 1;
         }
         printf("wrote %s\n", db.project_path().c_str());
+        return 0;
+    }
+    if (cmd == "sigmake") {
+        std::vector<signature> sigs = make_signatures(db);
+        std::string out = args.size() > 2 ? args[2] : b.path + ".sig";
+        std::string e;
+        if (!os::write_file(out, signatures_to_text(sigs), e)) {
+            fprintf(stderr, "can't write %s: %s\n", out.c_str(), e.c_str());
+            return 1;
+        }
+        printf("wrote %zu signatures to %s\n", sigs.size(), out.c_str());
+        return 0;
+    }
+    if (cmd == "sigapply") {
+        if (args.size() < 3) {
+            fprintf(stderr, "usage: ceasta-cli sigapply <file> <sigs.sig> [--save]\n");
+            return 2;
+        }
+        std::vector<uint8_t> bytes;
+        std::string e;
+        if (!os::read_file(args[2], bytes, e)) {
+            fprintf(stderr, "can't read %s: %s\n", args[2].c_str(), e.c_str());
+            return 1;
+        }
+        bool save = false;
+        for (const std::string& a : args)
+            if (a == "--save")
+                save = true;
+        std::vector<signature> sigs = signatures_from_text(std::string(bytes.begin(), bytes.end()));
+        std::vector<sig_match> m = match_signatures(db, sigs, save);
+        for (const sig_match& hit : m)
+            printf("%s  %s\n", db.fmt_addr(hit.addr).c_str(), hit.name.c_str());
+        printf("%zu signatures, matched %zu function%s%s\n", sigs.size(), m.size(), m.size() == 1 ? "" : "s",
+               save ? " (saved to the project file)" : "");
+        if (save && !m.empty())
+            db.save_project(e);
         return 0;
     }
     if (cmd == "run") {

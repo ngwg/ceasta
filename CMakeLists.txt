@@ -88,7 +88,8 @@ add_library(ceasta_core STATIC
     src/core/mcp.cpp
     src/core/mcp_transport.cpp
     src/core/os.cpp
-    src/core/pe.cpp)
+    src/core/pe.cpp
+    src/core/signatures.cpp)
 target_include_directories(ceasta_core PUBLIC src)
 target_link_libraries(ceasta_core PUBLIC capstone lua Threads::Threads)
 if(WIN32)

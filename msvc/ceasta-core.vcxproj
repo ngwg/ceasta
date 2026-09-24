@@ -58,6 +58,7 @@
     <ClCompile Include="..\src\core\mcp_transport.cpp" />
     <ClCompile Include="..\src\core\os.cpp" />
     <ClCompile Include="..\src\core\pe.cpp" />
+    <ClCompile Include="..\src\core\signatures.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\core\analysis.h" />
