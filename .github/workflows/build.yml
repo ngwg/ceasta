@@ -43,6 +43,19 @@ jobs:
           name: ceasta-linux
           path: dist/*.tar.gz
 
+  linux-gui:
+    name: linux - experimental gui (compile + link)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install glfw + opengl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libglfw3-dev libgl1-mesa-dev
+      - name: build the gui
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCEASTA_LINUX_GUI=ON
+          cmake --build build --target ceasta --parallel
+          test -x build/ceasta && echo "the linux gui built and linked"
+
   windows:
     name: windows - msvc, installer
     runs-on: windows-2022
