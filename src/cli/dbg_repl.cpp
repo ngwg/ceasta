@@ -322,9 +322,16 @@ int cmd_dbg(int argc, char** argv)
             cmd_disasm(rt, n);
         } else if (c == "dec" || c == "decompile") {
             uint64_t rt = g_dbg.pc(), st;
+            bool at_pc = tok.size() <= 1;
             if (tok.size() > 1 && !resolve_rt(tok[1], rt)) { printf("bad address\n"); continue; }
             if (!in_image(rt, st)) { printf("not in the loaded image\n"); continue; }
-            printf("%s", decompile_text(*g_db, st).c_str());
+            const function* f = g_db->an.func_containing(st);
+            uint64_t start = f ? f->start : st;
+            // when we're stopped inside this function, mark the current line
+            if (at_pc && g_dbg.state() == dbg_state::stopped)
+                printf("%s", decompile_text_marked(*g_db, start, st).c_str());
+            else
+                printf("%s", decompile_text(*g_db, start).c_str());
         } else if (c == "x" || c == "mem") {
             uint64_t rt;
             if (tok.size() < 2 || !resolve_rt(tok[1], rt)) { printf("need an address\n"); continue; }

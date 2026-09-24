@@ -32,3 +32,7 @@ decompiled decompile(database& db, uint64_t func_start);
 
 // the whole thing as plain text (used by the cli and the clipboard)
 std::string decompile_text(database& db, uint64_t func_start);
+
+// same, but mark the line that the address `here` (a static address, usually the debuggee's pc
+// mapped back into the listing) falls on, so you can read where execution is stopped
+std::string decompile_text_marked(database& db, uint64_t func_start, uint64_t here);

@@ -2481,3 +2481,31 @@ std::string decompile_text(database& db, uint64_t func_start)
     }
     return s;
 }
+
+std::string decompile_text_marked(database& db, uint64_t func_start, uint64_t here)
+{
+    decompiled d = decompile(db, func_start);
+    if (!d.ok)
+        return "// " + (d.error.empty() ? std::string("decompile failed") : d.error) + "\n";
+    // the marked line is the one with the greatest addr not past `here` (each line carries the
+    // address of the instruction it came from)
+    size_t mark = d.lines.size();
+    uint64_t best = 0;
+    for (size_t i = 0; i < d.lines.size(); i++) {
+        uint64_t a = d.lines[i].addr;
+        if (a && a <= here && a >= best) {
+            best = a;
+            mark = i;
+        }
+    }
+    std::string s;
+    for (size_t i = 0; i < d.lines.size(); i++) {
+        for (int j = 0; j < d.lines[i].indent; j++)
+            s += "    ";
+        s += d.lines[i].text;
+        if (i == mark)
+            s += "    // <= here (" + db.fmt_addr(here) + ")";
+        s += "\n";
+    }
+    return s;
+}

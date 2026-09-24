@@ -1226,6 +1226,40 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             return true;
         });
 
+    add("debug_decompile_here",
+        "Pseudocode for the function the program is stopped in, with the current line marked, followed "
+        "by the argument registers and their live values (a name in the file, or a string). The fast way "
+        "to see what a routine is doing with the data it actually has right now.",
+        schema({}), [](mcp_server& s, const json::value&, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            uint64_t st = 0;
+            if (!s.debug.to_static || !s.debug.to_static(d->pc(), st)) {
+                out = "the program is stopped outside the loaded file (" + hexa(d->pc()) + ")";
+                return false;
+            }
+            const function* f = db->an.func_containing(st);
+            if (!f) {
+                out = "no function at " + hexa(st);
+                return false;
+            }
+            out = "// " + db->location(f->start) + ", stopped at " + hexa(st) + "\n";
+            out += decompile_text_marked(*db, f->start, st);
+            out += "\nlive registers:\n";
+            for (const reg_value& r : d->registers()) {
+                if (r.name == "eflags" || r.name == "rflags" || r.name == "rsp" || r.name == "rip")
+                    continue;
+                std::string sym = symbolize(s, *db, *d, r.value);
+                if (!sym.empty())
+                    out += util::fmt("  %-5s %016llx  %s\n", r.name.c_str(), (unsigned long long)r.value,
+                                     sym.c_str());
+            }
+            cap(out);
+            return true;
+        });
+
     add("debug_backtrace", "The call stack of the stopped thread, best-effort from the frame pointers.",
         schema({{"limit", prop("integer", "how many frames (default 32)")}}),
         [](mcp_server& s, const json::value& args, std::string& out) {
