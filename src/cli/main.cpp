@@ -32,6 +32,7 @@ static void usage()
            "  xrefs <file> <where>          references to an address\n"
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
            "  diff <old> <new>              match functions between two files, show what changed\n"
+           "  export <file>                 write a committable project file (<file>.ceasta)\n"
            "  run <file> <script.lua>       run a lua script against the file (ceasta.* api)\n"
            "                                with --debug the file is started and stopped at its entry first,\n"
            "                                so ceasta.dbg.* works (windows x64, linux x64)\n"
@@ -405,6 +406,15 @@ int main(int argc, char** argv)
         }
         for (uint64_t a : db.find_bytes(args[2], 0, 1000))
             printf("%s  %s\n", db.fmt_addr(a).c_str(), db.location(a).c_str());
+        return 0;
+    }
+    if (cmd == "export") {
+        std::string e;
+        if (!db.save_project(e)) {
+            fprintf(stderr, "can't write the project file: %s\n", e.c_str());
+            return 1;
+        }
+        printf("wrote %s\n", db.project_path().c_str());
         return 0;
     }
     if (cmd == "run") {

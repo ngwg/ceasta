@@ -655,8 +655,14 @@ std::string database::db_path() const
     return os::join(os::join(os::user_dir(), "db"), safe + "-" + util::fmt("%08X", crc) + ".ceasta");
 }
 
-bool database::save(std::string& err) const
+// a committable project file that sits next to the binary. when it exists, ceasta reads it and
+// writes to it, so a team (or an ai) can keep names and comments in version control.
+std::string database::project_path() const { return bin.path + ".ceasta"; }
+
+std::string database::serialize() const
 {
+    // sorted (user_names / user_comments are std::map, breakpoints std::set), so the file is
+    // stable line by line and diffs cleanly
     std::string s = "ceasta 1\nfile " + bin.name + "\n";
     for (const auto& n : user_names)
         s += "name " + util::hex(n.first) + " " + n.second + "\n";
@@ -664,16 +670,37 @@ bool database::save(std::string& err) const
         s += "comment " + util::hex(c.first) + " " + escape_line(c.second) + "\n";
     for (uint64_t b : breakpoints)
         s += "bp " + util::hex(b) + "\n";
-    std::string path = db_path();
+    return s;
+}
+
+bool database::write_annotations(const std::string& path, std::string& err) const
+{
+    std::string s = serialize();
     size_t slash = path.find_last_of("/\\");
     if (slash != std::string::npos)
         os::make_dirs(path.substr(0, slash));
     return os::write_file(path, s, err);
 }
 
+bool database::save(std::string& err) const
+{
+    // keep the private copy in the user dir up to date, and, if the user has started a project
+    // file next to the binary, update that too
+    bool ok = write_annotations(db_path(), err);
+    if (os::exists(project_path())) {
+        std::string e;
+        ok = write_annotations(project_path(), e) && ok;
+    }
+    return ok;
+}
+
+bool database::save_project(std::string& err) const { return write_annotations(project_path(), err); }
+
 bool database::load_annotations(std::string& err)
 {
-    std::string path = db_path();
+    // the project file next to the binary wins over the private copy, so a committed file is
+    // what a fresh checkout sees
+    std::string path = os::exists(project_path()) ? project_path() : db_path();
     if (!os::exists(path))
         return true;
     std::vector<uint8_t> bytes;

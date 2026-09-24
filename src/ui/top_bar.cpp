@@ -26,6 +26,8 @@ static void file_menu(app_state& s)
     ImGui::Separator();
     if (ImGui::MenuItem("Save names and comments", "Ctrl+S", false, s.db != nullptr))
         app_save(s);
+    if (ImGui::MenuItem("Save project file (next to the binary)", nullptr, false, s.db != nullptr))
+        app_save_project(s);
     if (ImGui::MenuItem("Close file", nullptr, false, s.db != nullptr))
         app_close_file(s);
     ImGui::Separator();

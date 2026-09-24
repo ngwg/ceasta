@@ -204,6 +204,19 @@ void app_save(app_state& s)
     }
 }
 
+void app_save_project(app_state& s)
+{
+    if (!s.db)
+        return;
+    std::string err;
+    if (s.db->save_project(err)) {
+        s.db->dirty = false;
+        app_log(s, "wrote a project file you can commit: " + s.db->project_path());
+    } else {
+        app_log(s, "couldn't write the project file: " + err, 2);
+    }
+}
+
 void app_close_file(app_state& s)
 {
     if (s.dbg.state() != dbg_state::none)

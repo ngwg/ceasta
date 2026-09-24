@@ -86,7 +86,11 @@ public:
     std::vector<uint64_t> find_bytes(const std::string& pattern, uint64_t from, size_t max_results) const;
 
     std::string db_path() const;
-    bool save(std::string& err) const;
+    std::string project_path() const;              // "<binary>.ceasta", next to the file
+    std::string serialize() const;                 // the annotations file text (sorted, diffable)
+    bool save(std::string& err) const;             // private copy, and the project file if it exists
+    bool save_project(std::string& err) const;     // write the project file next to the binary
+    bool write_annotations(const std::string& path, std::string& err) const;
     bool load_annotations(std::string& err);
     bool dirty = false; // unsaved user changes
 

@@ -667,6 +667,28 @@ void add_edit_tools(std::vector<tool>& t)
     };
     t.push_back(std::move(cm));
 
+    tool sp;
+    sp.name = "save_project";
+    sp.description =
+        "Write a project file next to the binary (\"<file>.ceasta\") holding every name, comment and "
+        "breakpoint. It's plain sorted text meant to be committed to version control, so a team - or the "
+        "next session - picks up the work. Once it exists, later renames update it automatically.";
+    sp.schema = schema({});
+    sp.writes = true;
+    sp.run = [](mcp_server& s, const json::value&, std::string& out) {
+        database* db = need_db(s, out);
+        if (!db)
+            return false;
+        std::string err;
+        if (!db->save_project(err)) {
+            out = "can't write the project file: " + err;
+            return false;
+        }
+        out = "wrote " + db->project_path();
+        return true;
+    };
+    t.push_back(std::move(sp));
+
     tool lua;
     lua.name = "run_lua";
     lua.description =
