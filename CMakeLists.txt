@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ceasta VERSION 0.6.0 LANGUAGES C CXX)
+project(ceasta VERSION 0.11.0 LANGUAGES C CXX)
 
 # ceasta: disassembler + debugger.
 #   core (loaders, analysis, lua, debugger) builds everywhere, the gui is windows / directx 11.

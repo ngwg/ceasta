@@ -750,7 +750,7 @@ void dbg_start(app_state& s)
 void dbg_attach(app_state& s, uint32_t pid)
 {
     if (s.sandboxed || !debugger::supported()) {
-        app_log(s, "the debugger is only available in the windows x64 build", 1);
+        app_log(s, s.sandboxed ? "debugging is disabled in this session" : "this build has no debugger (the windows and linux x64 builds do)", 1);
         return;
     }
     std::string err;

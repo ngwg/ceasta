@@ -84,7 +84,7 @@ addresses; while debugging, translate with `ceasta.dbg.to_static` /
 
 ```lua
 { path, name, format, arch, kind, base, entry, has_entry, bits }
--- format: "pe" | "elf" | "raw"   arch: "x86" | "x64"   bits: 32 | 64
+-- format: "pe" | "elf" | "raw"   arch: "x86" | "x64" | "arm64"   bits: 32 | 64
 -- kind: "exe (console)", "dll", "elf pie", ...
 ```
 
@@ -184,7 +184,11 @@ available while a process is loaded under the debugger (windows, or linux with `
 |------|--------------|
 | `step_into()` | one instruction; **waits** until the target stops, returns true |
 | `step_over()` | steps over calls; waits; returns true |
+| `step_out()` | steps over until the function has returned; true when back in the caller |
+| `step_back()` | undoes the last recorded step (registers and the memory it wrote) |
 | `run_to(addr)` | runs until `addr` (or it stops); waits; returns true |
+| `call(func, args...)` | calls a function (a name or an address) in the stopped program and returns its result; a string argument that isn't a name is written into the target and passed as a pointer. 64-bit targets |
+| `trace([n])` | runs up to `n` steps (2000) and records the targets of indirect calls / jumps as xrefs; returns how many were new |
 | `cont()` | continue, returns right away |
 | `pause()` | request a stop, returns right away |
 | `wait([ms])` | wait for the next stop, returns the new state |
