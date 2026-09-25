@@ -436,7 +436,7 @@ static void run_args(app_state& s, dialog_state& d)
 static void about(app_state&, dialog_state&)
 {
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::func), "ceasta %s", CEASTA_VERSION);
-    ImGui::Text("disassembler + debugger with lua plugins");
+    ImGui::Text("disassembler, decompiler and debugger - with lua plugins and an ai server (mcp)");
     ImGui::Spacing();
     ImGui::TextDisabled("built with:");
     ImGui::BulletText("Dear ImGui %s (MIT)", IMGUI_VERSION);

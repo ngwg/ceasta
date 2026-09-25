@@ -61,16 +61,17 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 - ida-style listing: names instead of addresses, labels, xref and string comments
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
 - decompiler (f5): c-like pseudocode for a function — if / else, while / do, switch, calls with names
-- debugger: start or attach, breakpoints, step into / over, run to cursor, pause, registers, stack, live memory
+- search everything (ctrl+f): functions, names, imports, exports, strings, comments and segments in one box, and the strings say where they're used
+- debugger: start or attach, breakpoints, step into / over (one instruction or as many as you set per press), run to cursor, pause, registers, stack, live memory
   - **windows**: full gui debugger + terminal, win32 debug api, 32-bit via wow64
   - **linux**: a terminal debugger on ptrace (`ceasta-cli dbg`) — breakpoints, stepping, registers, memory. basic but real; best on single-threaded targets
 - decompiler while debugging: stopped in a function, the pseudocode marks the current line
 - call a function in the running program (`call decrypt "..."`), record indirect call targets as xrefs (`trace`)
 - binary diff: match functions between two builds and see what changed
 - library signatures: name known functions in a stripped binary (`sigmake` / `sigapply`)
-- a built-in MCP server: connect an AI (Claude Code, Cursor, ...) to the open binary — see [connect an AI](docs/mcp.md)
+- a built-in MCP server: connect an AI (Claude Code, Cursor, ...) to the open binary from the AI menu, or with `ceasta-cli mcp` — see [connect an AI](docs/mcp.md)
 - rename, comments, jump to address or name, xrefs, byte search, back / forward
-- names, comments and breakpoints save per file, and to a committable `<binary>.ceasta` next to it
+- your names, comments and breakpoints are saved when you save (ctrl+s), and closing asks before it throws unsaved work away. save a project (`.ceasta`) wherever you like and open it later, or commit it next to the binary
 - lua plugins and a lua console; `ceasta-cli` for scripts and ci
 
 ## layout
@@ -94,14 +95,15 @@ the decompiler (f5):
 
 | key | what | key | what |
 |-----|------|-----|------|
-| ctrl+o | open a file | space | listing / graph |
+| ctrl+o | open a file (or a `.ceasta` project) | space | listing / graph |
 | g | jump to address or name | f5 | pseudocode (decompiler) |
-| enter / double click | follow the operand | alt+b | search bytes |
-| esc / ctrl+enter | back / forward | f9 | start debugging / continue |
-| n | rename | f7 / f8 | step into / over |
-| ; | comment | f4 | run to cursor |
-| x | references to here | f2 | toggle breakpoint |
-| ctrl+s | save names and comments | f1 | all shortcuts |
+| ctrl+f | search names, imports, strings, ... | alt+b | search bytes |
+| enter / double click | follow the operand | f9 | start debugging / continue |
+| esc / ctrl+enter | back / forward | f7 / f8 | step into / over (n at once: the box by the step buttons) |
+| n | rename | f4 | run to cursor |
+| ; | comment | f2 | toggle breakpoint |
+| x | references to here | f12 | pause |
+| ctrl+s | save | f1 | all shortcuts |
 
 ## plugins
 
@@ -129,6 +131,7 @@ ceasta-cli graph file.exe start     basic blocks of a function
 ceasta-cli decompile file.exe main  pseudocode for a function
 ceasta-cli xrefs file.exe CreateFileW
 ceasta-cli find file.exe "48 8b ?? 05"
+ceasta-cli search file.exe usage      find text in names, imports, strings, comments
 ceasta-cli run file.exe script.lua  run a plugin / script
 ceasta-cli dbg ./program [args]     interactive debugger (linux + windows)
 ceasta-cli diff old.exe new.exe     match functions, show what changed
@@ -140,15 +143,24 @@ ceasta-cli mcp file.exe             serve the file to an AI over MCP
 ## connect an AI
 
 point an AI (Claude Code, Claude Desktop, Cursor, ...) at the binary through ceasta's built-in
-MCP server:
+MCP server. in the app: **AI > Connect an AI...**, start the server, and paste the command it
+shows into your client:
+
+```
+claude mcp add --transport http ceasta http://127.0.0.1:8744/mcp
+```
+
+the AI then works on what you have open — its renames and comments appear as it goes, and with
+the debugger allowed you watch it set breakpoints and step. without the app:
 
 ```
 claude mcp add ceasta -- ceasta-cli mcp /path/to/target.exe
 ```
 
-it can decompile, read xrefs, rename functions, diff builds, and — with `--allow-debug` — set
-breakpoints, step, read memory and even call a function in the running program. the full guide,
-including the debugger tools and the safety notes, is in [connect an AI](docs/mcp.md).
+it can decompile, read xrefs, rename functions, diff builds, and — with the debugger allowed
+(`--allow-debug`) — set breakpoints, step, read memory and even call a function in the running
+program. the full guide, including the debugger tools and the safety notes, is in
+[connect an AI](docs/mcp.md).
 
 ## on linux
 
@@ -199,10 +211,10 @@ cmake -S . -B build -DCEASTA_LINUX_GUI=ON && cmake --build build -j
 
 ## code
 
-- `src/app.*` — state, actions and the main layout
+- `src/app.*` — state, actions and the main layout; `src/app_mcp.cpp` runs the AI server from the app
 - `src/ui/` — one file per panel (top_bar, left_panel, ida_view, graph_view, pseudo_view, right_panel, cpu_panel, bottom_panel, status_bar, dialogs)
 - `src/widgets/` — small shared bits (nav_band, splitter)
-- `src/core/` — no ui: loaders (`binary`, `pe`, `elf`), `disasm` (capstone), `analysis`, `database`, `decompiler`, `lua_host`, `debugger` (win32) + `debugger_linux` (ptrace), `os`
+- `src/core/` — no ui: loaders (`binary`, `pe`, `elf`), `disasm` (capstone), `analysis`, `database`, `search`, `decompiler`, `lua_host`, `debugger` (win32) + `debugger_linux` (ptrace), `mcp` + `mcp_transport` (the AI server), `diff`, `signatures`, `os`
 - `src/cli/` — ceasta-cli and the `dbg` terminal debugger
 - `plugins/` — lua plugins that ship with it
 - `docs/` — the [lua guide](docs/lua.md), the [changelog](docs/CHANGELOG.md), third-party licenses, screenshots

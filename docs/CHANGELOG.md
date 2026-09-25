@@ -1,5 +1,25 @@
 # changelog
 
+## v0.10.0 - 2026-09-25
+
+- search everything (ctrl+f, edit > search, the toolbar): functions, names, imports, exports,
+  strings, comments and segments in one box - exact matches first, up / down / enter to jump,
+  and strings say where they're used. the info panel's box searches its lists and the tabs
+  count the matches. `ceasta-cli search <file> <text>` does the same from a terminal
+- debugger: a steps box by the step buttons (and in the debug menu) - f7 / f8 run that many
+  instructions at once without freezing the window; a breakpoint, a fault or the exit ends it
+  early, and the output gets one line instead of one per instruction
+- the ai server in the app: ai > connect an ai starts the mcp server for the open file and shows
+  what to paste into claude code / cursor. the ai works on what you see - its renames, comments
+  and breakpoints show up live, and its debug session is the window's debugger
+- saving: nothing is saved behind your back any more. closing the window, closing the file or
+  opening another one asks first (save / don't save / cancel), the title shows a * while there
+  are unsaved changes, and file > save project as... writes a `.ceasta` project wherever you
+  like - open it (ctrl+o or drop it on the window) to pick up where you left off
+- mcp over http only answers programs on this machine: requests from web pages of other sites
+  and dns-rebinding hosts are refused, and a stalled connection can't hold the server
+- linux debugger: the program no longer inherits ceasta's open files and sockets
+
 ## v0.9.0 - 2026-09-24
 
 - a built-in mcp server: connect an ai (claude code / desktop, cursor, ...) to the open binary
