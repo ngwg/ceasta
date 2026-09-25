@@ -613,6 +613,14 @@ void add_query_tools(std::vector<tool>& t)
 
 namespace {
 
+// the cli server keeps the files on disk current after every edit
+void autosave(mcp_server& s, database& db)
+{
+    std::string err;
+    if (s.opts.autosave && db.save(err))
+        db.dirty = false;
+}
+
 void add_edit_tools(std::vector<tool>& t)
 {
     tool rn;
@@ -636,7 +644,7 @@ void add_edit_tools(std::vector<tool>& t)
             out = "can't rename " + old + ": " + err;
             return false;
         }
-        db->save(err);
+        autosave(s, *db);
         if (s.on_changed)
             s.on_changed();
         out = name.empty() ? "removed the name at " + hexa(a) : "renamed " + old + " to " + name;
@@ -658,9 +666,8 @@ void add_edit_tools(std::vector<tool>& t)
         uint64_t a;
         if (!db || !arg_addr(*db, args, "address", a, out))
             return false;
-        std::string err;
         db->set_comment(a, arg_str(args, "comment"));
-        db->save(err);
+        autosave(s, *db);
         if (s.on_changed)
             s.on_changed();
         out = "comment set at " + db->location(a);
@@ -681,10 +688,13 @@ void add_edit_tools(std::vector<tool>& t)
         if (!db)
             return false;
         std::string err;
-        if (!db->save_project(err)) {
+        if (!db->save_project(err) || !db->save(err)) {
             out = "can't write the project file: " + err;
             return false;
         }
+        db->dirty = false;
+        if (s.on_changed)
+            s.on_changed();
         out = "wrote " + db->project_path();
         return true;
     };

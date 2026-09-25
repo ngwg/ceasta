@@ -5,6 +5,7 @@
 #include "version.h"
 #include <algorithm>
 #include <cstring>
+#include <functional>
 
 namespace dialogs {
 
@@ -22,6 +23,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::run_args: return "Program arguments###dlg";
     case dialog_kind::about: return "About ceasta###dlg";
     case dialog_kind::shortcuts: return "Keyboard shortcuts###dlg";
+    case dialog_kind::save_changes: return "Save changes?###dlg";
     default: return "###dlg";
     }
 }
@@ -445,10 +447,52 @@ static void about(app_state&, dialog_state&)
         ImGui::CloseCurrentPopup();
 }
 
+// asked before the file goes away with unsaved work (quit, close, open another)
+static void save_changes(app_state& s, dialog_state& d)
+{
+    if (!s.db) { // nothing left to save
+        d.proceed = true;
+        ImGui::CloseCurrentPopup();
+        return;
+    }
+    ImGui::Text("Save your changes to %s?", s.db->bin.name.c_str());
+    ImGui::TextDisabled("names, comments and breakpoints you added since the last save");
+    ImGui::TextDisabled("(don't save throws them away)");
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    ImGui::Spacing();
+    float bw = ImGui::GetFontSize() * 7;
+    bool save = ImGui::Button("Save", ImVec2(bw, 0));
+    // save is the default: enter presses it, tab moves on to the other buttons
+    ImGui::SetItemDefaultFocus();
+    if (ImGui::IsWindowAppearing())
+        ImGui::SetNavCursorVisible(true);
+    if (save) {
+        app_save(s);
+        if (s.db->dirty) {
+            d.error = "couldn't save - see the output panel";
+        } else {
+            d.proceed = true;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Don't save", ImVec2(bw, 0))) {
+        d.proceed = true;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(bw, 0))) {
+        s.pending_close = nullptr;
+        ImGui::CloseCurrentPopup();
+    }
+}
+
 static void shortcuts(app_state&, dialog_state&)
 {
     static const char* const keys[][2] = {
-        {"Ctrl+O", "open a file"},          {"Ctrl+S", "save names and comments"},
+        {"Ctrl+O", "open a file"},          {"Ctrl+S", "save"},
+        {"Ctrl+Shift+S", "save the project as"},
         {"G", "jump to address / name"},    {"Enter / double click", "follow the operand"},
         {"Esc / Alt+Left", "back"},         {"Ctrl+Enter / Alt+Right", "forward"},
         {"N", "rename"},                    {";", "comment"},
@@ -490,7 +534,16 @@ void draw(app_state& s)
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.4f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     bool open = true;
     if (!ImGui::BeginPopupModal(t, &open, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-        d.kind = dialog_kind::none; // closed with esc or the x
+        // closed with esc or the x. after "save changes?", go on with what was waiting, unless
+        // the answer was cancel
+        std::function<void()> then;
+        if (d.kind == dialog_kind::save_changes && d.proceed)
+            then.swap(s.pending_close);
+        else if (d.kind == dialog_kind::save_changes)
+            s.pending_close = nullptr;
+        d.kind = dialog_kind::none;
+        if (then)
+            then();
         return;
     }
     // dialogs that need a file close themselves when the file goes away
@@ -509,6 +562,7 @@ void draw(app_state& s)
         case dialog_kind::run_args: run_args(s, d); break;
         case dialog_kind::about: about(s, d); break;
         case dialog_kind::shortcuts: shortcuts(s, d); break;
+        case dialog_kind::save_changes: save_changes(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

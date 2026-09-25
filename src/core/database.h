@@ -49,6 +49,7 @@ struct load_options {
     bool force_raw = false;
     bin_arch raw_arch = bin_arch::x64;
     uint64_t raw_base = 0;
+    std::string project; // a project file to read names / comments from (and save to)
 };
 
 class database {
@@ -92,7 +93,9 @@ public:
     std::vector<uint64_t> find_bytes(const std::string& pattern, uint64_t from, size_t max_results) const;
 
     std::string db_path() const;
-    std::string project_path() const;              // "<binary>.ceasta", next to the file
+    std::string project_file;                      // set by "save as" or by opening a project
+    std::string project_path() const;              // project_file, else "<binary>.ceasta" next to the file
+    std::string annotations_path() const;          // what loading reads: the project if it exists, else db_path
     std::string serialize() const;                 // the annotations file text (sorted, diffable)
     bool save(std::string& err) const;             // private copy, and the project file if it exists
     bool save_project(std::string& err) const;     // write the project file next to the binary
@@ -118,3 +121,9 @@ private:
 // load + analyze, safe to run on a worker thread
 std::unique_ptr<database> open_database(const std::string& path, const load_options& opts,
     analysis_progress* progress, std::string& err);
+
+// true for a ceasta project file name ("*.ceasta")
+bool is_project_file(const std::string& path);
+// the file a project belongs to: "<x>.ceasta" sits next to "<x>", or its "file <name>" line
+// names a file in the same folder. "" when neither is there; name_out gets the recorded name.
+std::string project_binary(const std::string& project, std::string& name_out);

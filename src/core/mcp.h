@@ -33,6 +33,9 @@ struct mcp_debug_link {
 struct mcp_options {
     bool allow_debug = false; // tools that run the program and change its state
     bool allow_lua = false;   // run_lua runs any code, with file and os access
+    // write each rename / comment to disk right away (the cli server has no save of its own).
+    // the gui turns it off: there the ai's edits wait for the user's save, like their own
+    bool autosave = true;
 };
 
 class mcp_server {

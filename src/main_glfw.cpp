@@ -12,35 +12,73 @@
 #include <GL/gl.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
-// a file open dialog through zenity / kdialog when present; otherwise empty (drag and drop and
-// the command line still work)
+// one argument for sh: single quotes, with any ' inside closed, escaped and reopened
+static std::string shell_quote(const std::string& s)
+{
+    std::string o = "'";
+    for (char c : s)
+        o += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return o + "'";
+}
+
+// the desktop's file dialog tool: zenity, else kdialog, else none ("")
+static const char* dialog_tool()
+{
+    static const char* tool = std::system("command -v zenity >/dev/null 2>&1") == 0    ? "zenity"
+                              : std::system("command -v kdialog >/dev/null 2>&1") == 0 ? "kdialog"
+                                                                                        : "";
+    return tool;
+}
+
+// runs a dialog command, returns what it printed ("" when cancelled)
+static std::string run_dialog(const std::string& cmd)
+{
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p)
+        return std::string();
+    std::string out;
+    char buf[1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0)
+        out.append(buf, n);
+    int rc = pclose(p);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+        out.pop_back();
+    return rc == 0 ? out : std::string();
+}
+
+// file dialogs through zenity / kdialog when present; otherwise empty (drag and drop and the
+// command line still work)
 static std::string open_file_dialog(const char* title)
 {
-    const char* tools[] = {
-        "zenity --file-selection --title=\"%s\" 2>/dev/null",
-        "kdialog --getopenfilename . --title \"%s\" 2>/dev/null",
-    };
-    for (const char* fmt : tools) {
-        char cmd[256];
-        std::snprintf(cmd, sizeof(cmd), fmt, title ? title : "Open");
-        FILE* p = popen(cmd, "r");
-        if (!p)
-            continue;
-        std::string out;
-        char buf[1024];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), p)) > 0)
-            out.append(buf, n);
-        int rc = pclose(p);
-        while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
-            out.pop_back();
-        if (rc == 0 && !out.empty())
-            return out;
-    }
+    std::string t = shell_quote(title ? title : "Open"), tool = dialog_tool();
+    if (tool == "zenity")
+        return run_dialog("zenity --file-selection --title=" + t + " 2>/dev/null");
+    if (tool == "kdialog")
+        return run_dialog("kdialog --getopenfilename . --title " + t + " 2>/dev/null");
     return std::string();
+}
+
+static std::string save_file_dialog(const char* title, const std::string& suggested)
+{
+    std::string t = shell_quote(title ? title : "Save"), f = shell_quote(suggested), tool = dialog_tool();
+    if (tool == "zenity")
+        return run_dialog("zenity --file-selection --save --title=" + t + " --filename=" + f + " 2>/dev/null");
+    if (tool == "kdialog")
+        return run_dialog("kdialog --getsavefilename " + f + " --title " + t + " 2>/dev/null");
+    return std::string();
+}
+
+// the close button: with unsaved changes, ask first (the answer closes through platform.quit)
+static void close_callback(GLFWwindow* w)
+{
+    app_state* s = (app_state*)glfwGetWindowUserPointer(w);
+    if (s && !app_request_close(*s))
+        glfwSetWindowShouldClose(w, GLFW_FALSE);
 }
 
 static void drop_callback(GLFWwindow* w, int count, const char** paths)
@@ -100,9 +138,11 @@ int main(int argc, char** argv)
     state.dpi_scale = scale;
     glfwSetWindowUserPointer(window, &state);
     glfwSetDropCallback(window, drop_callback);
+    glfwSetWindowCloseCallback(window, close_callback);
 
     platform_api platform;
     platform.open_file_dialog = open_file_dialog;
+    platform.save_file_dialog = save_file_dialog;
     platform.set_title = [window](const std::string& t) { glfwSetWindowTitle(window, t.c_str()); };
     platform.quit = [window]() { glfwSetWindowShouldClose(window, 1); };
     app_init(state, platform, args);

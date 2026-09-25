@@ -25,15 +25,17 @@ static void file_menu(app_state& s)
             app_open(s, pick);
     }
     ImGui::Separator();
-    if (ImGui::MenuItem("Save names and comments", "Ctrl+S", false, s.db != nullptr))
+    if (ImGui::MenuItem("Save", "Ctrl+S", false, s.db && s.db->dirty))
         app_save(s);
-    if (ImGui::MenuItem("Save project file (next to the binary)", nullptr, false, s.db != nullptr))
-        app_save_project(s);
+    ImGui::SetItemTooltip("your names, comments and breakpoints for this file");
+    if (ImGui::MenuItem("Save project as...", "Ctrl+Shift+S", false, s.db && s.platform.save_file_dialog))
+        app_save_as(s);
+    ImGui::SetItemTooltip("a .ceasta file with your work: open it later, share it or commit it");
     if (ImGui::MenuItem("Close file", nullptr, false, s.db != nullptr))
         app_close_file(s);
     ImGui::Separator();
-    if (ImGui::MenuItem("Exit", "Alt+F4") && s.platform.quit)
-        s.platform.quit();
+    if (ImGui::MenuItem("Exit", "Alt+F4"))
+        app_quit(s);
     ImGui::EndMenu();
 }
 

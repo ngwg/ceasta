@@ -105,7 +105,8 @@ static void set_title(app_state& s)
         return;
     std::string t = "ceasta";
     if (s.db)
-        t = s.db->bin.name + " - ceasta";
+        t = (s.db->dirty ? "*" : "") + s.db->bin.name + " - ceasta";
+    s.title_dirty = s.db && s.db->dirty;
     s.platform.set_title(t);
 }
 
@@ -129,6 +130,47 @@ bool app_loading(const app_state& s)
     return s.job != nullptr;
 }
 
+// with unsaved changes, asks "save changes?" and returns true: then runs `then` once the
+// answer is save or don't save (and never, on cancel)
+static bool ask_to_save(app_state& s, std::function<void()> then)
+{
+    if (!s.db || !s.db->dirty)
+        return false;
+    dialogs::open(s, dialog_kind::save_changes, 0);
+    s.pending_close = std::move(then);
+    return true;
+}
+
+static void start_open(app_state& s, const std::string& path, load_options opts)
+{
+    std::string target = path;
+    if (is_project_file(path) && !opts.force_raw) {
+        // a project: open the file it belongs to, with the project's names and comments
+        std::string name;
+        target = project_binary(path, name);
+        if (target.empty() && s.platform.open_file_dialog)
+            target = s.platform.open_file_dialog(("Where is " + (name.empty() ? std::string("the file for this project") : name) + "?").c_str());
+        if (target.empty()) {
+            app_log(s, "can't find the file " + path + " belongs to" + (name.empty() ? std::string() : " (" + name + ")") +
+                ": keep the project next to it", 2);
+            return;
+        }
+        opts.project = path;
+    }
+    if (s.dbg.state() != dbg_state::none) {
+        app_log(s, "ending the debug session to open another file", 1);
+        dbg_stop(s);
+    }
+    s.job.reset(new load_job());
+    load_job* job = s.job.get();
+    job->path = target;
+    job->worker = std::thread([job, target, opts]() {
+        job->result = open_database(target, opts, &job->progress, job->error);
+        job->done.store(true);
+    });
+    app_log(s, "loading " + target + (opts.project.empty() ? std::string() : " with " + opts.project));
+}
+
 void app_open(app_state& s, const std::string& path, const load_options& opts)
 {
     if (path.empty())
@@ -137,19 +179,9 @@ void app_open(app_state& s, const std::string& path, const load_options& opts)
         app_log(s, "still loading " + s.job->path + ", wait for it or cancel it first", 1);
         return;
     }
-    if (s.dbg.state() != dbg_state::none) {
-        app_log(s, "ending the debug session to open another file", 1);
-        dbg_stop(s);
-    }
-    app_save(s);
-    s.job.reset(new load_job());
-    load_job* job = s.job.get();
-    job->path = path;
-    job->worker = std::thread([job, path, opts]() {
-        job->result = open_database(path, opts, &job->progress, job->error);
-        job->done.store(true);
-    });
-    app_log(s, "loading " + path);
+    if (ask_to_save(s, [&s, path, opts]() { start_open(s, path, opts); }))
+        return;
+    start_open(s, path, opts);
 }
 
 void app_open_dialog(app_state& s)
@@ -187,7 +219,7 @@ static void finish_job(app_state& s)
         arch_name(b.arch), b.kind.c_str(), s.db->an.funcs.size(), b.imports.size(), s.db->an.strings.size()));
     if (!s.db->user_names.empty() || !s.db->user_comments.empty())
         app_log(s, util::fmt("restored %zu names and %zu comments from %s", s.db->user_names.size(),
-            s.db->user_comments.size(), s.db->db_path().c_str()));
+            s.db->user_comments.size(), s.db->annotations_path().c_str()));
     add_recent(s, b.path);
     set_title(s);
     s.lua.fire("load");
@@ -201,30 +233,37 @@ void app_save(app_state& s)
     std::string err;
     if (s.db->save(err)) {
         s.db->dirty = false;
-        app_log(s, "saved names and comments to " + s.db->db_path());
+        app_log(s, "saved to " + s.db->annotations_path());
     } else {
         app_log(s, "couldn't save: " + err, 2);
     }
 }
 
-void app_save_project(app_state& s)
+void app_save_as(app_state& s)
 {
-    if (!s.db)
+    if (!s.db || !s.platform.save_file_dialog)
         return;
+    std::string path = s.platform.save_file_dialog("Save the project as", s.db->project_path());
+    if (path.empty())
+        return;
+    if (!is_project_file(path))
+        path += ".ceasta";
+    std::string old = s.db->project_file;
+    s.db->project_file = path;
     std::string err;
-    if (s.db->save_project(err)) {
+    if (s.db->save_project(err) && s.db->save(err)) {
         s.db->dirty = false;
-        app_log(s, "wrote a project file you can commit: " + s.db->project_path());
+        app_log(s, "saved the project to " + path + " (open it to pick up where you left off)");
     } else {
-        app_log(s, "couldn't write the project file: " + err, 2);
+        s.db->project_file = old;
+        app_log(s, "couldn't save the project: " + err, 2);
     }
 }
 
-void app_close_file(app_state& s)
+static void close_now(app_state& s)
 {
     if (s.dbg.state() != dbg_state::none)
         dbg_stop(s);
-    app_save(s);
     s.db.reset();
     s.lua.bridge().db = nullptr;
     s.back.clear();
@@ -232,6 +271,31 @@ void app_close_file(app_state& s)
     s.cursor = 0;
     s.version++;
     set_title(s);
+}
+
+void app_close_file(app_state& s)
+{
+    if (!ask_to_save(s, [&s]() { close_now(s); }))
+        close_now(s);
+}
+
+bool app_request_close(app_state& s)
+{
+    if (s.quit_confirmed)
+        return true;
+    return !ask_to_save(s, [&s]() {
+        s.quit_confirmed = true;
+        if (s.platform.quit)
+            s.platform.quit();
+    });
+}
+
+void app_quit(app_state& s)
+{
+    if (app_request_close(s) && s.platform.quit) {
+        s.quit_confirmed = true;
+        s.platform.quit();
+    }
 }
 
 // ---- navigation ----
@@ -423,7 +487,6 @@ void dbg_start(app_state& s)
     }
     if (s.dbg.state() != dbg_state::none)
         return;
-    app_save(s);
     std::string err;
     if (!s.dbg.start(s.db->bin.path, s.debug_args, "", err))
         app_log(s, err, 2);
@@ -677,7 +740,7 @@ void app_shutdown(app_state& s)
     }
     if (s.dbg.state() != dbg_state::none)
         dbg_stop(s);
-    app_save(s);
+    // unsaved changes were offered a save when the window closed; nothing is written here
     save_settings(s);
     s.lua.shutdown();
 }
@@ -699,6 +762,8 @@ static void shortcuts(app_state& s)
         app_open_dialog(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S))
         app_save(s);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S))
+        app_save_as(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Equal) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadAdd))
         app_set_font_size(s, s.font_size + 1);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Minus) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadSubtract))
@@ -756,6 +821,8 @@ static void shortcuts(app_state& s)
 void app_frame(app_state& s)
 {
     finish_job(s);
+    if ((s.db && s.db->dirty) != s.title_dirty)
+        set_title(s);
     if (dbg_stepping(s))
         run_steps(s);
     if (s.dbg.state() == dbg_state::running)

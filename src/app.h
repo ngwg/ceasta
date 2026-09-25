@@ -15,6 +15,8 @@
 // what the window host provides (main.cpp on windows, stubs in the ui tests)
 struct platform_api {
     std::function<std::string(const char* title)> open_file_dialog; // "" when cancelled
+    // "" when cancelled; suggested is the path to start from
+    std::function<std::string(const char* title, const std::string& suggested)> save_file_dialog;
     std::function<void(const std::string&)> set_title;
     std::function<void()> quit;
 };
@@ -36,7 +38,8 @@ struct load_job {
 
 enum class center_view { listing, graph, pseudo };
 
-enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts };
+enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
+    save_changes };
 
 struct dialog_state {
     dialog_kind kind = dialog_kind::none;
@@ -57,6 +60,7 @@ struct dialog_state {
     bool hits_cut = false;
     int sel = 0;
     bool refocus = false;
+    bool proceed = false; // save_changes answered with save / don't save
 };
 
 struct app_state {
@@ -124,6 +128,11 @@ struct app_state {
     int win_h = 0;
     bool win_max = false;
 
+    // unsaved changes: what to do once "save changes?" is answered (close, open, quit)
+    std::function<void()> pending_close;
+    bool quit_confirmed = false; // the window may close without asking again
+    bool title_dirty = false;    // the title shows the unsaved mark
+
     std::vector<std::string> recent;
     std::string settings_path;
     bool sandboxed = false; // tests: never start / attach to processes or open the shell
@@ -141,7 +150,11 @@ void app_open(app_state& s, const std::string& path, const load_options& opts = 
 void app_open_dialog(app_state& s);
 void app_close_file(app_state& s);
 void app_save(app_state& s);
-void app_save_project(app_state& s);
+void app_save_as(app_state& s); // pick where the project file goes
+// the window is about to close (its close button, alt+f4): true when it may close now. with
+// unsaved changes it asks first and returns false; the answer then closes it via platform.quit
+bool app_request_close(app_state& s);
+void app_quit(app_state& s); // file > exit
 bool app_loading(const app_state& s);
 
 void app_jump(app_state& s, uint64_t addr, bool remember = true);
