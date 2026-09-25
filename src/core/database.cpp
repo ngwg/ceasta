@@ -211,6 +211,102 @@ std::string database::location(uint64_t a) const
     return fmt_addr(a);
 }
 
+bool database::check_name(uint64_t a, const std::string& name, std::string& err) const
+{
+    std::string n = util::trim(name);
+    if (!bin.is_mapped(a)) {
+        err = "address " + fmt_addr(a) + " isn't mapped";
+        return false;
+    }
+    if (n.empty())
+        return true;
+    if (n.size() > 255) {
+        err = "name is too long";
+        return false;
+    }
+    for (char c : n)
+        if (!is_name_char(c)) {
+            err = "names can only use letters, digits and _ @ $ ? . : < > ~";
+            return false;
+        }
+    if (n[0] >= '0' && n[0] <= '9') {
+        err = "names can't start with a digit";
+        return false;
+    }
+    uint64_t dummy;
+    if (parse_auto(n, dummy)) {
+        err = "that prefix is used for automatic names";
+        return false;
+    }
+    auto used = by_name_.find(n);
+    if (used != by_name_.end() && used->second != a) {
+        err = "name is already used at " + fmt_addr(used->second);
+        return false;
+    }
+    return true;
+}
+
+// ---- names an ai suggested
+
+bool database::suggest(uint64_t addr, const std::string& var, const std::string& name, const std::string& reason,
+                       std::string& err)
+{
+    std::string n = util::trim(name);
+    if (n.empty()) {
+        err = "the name is empty";
+        return false;
+    }
+    if (var.empty() ? !check_name(addr, n, err) : (!is_identifier(n) || is_reserved_word(n))) {
+        if (!var.empty())
+            err = "a variable's name is letters, digits and _, and not a c keyword";
+        return false;
+    }
+    std::string why = util::trim(reason);
+    for (char& c : why)
+        if (c == '\n' || c == '\r' || c == '\t')
+            c = ' ';
+    for (suggestion& s : suggestions)
+        if (s.addr == addr && s.var == var) {
+            s.name = n;
+            s.reason = why;
+            dirty = true;
+            return true;
+        }
+    suggestions.push_back({addr, var, n, why});
+    dirty = true;
+    return true;
+}
+
+bool database::accept_suggestion(size_t i, std::string& err)
+{
+    if (i >= suggestions.size())
+        return false;
+    suggestion s = suggestions[i];
+    bool ok;
+    if (s.var.empty()) {
+        ok = set_name(s.addr, s.name, err);
+    } else {
+        std::string type;
+        auto f = lvars.find(s.addr);
+        if (f != lvars.end() && f->second.count(s.var))
+            type = f->second.at(s.var).type;
+        ok = set_lvar(s.addr, s.var, s.name, type, err);
+    }
+    if (ok) {
+        suggestions.erase(suggestions.begin() + (std::ptrdiff_t)i);
+        dirty = true;
+    }
+    return ok;
+}
+
+void database::reject_suggestion(size_t i)
+{
+    if (i < suggestions.size()) {
+        suggestions.erase(suggestions.begin() + (std::ptrdiff_t)i);
+        dirty = true;
+    }
+}
+
 bool database::set_name(uint64_t a, const std::string& name, std::string& err)
 {
     std::string n = util::trim(name);
@@ -1038,6 +1134,9 @@ std::string database::serialize(bool with_program) const
     for (const auto& f : lvars)
         for (const auto& v : f.second) // "lvar <func> <key> <name>\t<type>"
             s += "lvar " + util::hex(f.first) + " " + v.first + " " + v.second.name + "\t" + v.second.type + "\n";
+    for (const suggestion& g : suggestions) // "suggest <addr> <variable or -> <name>\t<reason>"
+        s += "suggest " + util::hex(g.addr) + " " + (g.var.empty() ? "-" : g.var) + " " + g.name + "\t" +
+             escape_line(g.reason) + "\n";
     if (saved_cursor)
         s += util::fmt("view %llx %d\n", (unsigned long long)saved_cursor, saved_view);
     if (with_program && !bin.file.empty()) {
@@ -1151,7 +1250,14 @@ bool database::load_annotations(std::string& err)
             bp_conditions[a] = unescape_line(rest);
         else if (kind == "proto")
             set_proto(a, rest, e);
-        else if (kind == "lvar") {
+        else if (kind == "suggest") {
+            size_t sp = rest.find(' '), tab = rest.find('\t');
+            if (sp != std::string::npos && tab != std::string::npos && tab > sp) {
+                std::string var = rest.substr(0, sp);
+                suggest(a, var == "-" ? std::string() : var, rest.substr(sp + 1, tab - sp - 1),
+                        unescape_line(rest.substr(tab + 1)), e);
+            }
+        } else if (kind == "lvar") {
             size_t sp = rest.find(' '), tab = rest.find('\t');
             if (sp != std::string::npos && tab != std::string::npos && tab > sp)
                 set_lvar(a, rest.substr(0, sp), rest.substr(sp + 1, tab - sp - 1), rest.substr(tab + 1), e);

@@ -802,6 +802,67 @@ void add_edit_tools(std::vector<tool>& t)
     };
     t.push_back(std::move(fp));
 
+    // names for the user to review, instead of renaming right away
+    tool sg;
+    sg.name = "suggest_name";
+    sg.description =
+        "Propose a name for a function or global without renaming it: the user reviews your suggestions in "
+        "ceasta (AI > Review suggested names) and accepts or rejects each. Prefer this over rename when you're "
+        "naming many things or aren't sure. Give a one-line reason (what it does, the evidence).";
+    sg.schema = schema({{"address", prop("string", "hex address or current name")},
+                        {"name", prop("string", "the proposed name, like parse_config")},
+                        {"reason", prop("string", "why, in one line")}},
+                       {"address", "name"});
+    sg.writes = true;
+    sg.run = [](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t a;
+        std::string err;
+        if (!db || !arg_addr(*db, args, "address", a, out))
+            return false;
+        if (!db->suggest(a, std::string(), arg_str(args, "name"), arg_str(args, "reason"), err)) {
+            out = "can't suggest that: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = util::fmt("suggested %s for %s (%zu waiting for review)", util::trim(arg_str(args, "name")).c_str(),
+                        db->location(a).c_str(), db->suggestions.size());
+        return true;
+    };
+    t.push_back(std::move(sg));
+
+    tool sv;
+    sv.name = "suggest_variable_name";
+    sv.description =
+        "Propose a name for a variable of a function's pseudocode (as decompile_function shows it) for the user "
+        "to review, like suggest_name.";
+    sv.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"variable", prop("string", "the variable as the pseudocode shows it")},
+                        {"name", prop("string", "the proposed name")},
+                        {"reason", prop("string", "why, in one line")}},
+                       {"function", "variable", "name"});
+    sv.writes = true;
+    sv.run = [func_of, var_key](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        std::string key, err;
+        if (!db || !func_of(*db, args, f, out) || !var_key(*db, f, util::trim(arg_str(args, "variable")), key, out))
+            return false;
+        if (!db->suggest(f, key, arg_str(args, "name"), arg_str(args, "reason"), err)) {
+            out = "can't suggest that: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = util::fmt("suggested %s for %s in %s (%zu waiting for review)", util::trim(arg_str(args, "name")).c_str(),
+                        arg_str(args, "variable").c_str(), db->location(f).c_str(), db->suggestions.size());
+        return true;
+    };
+    t.push_back(std::move(sv));
+
     tool sp;
     sp.name = "save_project";
     sp.description =
@@ -1324,10 +1385,11 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             return true;
         });
 
-    add("debug_call_stack",
-        "How the stopped thread got here: the function it's in, then each caller (the call that made the frame "
-        "and where it returns to). Read from the stack without unwind tables, so treat deep frames as a good guess.",
-        schema({{"max_frames", prop("integer", "at most this many (default 32)")}}),
+    add("debug_backtrace",
+        "The call stack: how the stopped thread got here. The function it's in, then each caller (the call that "
+        "made the frame and where it returns to). Read from the stack without unwind tables, so treat deep frames "
+        "as a good guess.",
+        schema({{"limit", prop("integer", "how many frames (default 32)")}}),
         [](mcp_server& s, const json::value& args, std::string& out) {
             database* db = need_db(s, out);
             debugger* d = db ? stopped_dbg(s, out) : nullptr;
@@ -1340,7 +1402,7 @@ void add_debug_inspect_tools(std::vector<tool>& t)
                 const function* f = db->an.func_containing(st);
                 return f && s.debug.to_runtime ? s.debug.to_runtime(f->start) : 0;
             };
-            std::vector<stack_frame> fr = dbg_call_stack(*d, arg_int(args, "max_frames", 32, 1, 256), func_start);
+            std::vector<stack_frame> fr = dbg_call_stack(*d, arg_int(args, "limit", 32, 1, 256), func_start);
             for (size_t i = 0; i < fr.size(); i++) {
                 std::string sym = symbolize(s, *db, *d, i ? fr[i].call : fr[i].pc);
                 out += util::fmt("#%zu  %s", i, (sym.empty() ? hexa(i ? fr[i].call : fr[i].pc) : sym).c_str());
@@ -1600,40 +1662,6 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             return true;
         });
 
-    add("debug_backtrace", "The call stack of the stopped thread, best-effort from the frame pointers.",
-        schema({{"limit", prop("integer", "how many frames (default 32)")}}),
-        [](mcp_server& s, const json::value& args, std::string& out) {
-            database* db = need_db(s, out);
-            debugger* d = db ? stopped_dbg(s, out) : nullptr;
-            if (!d)
-                return false;
-            int limit = arg_int(args, "limit", 32, 1, 256);
-            out = "#0  " + where_text(s, *db, *d, d->pc()) + "\n";
-            uint64_t bp = 0;
-            for (const reg_value& r : d->registers())
-                if (r.name == "rbp" || r.name == "ebp")
-                    bp = r.value;
-            int frame = 1;
-            for (int i = 0; i < limit && bp; i++) {
-                // a frame is [bp] = caller's bp, [bp + ptr] = return address
-                uint64_t next_bp = 0, ret = 0;
-                if (d->is64()) {
-                    if (d->read(bp, &next_bp, 8) < 8 || d->read(bp + 8, &ret, 8) < 8)
-                        break;
-                } else {
-                    uint32_t a = 0, b = 0;
-                    if (d->read(bp, &a, 4) < 4 || d->read(bp + 4, &b, 4) < 4)
-                        break;
-                    next_bp = a;
-                    ret = b;
-                }
-                if (!ret || next_bp <= bp)
-                    break;
-                out += util::fmt("#%d  ", frame++) + where_text(s, *db, *d, ret) + "\n";
-                bp = next_bp;
-            }
-            return true;
-        });
 }
 
 } // namespace
@@ -1722,6 +1750,76 @@ json::value rpc_result(const json::value& id, json::value result)
     return r;
 }
 
+// ---- prompts: ready-made requests the client offers the user (claude code lists them as
+// /mcp__ceasta__<name>). {function} and {limit} in the text are the arguments
+
+struct prompt_arg {
+    const char* name;
+    const char* description;
+    bool required;
+};
+
+struct prompt_def {
+    const char* name;
+    const char* description;
+    std::vector<prompt_arg> args;
+    const char* text;
+    bool debug; // uses the debugger tools
+};
+
+const std::vector<prompt_def>& prompt_list()
+{
+    static const std::vector<prompt_def> p = {
+        {"triage", "A first look at the binary: what it is, what stands out, and where to read next.", {},
+         "Take a first look at the binary open in ceasta. Call get_binary_info (format, architecture, entry point, "
+         "sections), then list_imports and pick out what stands out: networking, crypto, process and memory "
+         "manipulation (VirtualAlloc, WriteProcessMemory, CreateRemoteThread), anti-debugging, registry and service "
+         "changes. Then list_strings for urls, ip addresses, file paths, registry keys, commands and error messages, "
+         "and decompile_function on the entry point and main. Finish with a short summary: what the program probably "
+         "is and does, anything suspicious, and the 3 to 5 functions most worth reading next, with their addresses "
+         "and why.",
+         false},
+        {"explain_function", "What a function does, its parameters and result, with names for it and its variables.",
+         {{"function", "the function: name or address", true}},
+         "Explain what {function} does in the binary open in ceasta. Read it with decompile_function (and "
+         "disassemble_function where the pseudocode looks off), see who calls it with get_xrefs_to, and look at the "
+         "functions it calls and the strings it uses. Say in a few sentences what it does, what its parameters and "
+         "return value mean, and anything unusual (error paths, loops over buffers, constants). Then propose names "
+         "for review: suggest_name for the function and suggest_variable_name for its parameters and important "
+         "locals. If the user asked you to go ahead, use rename, rename_variable and set_function_prototype "
+         "directly instead.",
+         false},
+        {"rename_pass", "Name the unnamed functions (sub_...), bottom-up. The names wait for your review in ceasta.",
+         {{"limit", "at most this many functions (default 30)", false}},
+         "Name the unnamed functions of the binary open in ceasta (the sub_... ones). Get them with list_functions. "
+         "Work bottom-up: functions that call nothing unnamed first, since their names help with their callers. For "
+         "each one: decompile_function, get_xrefs_from for what it calls, and a look at its strings. When you can "
+         "tell what it does, call suggest_name with a short verb_noun name (parse_header, decrypt_config, "
+         "send_beacon) and a one-line reason. Skip what you can't tell rather than guessing, and skip library code. "
+         "Stop after {limit} functions, then list what you named and what you skipped. The user reviews your "
+         "suggestions in ceasta under AI > Review suggested names.",
+         false},
+        {"find_crypto", "Find cryptography: crypto api calls, well-known constants, xor loops.", {},
+         "Find cryptography in the binary open in ceasta. Check list_imports for crypto apis (CryptEncrypt, "
+         "CryptDecrypt, BCrypt*, EVP_*). Search for well-known constants with search_bytes: the aes s-box "
+         "(63 7c 77 7b f2 6b 6f c5), sha-256 (98 2f 8a 42 91 44 37 71), the md5 / sha-1 initial values "
+         "(01 23 45 67 89 ab cd ef), crc32 (20 83 b8 ed); and look with decompile_function for loops that run 256 "
+         "times (rc4 key scheduling) or xor a buffer with a key. For each find, say which algorithm it is and where "
+         "(function and address), what key or data it works on if you can tell, and suggest a name for the "
+         "function with suggest_name.",
+         false},
+        {"trace_function", "Run the program to a function under the debugger and watch what it gets and returns.",
+         {{"function", "the function: name or address", true}},
+         "Use ceasta's debugger to watch {function} run. debug_set_breakpoint on it, debug_start, then "
+         "debug_continue until it stops there. Show its arguments: debug_get_registers, and debug_read_memory on the "
+         "ones that point at memory (strings, buffers, structures). Then debug_step_out to let it return, and read "
+         "the result (rax / eax) and anything it wrote. debug_backtrace shows who called it. Summarize what it was "
+         "given and what it did with it, then end the program with debug_kill.",
+         true},
+    };
+    return p;
+}
+
 // a tools/call result: text content, with isError set when the tool failed
 json::value tool_content(const std::string& text, bool is_error)
 {
@@ -1794,6 +1892,8 @@ json::value mcp_server::dispatch(const json::value& msg)
         caps = json::value::make_object();
         json::value& tcap = caps["tools"];
         tcap = json::value::make_object();
+        json::value& pcap = caps["prompts"];
+        pcap = json::value::make_object();
         json::value& info = r["serverInfo"];
         info["name"] = "ceasta";
         info["version"] = CEASTA_VERSION;
@@ -1832,9 +1932,64 @@ json::value mcp_server::dispatch(const json::value& msg)
             on_activity(activity);
         return rpc_result(id, std::move(result));
     }
-    if (method == "resources/list" || method == "prompts/list") {
+    if (method == "prompts/list") {
         json::value r = json::value::make_object();
-        r[method == "resources/list" ? "resources" : "prompts"] = json::value::make_array();
+        json::value& list = r["prompts"];
+        list = json::value::make_array();
+        for (const prompt_def& pd : prompt_list()) {
+            if (pd.debug && !opts.allow_debug)
+                continue;
+            json::value item = json::value::make_object();
+            item["name"] = pd.name;
+            item["description"] = pd.description;
+            json::value& args = item["arguments"];
+            args = json::value::make_array();
+            for (const prompt_arg& a : pd.args) {
+                json::value arg = json::value::make_object();
+                arg["name"] = a.name;
+                arg["description"] = a.description;
+                arg["required"] = a.required;
+                args.push(std::move(arg));
+            }
+            list.push(std::move(item));
+        }
+        return rpc_result(id, std::move(r));
+    }
+    if (method == "prompts/get") {
+        std::string name = p.get("name") ? p.get("name")->str() : std::string();
+        const json::value* given = p.get("arguments");
+        for (const prompt_def& pd : prompt_list()) {
+            if (name != pd.name || (pd.debug && !opts.allow_debug))
+                continue;
+            std::string text = pd.text;
+            for (const prompt_arg& a : pd.args) {
+                const json::value* v = given && given->is_object() ? given->get(a.name) : nullptr;
+                std::string val = v ? util::trim(v->str()) : std::string();
+                if (val.empty() && a.required)
+                    return rpc_error(id, -32602, std::string("the prompt needs ") + a.name);
+                if (val.empty())
+                    val = std::string(a.name) == "limit" ? "30" : "";
+                std::string key = std::string("{") + a.name + "}";
+                for (size_t at = text.find(key); at != std::string::npos; at = text.find(key, at + val.size()))
+                    text.replace(at, key.size(), val);
+            }
+            json::value r = json::value::make_object();
+            r["description"] = pd.description;
+            json::value& msgs = r["messages"];
+            msgs = json::value::make_array();
+            json::value m = json::value::make_object();
+            m["role"] = "user";
+            json::value& c = m["content"];
+            c["type"] = "text";
+            c["text"] = text;
+            msgs.push(std::move(m));
+            return rpc_result(id, std::move(r));
+        }
+        return rpc_error(id, -32602, "no prompt called " + name);
+    }
+    if (method == "resources/list") {
+        json::value r = json::value::make_object();
+        r["resources"] = json::value::make_array();
         return rpc_result(id, std::move(r));
     }
     if (is_notification)

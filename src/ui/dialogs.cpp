@@ -34,6 +34,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::lvar_name: return "Rename variable###dlg";
     case dialog_kind::lvar_type: return "Variable type###dlg";
     case dialog_kind::proto: return "Function prototype###dlg";
+    case dialog_kind::review: return "Suggested names###dlg";
     default: return "###dlg";
     }
 }
@@ -43,7 +44,7 @@ static bool needs_file(dialog_kind k)
     return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
            k == dialog_kind::search || k == dialog_kind::find || k == dialog_kind::bookmarks ||
            k == dialog_kind::bp_condition || k == dialog_kind::watch || k == dialog_kind::lvar_name ||
-           k == dialog_kind::lvar_type || k == dialog_kind::proto;
+           k == dialog_kind::lvar_type || k == dialog_kind::proto || k == dialog_kind::review;
 }
 
 void open(app_state& s, dialog_kind kind, uint64_t addr)
@@ -666,6 +667,100 @@ static void proto(app_state& s, dialog_state& d)
     }
 }
 
+// names an ai suggested (suggest_name / suggest_variable_name): accept or reject each. up / down
+// pick one, enter accepts it, delete rejects it
+static void review(app_state& s, dialog_state& d)
+{
+    database& db = *s.db;
+    if (db.suggestions.empty()) {
+        ImGui::TextDisabled("nothing to review. an AI you connect (AI > Connect an AI) can suggest names with");
+        ImGui::TextDisabled("suggest_name; they wait here until you accept or reject them.");
+        if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+            ImGui::CloseCurrentPopup();
+        return;
+    }
+    size_t n = db.suggestions.size();
+    ImGui::Text("%zu name%s an AI suggested", n, n == 1 ? "" : "s");
+    ImGui::SameLine();
+    ImGui::TextDisabled("nothing changes until you accept one. ctrl+z takes an accept back");
+    d.sel = std::max(0, std::min(d.sel, (int)n - 1));
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+        d.sel = std::min(d.sel + 1, (int)n - 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+        d.sel = std::max(d.sel - 1, 0);
+    int accept = -1, reject = -1;
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))
+        accept = d.sel;
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+        reject = d.sel;
+    float fs = ImGui::GetFontSize();
+    if (ImGui::BeginTable("##sugg", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit |
+                                           ImGuiTableFlags_BordersInnerV, ImVec2(fs * 60, fs * std::min(22.0f, 3.0f + 1.6f * (float)n)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Now");
+        ImGui::TableSetupColumn("Suggested");
+        ImGui::TableSetupColumn("Why", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("");
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < n; i++) {
+            const database::suggestion& g = db.suggestions[i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID((int)i);
+            std::string now = g.var.empty() ? db.location(g.addr) : db.location(g.addr) + ": " + g.var;
+            if (ImGui::Selectable(now.c_str(), (int)i == d.sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                d.sel = (int)i;
+                app_jump(s, g.addr); // a look at it, behind the dialog
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::func), "%s", g.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", g.reason.empty() ? "-" : g.reason.c_str());
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Accept"))
+                accept = (int)i;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reject"))
+                reject = (int)i;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    ImGui::Spacing();
+    float bw = fs * 8;
+    bool all_yes = ImGui::Button("Accept all", ImVec2(bw, 0));
+    ImGui::SameLine();
+    bool all_no = ImGui::Button("Reject all", ImVec2(bw, 0));
+    ImGui::SameLine();
+    if (ImGui::Button("Close", ImVec2(bw, 0)))
+        ImGui::CloseCurrentPopup();
+    std::string err;
+    if (accept >= 0) {
+        if (db.accept_suggestion((size_t)accept, err)) {
+            app_names_changed(s);
+            d.error.clear();
+        } else {
+            d.error = err;
+        }
+    } else if (reject >= 0) {
+        db.reject_suggestion((size_t)reject);
+    } else if (all_yes) {
+        // one undo step for all of them (edits in one frame go together); the ones that can't be
+        // taken stay in the list
+        size_t kept = 0;
+        while (db.suggestions.size() > kept)
+            if (!db.accept_suggestion(kept, err))
+                kept++;
+        app_names_changed(s);
+        d.error = kept ? util::fmt("%zu couldn't be taken: ", kept) + err : std::string();
+    } else if (all_no) {
+        db.suggestions.clear();
+        db.dirty = true;
+    }
+}
+
 // the bookmarks: pick one to jump there; a note per bookmark; delete removes it
 static void bookmarks(app_state& s, dialog_state& d)
 {
@@ -902,6 +997,7 @@ void draw(app_state& s)
         case dialog_kind::lvar_name:
         case dialog_kind::lvar_type: lvar(s, d); break;
         case dialog_kind::proto: proto(s, d); break;
+        case dialog_kind::review: review(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

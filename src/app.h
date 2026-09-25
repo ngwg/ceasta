@@ -41,7 +41,7 @@ struct load_job {
 enum class center_view { listing, graph, pseudo, split }; // split: listing and pseudocode side by side
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai, palette, bookmarks, bp_condition, watch, lvar_name, lvar_type, proto };
+    save_changes, ai, palette, bookmarks, bp_condition, watch, lvar_name, lvar_type, proto, review };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 

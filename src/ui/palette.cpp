@@ -102,6 +102,7 @@ static const std::vector<action>& actions()
             [](app_state& s) { s.dbg.break_on_entry = !s.dbg.break_on_entry; }},
 
         {"AI", "Connect an AI...", "", always, [](app_state& s) { open_dialog(s, dialog_kind::ai); }},
+        {"AI", "Review names the AI suggested", "", has_file, [](app_state& s) { open_dialog(s, dialog_kind::review); }},
         {"AI", "Start / stop the AI server", "", always,
             [](app_state& s) { app_mcp_running(s) ? app_mcp_stop(s) : (void)app_mcp_start(s); }},
 

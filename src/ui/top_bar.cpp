@@ -189,6 +189,10 @@ static void ai_menu(app_state& s)
     ImGui::SetItemTooltip("serves the open file over MCP to an AI client on this computer");
     if (ImGui::MenuItem("Copy the Claude Code command"))
         ImGui::SetClipboardText(util::fmt("claude mcp add --transport http ceasta http://127.0.0.1:%d/mcp", s.mcp_port).c_str());
+    size_t n = s.db ? s.db->suggestions.size() : 0;
+    if (ImGui::MenuItem(n ? util::fmt("Review suggested names (%zu)", n).c_str() : "Review suggested names", nullptr, false, s.db != nullptr))
+        dialogs::open(s, dialog_kind::review, 0);
+    ImGui::SetItemTooltip("names an AI proposed with suggest_name: accept or reject each");
     ImGui::Separator();
     ImGui::MenuItem("Let it use the debugger", nullptr, &s.mcp_allow_debug, !running && debugger::supported());
     ImGui::SetItemTooltip("start, step and inspect the program (it runs on this computer)%s",

@@ -133,6 +133,23 @@ public:
     // the argument an instruction sets for the call after it ("lpFileName"), "" when none
     std::string arg_note(uint64_t a);
 
+    // names an ai proposed, waiting for you to accept or reject them (ai > review names). var
+    // empty: a name for addr; else a name for that variable of the function at addr
+    struct suggestion {
+        uint64_t addr = 0;
+        std::string var;
+        std::string name;
+        std::string reason;
+    };
+    std::vector<suggestion> suggestions;
+    // checks the name the way accepting it will; a newer suggestion for the same thing replaces one
+    bool suggest(uint64_t addr, const std::string& var, const std::string& name, const std::string& reason,
+                 std::string& err);
+    bool accept_suggestion(size_t i, std::string& err); // renames, and it's gone from the list
+    void reject_suggestion(size_t i);
+    // would set_name take this name here? (the same checks, nothing changes)
+    bool check_name(uint64_t a, const std::string& name, std::string& err) const;
+
     // undo / redo of your edits: names, comments, bookmarks. edits in the same group (the app
     // uses one per frame, so a plugin or the ai renaming many things is one step) go together
     enum class edit_kind : uint8_t { name, comment, bookmark, lvar, proto };

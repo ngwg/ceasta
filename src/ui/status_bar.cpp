@@ -1,5 +1,6 @@
 #include "ui/status_bar.h"
 #include "core/util.h"
+#include "ui/dialogs.h"
 #include "imgui.h"
 #include "theme.h"
 
@@ -38,6 +39,18 @@ void draw(app_state& s)
         ImGui::SameLine(0, 24);
         ImGui::TextDisabled("|  %zu functions  %s%s", db.an.funcs.size(), db.dirty ? "  unsaved changes (ctrl+s)" : "",
             db.breakpoints.empty() ? "" : util::fmt("  %zu breakpoints", db.breakpoints.size()).c_str());
+    }
+    // names an ai suggested: a click opens the review
+    if (s.db && !s.db->suggestions.empty()) {
+        ImGui::SameLine(0, 24);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(theme::call));
+        std::string t = util::fmt("|  %zu suggested name%s to review", s.db->suggestions.size(), s.db->suggestions.size() == 1 ? "" : "s");
+        ImGui::TextUnformatted(t.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked())
+            dialogs::open(s, dialog_kind::review, 0);
     }
     if (s.mcp) {
         std::string url = app_mcp_url(s), err = app_mcp_error(s);
