@@ -17,12 +17,23 @@ struct decomp_line {
     uint64_t addr = 0;    // instruction this line came from, 0 if none (braces, blanks)
 };
 
+// a variable of the function: a parameter, a slot of its stack frame, or a register the code
+// keeps a value in. the database keeps your name and type for it under key
+struct decomp_var {
+    std::string key;   // the decompiler's own name: "rdi", "eax", "local_1c", "arg_4"
+    std::string name;  // as shown (yours, the prototype's, or key)
+    std::string type;  // as declared ("" for a register nobody gave a type)
+    bool param = false;
+    bool stack = false;
+};
+
 struct decompiled {
     bool ok = false;
     std::string error;
     uint64_t func = 0;
     std::string name;
-    std::vector<decomp_line> lines;
+    std::vector<decomp_line> lines;   // lines[0] is the signature
+    std::vector<decomp_var> vars;
     bool truncated = false;   // the function was too big, output is partial
 };
 

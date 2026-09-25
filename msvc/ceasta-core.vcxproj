@@ -60,6 +60,7 @@
     <ClCompile Include="..\src\core\mcp.cpp" />
     <ClCompile Include="..\src\core\mcp_transport.cpp" />
     <ClCompile Include="..\src\core\os.cpp" />
+    <ClCompile Include="..\src\core\protos.cpp" />
     <ClCompile Include="..\src\core\pe.cpp" />
     <ClCompile Include="..\src\core\search.cpp" />
     <ClCompile Include="..\src\core\signatures.cpp" />

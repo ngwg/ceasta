@@ -2,6 +2,7 @@
 #include "core/analysis.h"
 #include "core/binary.h"
 #include "core/disasm.h"
+#include "core/protos.h"
 #include <map>
 #include <memory>
 #include <set>
@@ -114,9 +115,27 @@ public:
     std::map<uint64_t, std::string> bookmarks;
     void set_bookmark(uint64_t a, bool on, const std::string& note = std::string());
 
+    // the decompiler's variables as you named and typed them: function start -> the
+    // decompiler's own name for the variable ("rdi", "local_1c") -> yours ("" keeps its own)
+    struct lvar {
+        std::string name, type;
+    };
+    std::map<uint64_t, std::map<std::string, lvar>> lvars;
+    bool set_lvar(uint64_t func, const std::string& key, const std::string& name, const std::string& type,
+                  std::string& err);
+    // prototypes you gave functions ("int check(char* key, int len)"); the name in it follows the
+    // function's name
+    std::map<uint64_t, prototype> protos;
+    bool set_proto(uint64_t func, const std::string& text, std::string& err); // "" removes it
+    // what a call to target takes: your prototype of a function here (through a thunk), or a
+    // well-known one by name (imports like CreateFileW, printf). null when there's neither
+    const prototype* callee_proto(uint64_t target) const;
+    // the argument an instruction sets for the call after it ("lpFileName"), "" when none
+    std::string arg_note(uint64_t a);
+
     // undo / redo of your edits: names, comments, bookmarks. edits in the same group (the app
     // uses one per frame, so a plugin or the ai renaming many things is one step) go together
-    enum class edit_kind : uint8_t { name, comment, bookmark };
+    enum class edit_kind : uint8_t { name, comment, bookmark, lvar, proto };
     struct edit {
         edit_kind kind;
         uint64_t addr;
@@ -137,6 +156,9 @@ private:
     bool applying_ = false;
 
     std::string auto_name(uint64_t a) const;
+    void note_args(const function& f);
+    std::unordered_map<uint64_t, std::string> arg_notes_; // instruction -> argument name
+    std::set<uint64_t> noted_funcs_;                      // functions arg_notes_ covers
     void build_names();
     void build_rows();
     void claim_name(uint64_t a, const std::string& base);

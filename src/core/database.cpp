@@ -2,6 +2,7 @@
 #include "core/os.h"
 #include "core/util.h"
 #include <algorithm>
+#include <cctype>
 
 namespace {
 
@@ -231,6 +232,8 @@ bool database::set_name(uint64_t a, const std::string& name, std::string& err)
             if (s != names_.end())
                 by_name_[s->second] = a;
             dirty = true;
+            arg_notes_.clear();
+            noted_funcs_.clear();
         }
         return true;
     }
@@ -266,6 +269,8 @@ bool database::set_name(uint64_t a, const std::string& name, std::string& err)
     user_names[a] = n;
     by_name_[n] = a;
     dirty = true;
+    arg_notes_.clear(); // a name can make a call a well-known one (strcpy, CreateFileW)
+    noted_funcs_.clear();
     // a named spot inside code needs its own label line
     uint8_t f = an.flags_at(a);
     bool tail = (f & fl_tail) && !(f & (fl_code | fl_str | fl_data));
@@ -306,6 +311,213 @@ void database::set_bookmark(uint64_t a, bool on, const std::string& note)
     dirty = true;
 }
 
+// ---- the decompiler's variables and prototypes
+
+static bool good_type(const std::string& t)
+{
+    if (t.size() > 120)
+        return false;
+    for (char c : t)
+        if (!(std::isalnum((unsigned char)c) || c == '_' || c == ' ' || c == '*' || c == '&' || c == '[' || c == ']'))
+            return false;
+    return true;
+}
+
+bool database::set_lvar(uint64_t func, const std::string& key, const std::string& name, const std::string& type,
+                        std::string& err)
+{
+    std::string n = util::trim(name), t = util::trim(type);
+    if (!is_identifier(key)) {
+        err = "no such variable";
+        return false;
+    }
+    if (!n.empty() && (!is_identifier(n) || is_reserved_word(n))) {
+        err = "a variable's name is letters, digits and _, and not a c keyword";
+        return false;
+    }
+    if (!t.empty() && !good_type(t)) {
+        err = "a type is words, * and [] (int, char*, DWORD, struct header*)";
+        return false;
+    }
+    std::map<std::string, lvar>& vars = lvars[func];
+    if (!n.empty())
+        for (const auto& v : vars)
+            if (v.first != key && (v.second.name == n || (v.second.name.empty() && v.first == n))) {
+                err = "another variable in this function is called " + n;
+                return false;
+            }
+    auto it = vars.find(key);
+    std::string before = it == vars.end() ? std::string() : key + "\n" + it->second.name + "\t" + it->second.type;
+    std::string after = n.empty() && t.empty() ? std::string() : key + "\n" + n + "\t" + t;
+    record(edit_kind::lvar, func, before.empty() ? key + "\n\t" : before, after.empty() ? key + "\n\t" : after);
+    if (n.empty() && t.empty()) {
+        if (it != vars.end())
+            vars.erase(it);
+        if (vars.empty())
+            lvars.erase(func);
+    } else {
+        vars[key] = {n, t};
+    }
+    dirty = true;
+    return true;
+}
+
+bool database::set_proto(uint64_t func, const std::string& text, std::string& err)
+{
+    auto it = protos.find(func);
+    std::string before = it == protos.end() ? std::string() : format_prototype(it->second);
+    if (util::trim(text).empty()) {
+        record(edit_kind::proto, func, before, std::string());
+        if (it != protos.end())
+            protos.erase(it);
+        arg_notes_.clear();
+        noted_funcs_.clear();
+        dirty = true;
+        return true;
+    }
+    prototype p;
+    if (!parse_prototype(text, p, err))
+        return false;
+    for (const proto_param& pp : p.params)
+        if (!good_type(pp.type) && pp.type.find("(*") == std::string::npos) {
+            err = "the type of " + pp.name + " isn't one: " + pp.type;
+            return false;
+        }
+    if (!good_type(p.ret)) {
+        err = "the return type isn't one: " + p.ret;
+        return false;
+    }
+    // a new name in the prototype renames the function
+    std::string cur = name_at(func);
+    if (!cur.empty() && p.name != cur && !applying_ && !set_name(func, p.name, err))
+        return false;
+    record(edit_kind::proto, func, before, format_prototype(p));
+    protos[func] = p;
+    arg_notes_.clear();
+    noted_funcs_.clear();
+    dirty = true;
+    return true;
+}
+
+const prototype* database::callee_proto(uint64_t target) const
+{
+    auto own = protos.find(target);
+    if (own != protos.end())
+        return &own->second;
+    const function* f = an.func_containing(target);
+    if (f && f->start == target && f->thunk && f->thunk_target) { // a thunk: where it jumps
+        auto p = protos.find(f->thunk_target);
+        if (p != protos.end())
+            return &p->second;
+        if (const prototype* k = known_prototype(name_at(f->thunk_target)))
+            return k;
+    }
+    std::string n = name_at(target);
+    return n.empty() ? nullptr : known_prototype(n);
+}
+
+namespace {
+
+// the 64-bit register a register name is part of: "r8d" -> "r8", "ecx" -> "rcx"
+std::string reg64(const std::string& r)
+{
+    static const std::map<std::string, std::string> m = {
+        {"rcx", "rcx"}, {"ecx", "rcx"}, {"cx", "rcx"}, {"cl", "rcx"}, {"rdx", "rdx"}, {"edx", "rdx"}, {"dx", "rdx"},
+        {"dl", "rdx"}, {"rdi", "rdi"}, {"edi", "rdi"}, {"di", "rdi"}, {"dil", "rdi"}, {"rsi", "rsi"}, {"esi", "rsi"},
+        {"si", "rsi"}, {"sil", "rsi"}};
+    auto it = m.find(r);
+    if (it != m.end())
+        return it->second;
+    if (r.size() >= 2 && r[0] == 'r' && std::isdigit((unsigned char)r[1])) {
+        size_t e = 1;
+        while (e < r.size() && std::isdigit((unsigned char)r[e]))
+            e++;
+        return r.substr(0, e);
+    }
+    return std::string();
+}
+
+bool writes_first(const char* m)
+{
+    static const std::set<std::string> w = {"mov", "movzx", "movsx", "movsxd", "movabs", "lea", "xor", "or", "and",
+        "add", "sub", "inc", "dec", "neg", "not", "shl", "shr", "sar", "imul", "pop", "movd", "movq"};
+    return w.count(m) != 0;
+}
+
+} // namespace
+
+// for every call in f to something with a known prototype: the instructions before it that set
+// its arguments (the closest one per argument), back to a label or another call
+void database::note_args(const function& f)
+{
+    noted_funcs_.insert(f.start);
+    std::vector<uint64_t> heads;
+    for (uint64_t a = f.start; a < f.end && heads.size() < 200000;) {
+        uint32_t sz = an.item_size(a);
+        if (an.flags_at(a) & fl_code)
+            heads.push_back(a);
+        a += sz ? sz : 1;
+    }
+    bool pe = bin.format == bin_format::pe, x64 = bin.is64();
+    static const char* const win64[] = {"rcx", "rdx", "r8", "r9"};
+    static const char* const sysv[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    for (size_t i = 0; i < heads.size(); i++) {
+        insn call;
+        if (!decode(heads[i], call) || call.kind != flow::call)
+            continue;
+        const prototype* p = nullptr;
+        if (call.has_target && !call.indirect)
+            p = callee_proto(call.target);
+        else if (call.has_mem && !call.is_lea) // call [__imp_CreateFileW]
+            p = known_prototype(name_at(call.mem));
+        if (!p || p->params.empty())
+            continue;
+        size_t nregs = !x64 ? 0 : pe ? 4 : 6;
+        std::vector<bool> done(p->params.size(), false);
+        int pushes = 0;
+        for (size_t j = i; j-- > 0 && i - j <= 24;) {
+            insn in;
+            if (!decode(heads[j], in) || in.kind != flow::normal)
+                break;
+            int arg = -1;
+            if (!x64 && std::string(in.mnem) == "push")
+                arg = pushes++;
+            else if (in.mem_write && in.has_mem_op && !in.mem_index && in.mem_base) {
+                // a stack argument: [rsp + 0x20 + 8 * n] on win64, [rsp + 8 * n] on system v / x86
+                std::string base = reg_name(in.mem_base);
+                if (base == "rsp" || base == "esp") {
+                    int64_t off = in.mem_disp - (x64 && pe ? 0x20 : 0);
+                    int ptr = x64 ? 8 : 4;
+                    if (off >= 0 && off % ptr == 0)
+                        arg = (int)nregs + (int)(off / ptr);
+                }
+            } else if (x64 && in.reg0 && !in.mem_write && writes_first(in.mnem)) {
+                std::string r = reg64(reg_name(in.reg0));
+                for (size_t k = 0; k < nregs; k++)
+                    if (r == (pe ? win64[k] : sysv[k]))
+                        arg = (int)k;
+            }
+            if (arg >= 0 && arg < (int)done.size() && !done[(size_t)arg]) {
+                done[(size_t)arg] = true;
+                arg_notes_[heads[j]] = p->params[(size_t)arg].name;
+            }
+            if (an.flags_at(heads[j]) & fl_label)
+                break; // other paths come in here
+        }
+    }
+}
+
+std::string database::arg_note(uint64_t a)
+{
+    const function* f = an.func_containing(a);
+    if (!f)
+        return std::string();
+    if (!noted_funcs_.count(f->start))
+        note_args(*f);
+    auto it = arg_notes_.find(a);
+    return it == arg_notes_.end() ? std::string() : it->second;
+}
+
 void database::record(edit_kind k, uint64_t a, const std::string& before, const std::string& after)
 {
     if (!record_edits || applying_ || before == after)
@@ -331,6 +543,17 @@ std::string database::apply(const edit& e, bool forward)
     case edit_kind::bookmark:
         set_bookmark(e.addr, !v.empty(), v.empty() ? std::string() : v.substr(1));
         return "bookmark at " + where;
+    case edit_kind::lvar: { // "key\nname\ttype"
+        size_t nl = v.find('\n'), tab = v.find('\t');
+        if (nl == std::string::npos || tab == std::string::npos || tab < nl)
+            return std::string();
+        std::string key = v.substr(0, nl);
+        set_lvar(e.addr, key, v.substr(nl + 1, tab - nl - 1), v.substr(tab + 1), err);
+        return "variable " + key + " in " + location(e.addr);
+    }
+    case edit_kind::proto:
+        set_proto(e.addr, v, err);
+        return "prototype of " + location(e.addr);
     }
     return std::string();
 }
@@ -650,6 +873,9 @@ void database::format(const row& r, line_text& out)
                 break;
             }
         }
+        std::string note = arg_note(r.addr);
+        if (!note.empty())
+            out.auto_comment = out.auto_comment.empty() ? note : note + " = " + out.auto_comment;
         auto t = an.tables.find(r.addr);
         if (t != an.tables.end())
             out.auto_comment = util::fmt("switch jump, %u cases", t->second.entries);
@@ -807,6 +1033,11 @@ std::string database::serialize(bool with_program) const
         s += "bookmark " + util::hex(b.first) + (b.second.empty() ? std::string() : " " + escape_line(b.second)) + "\n";
     for (const xref& x : extra_xrefs)
         s += "xref " + util::hex(x.from) + " " + util::hex(x.to) + " " + std::to_string((int)x.type) + "\n";
+    for (const auto& p : protos)
+        s += "proto " + util::hex(p.first) + " " + format_prototype(p.second) + "\n";
+    for (const auto& f : lvars)
+        for (const auto& v : f.second) // "lvar <func> <key> <name>\t<type>"
+            s += "lvar " + util::hex(f.first) + " " + v.first + " " + v.second.name + "\t" + v.second.type + "\n";
     if (saved_cursor)
         s += util::fmt("view %llx %d\n", (unsigned long long)saved_cursor, saved_view);
     if (with_program && !bin.file.empty()) {
@@ -918,6 +1149,13 @@ bool database::load_annotations(std::string& err)
             bookmarks[a] = unescape_line(rest);
         else if (kind == "bpcond" && bin.is_mapped(a))
             bp_conditions[a] = unescape_line(rest);
+        else if (kind == "proto")
+            set_proto(a, rest, e);
+        else if (kind == "lvar") {
+            size_t sp = rest.find(' '), tab = rest.find('\t');
+            if (sp != std::string::npos && tab != std::string::npos && tab > sp)
+                set_lvar(a, rest.substr(0, sp), rest.substr(sp + 1, tab - sp - 1), rest.substr(tab + 1), e);
+        }
         else if (kind == "xref") {
             // "xref <from> <to> <kind>": a runtime-learned cross reference
             uint64_t to = 0;

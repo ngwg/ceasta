@@ -91,6 +91,7 @@ add_library(ceasta_core STATIC
     src/core/mcp.cpp
     src/core/mcp_transport.cpp
     src/core/os.cpp
+    src/core/protos.cpp
     src/core/pe.cpp
     src/core/search.cpp
     src/core/signatures.cpp)
