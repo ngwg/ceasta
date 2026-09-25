@@ -1,8 +1,9 @@
 // linux (and any x11 / wayland) gui entry point: glfw + opengl3, around the same app_init /
-// app_frame the windows build uses. experimental - the windows build is the primary gui.
+// app_frame the windows build uses.
 #include "app.h"
 #include "core/os.h"
 #include "theme.h"
+#include "version.h"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -93,8 +94,21 @@ static void glfw_error(int code, const char* desc) { std::fprintf(stderr, "glfw 
 int main(int argc, char** argv)
 {
     std::vector<std::string> args;
-    for (int i = 1; i < argc; i++)
-        args.push_back(argv[i]);
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--version" || a == "-v") {
+            std::printf("ceasta %s\n", CEASTA_VERSION);
+            return 0;
+        }
+        if (a == "--help" || a == "-h") {
+            std::printf("ceasta %s - disassembler, decompiler and debugger\n\n"
+                        "usage: ceasta [file]    opens the file (a program, a .ceasta database or project)\n"
+                        "the command line tool is ceasta-cli.\n",
+                CEASTA_VERSION);
+            return 0;
+        }
+        args.push_back(a);
+    }
 
     glfwSetErrorCallback(glfw_error);
     if (!glfwInit()) {
@@ -105,6 +119,12 @@ int main(int argc, char** argv)
     const char* glsl_version = "#version 130";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    // the desktop matches the window to ceasta.desktop (its icon, its name) by this class
+    glfwWindowHintString(GLFW_X11_CLASS_NAME, "ceasta");
+    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "ceasta");
+#ifdef GLFW_WAYLAND_APP_ID
+    glfwWindowHintString(GLFW_WAYLAND_APP_ID, "ceasta");
+#endif
 
     GLFWwindow* window = glfwCreateWindow(1280, 800, "ceasta", nullptr, nullptr);
     if (!window) {
