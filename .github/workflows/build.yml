@@ -129,7 +129,7 @@ jobs:
 
           - **ceasta-$version-setup.exe** - installer for windows 10/11 x64. installs for your user without admin rights, adds a start menu entry and (optionally) "open with ceasta" to the right-click menu.
           - **ceasta-$version-windows-x64.zip** - portable, unzip and run \`ceasta.exe\`.
-          - **ceasta-cli-$version-linux-x64.tar.gz** - the command line tool for linux: analysis, disassembly, the decompiler, a terminal debugger (\`ceasta-cli dbg\`), binary diff, library signatures, lua scripting, and the mcp server (\`ceasta-cli mcp\`) for connecting an ai. no gui on linux.
+          - **ceasta-cli-$version-linux-x64.tar.gz** - the command line tool for linux: analysis, disassembly, the decompiler, a terminal debugger (\`ceasta-cli dbg\`), binary diff, library signatures, lua scripting, and the mcp server (\`ceasta-cli mcp\`) for connecting an ai. the linux gui is experimental and not in this download - build it yourself (see the readme).
 
           checksums are in SHA256SUMS.txt.
           EOF

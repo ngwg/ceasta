@@ -13,7 +13,7 @@
   what to paste into claude code / cursor. the ai works on what you see - its renames, comments
   and breakpoints show up live, and its debug session is the window's debugger
 - saving: nothing is saved behind your back any more. closing the window, closing the file or
-  opening another one asks first (save / don't save / cancel), the title shows a * while there
+  opening another one asks first (save / don't save / cancel), the title shows a `*` while there
   are unsaved changes, and file > save project as... writes a `.ceasta` project wherever you
   like - open it (ctrl+o or drop it on the window) to pick up where you left off
 - mcp over http only answers programs on this machine: requests from web pages of other sites
