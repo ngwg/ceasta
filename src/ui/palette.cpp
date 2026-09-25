@@ -20,7 +20,7 @@ struct action {
 bool always(const app_state&) { return true; }
 bool has_file(const app_state& s) { return s.db != nullptr; }
 bool not_loading(const app_state& s) { return !app_loading(s); }
-bool dirty(const app_state& s) { return s.db && s.db->dirty; }
+bool dirty(const app_state& s) { return s.db && (s.db->dirty || s.db->project_file.empty()); }
 bool no_process(const app_state& s) { return s.dbg.state() == dbg_state::none; }
 bool has_process(const app_state& s) { return s.dbg.state() != dbg_state::none; }
 bool stopped(const app_state& s) { return s.dbg.state() == dbg_state::stopped && !dbg_stepping(s); }

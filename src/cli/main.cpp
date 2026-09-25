@@ -198,8 +198,8 @@ static int cmd_diff(const std::vector<std::string>& args, const load_options& op
         return 2;
     }
     std::string ea, eb;
-    std::unique_ptr<database> a = open_database(args[1], opts, nullptr, ea);
-    std::unique_ptr<database> b = open_database(args[2], opts, nullptr, eb);
+    std::unique_ptr<database> a = open_any(args[1], opts, nullptr, ea);
+    std::unique_ptr<database> b = open_any(args[2], opts, nullptr, eb);
     if (!a) {
         fprintf(stderr, "can't open %s: %s\n", args[1].c_str(), ea.c_str());
         return 1;
@@ -281,7 +281,10 @@ int main(int argc, char** argv)
         return cmd_diff(args, opts);
 
     std::string err;
-    std::unique_ptr<database> dbp = open_database(args[1], opts, nullptr, err);
+    std::string note;
+    std::unique_ptr<database> dbp = open_any(args[1], opts, nullptr, err, &note);
+    if (!note.empty())
+        fprintf(stderr, "note: %s\n", note.c_str());
     if (!dbp) {
         fprintf(stderr, "error: %s\n", err.c_str());
         return 1;

@@ -125,6 +125,17 @@ bool exists(const std::string& path)
     return fs::exists(to_path(path), ec);
 }
 
+void make_executable(const std::string& path)
+{
+#ifndef _WIN32
+    std::error_code ec;
+    fs::permissions(to_path(path), fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+        fs::perm_options::add, ec);
+#else
+    (void)path;
+#endif
+}
+
 bool make_dirs(const std::string& path)
 {
     std::error_code ec;

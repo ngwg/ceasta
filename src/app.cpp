@@ -152,16 +152,25 @@ static void start_open(app_state& s, const std::string& path, load_options opts)
 {
     std::string target = path;
     if (is_project_file(path) && !opts.force_raw) {
-        // a project: open the file it belongs to, with the project's names and comments
-        std::string name;
-        target = project_binary(path, name);
-        if (target.empty() && s.platform.open_file_dialog)
-            target = s.platform.open_file_dialog(("Where is " + (name.empty() ? std::string("the file for this project") : name) + "?").c_str());
-        if (target.empty()) {
-            app_log(s, "can't find the file " + path + " belongs to" + (name.empty() ? std::string() : " (" + name + ")") +
-                ": keep the project next to it", 2);
+        // a project / database: open its program (the file next to it, or the copy inside) with
+        // the project's names, comments and the rest
+        project_info info;
+        std::string err, note;
+        if (!read_project_info(path, info, err)) {
+            app_log(s, "can't open " + path + ": " + err, 2);
             return;
         }
+        target = project_program(path, info, note);
+        std::string name = info.name.empty() ? std::string("the program for this project") : info.name;
+        if (target.empty() && s.platform.open_file_dialog)
+            target = s.platform.open_file_dialog(("Where is " + name + "?").c_str());
+        if (target.empty()) {
+            app_log(s, "can't find " + name + ", the program " + path + " belongs to - keep the project next to it", 2);
+            return;
+        }
+        if (!note.empty())
+            app_log(s, note, 1);
+        opts = info.opts;
         opts.project = path;
     }
     if (s.dbg.state() != dbg_state::none) {
@@ -218,6 +227,10 @@ static void finish_job(app_state& s)
     s.dbg_mapped = false;
     const binary& b = s.db->bin;
     s.cursor = b.has_entry ? b.entry : b.min_addr();
+    if (s.db->saved_cursor && b.is_mapped(s.db->saved_cursor)) { // where you were when it was saved
+        s.cursor = s.db->saved_cursor;
+        s.view = s.db->saved_view == 1 ? center_view::graph : s.db->saved_view == 2 ? center_view::pseudo : center_view::listing;
+    }
     s.hex_addr = s.cursor;
     s.scroll_to_cursor = true;
     for (const std::string& n : b.notes)
@@ -227,23 +240,48 @@ static void finish_job(app_state& s)
     if (!s.db->user_names.empty() || !s.db->user_comments.empty())
         app_log(s, util::fmt("restored %zu names and %zu comments from %s", s.db->user_names.size(),
             s.db->user_comments.size(), s.db->annotations_path().c_str()));
-    add_recent(s, b.path);
+    add_recent(s, s.db->project_file.empty() ? b.path : s.db->project_file);
     set_title(s);
     s.lua.fire("load");
     app_names_changed(s);
 }
 
+// where you are goes into the database too, so opening it picks up there
+static void stash_view(app_state& s)
+{
+    s.db->saved_cursor = s.cursor;
+    s.db->saved_view = s.view == center_view::graph ? 1 : s.view == center_view::pseudo ? 2 : 0;
+}
+
 void app_save(app_state& s)
 {
-    if (!s.db || !s.db->dirty)
+    if (!s.db)
         return;
+    bool first = s.db->project_file.empty();
+    if (!first && !s.db->dirty)
+        return;
+    stash_view(s);
+    if (first) {
+        // the first save makes a database next to the file, holding the program too (like ida's
+        // .i64): it opens later, or on another machine, without the original file
+        s.db->project_file = s.db->bin.path + ".ceasta";
+        s.db->project_has_program = true;
+    }
     std::string err;
     if (s.db->save(err)) {
         s.db->dirty = false;
-        app_log(s, "saved to " + s.db->annotations_path());
-    } else {
-        app_log(s, "couldn't save: " + err, 2);
+        app_log(s, "saved to " + s.db->project_path());
+        add_recent(s, s.db->project_file);
+        return;
     }
+    if (first) {
+        s.db->project_file.clear();
+        s.db->project_has_program = false;
+        app_log(s, "couldn't save next to the file (" + err + ") - pick where", 1);
+        app_save_as(s);
+        return;
+    }
+    app_log(s, "couldn't save: " + err, 2);
 }
 
 void app_save_as(app_state& s)
@@ -256,14 +294,19 @@ void app_save_as(app_state& s)
     if (!is_project_file(path))
         path += ".ceasta";
     std::string old = s.db->project_file;
+    bool old_program = s.db->project_has_program;
     s.db->project_file = path;
+    s.db->project_has_program = true;
+    stash_view(s);
     std::string err;
-    if (s.db->save_project(err) && s.db->save(err)) {
+    if (s.db->save(err)) {
         s.db->dirty = false;
-        app_log(s, "saved the project to " + path + " (open it to pick up where you left off)");
+        app_log(s, "saved to " + path + " - it holds the program too, so it opens anywhere");
+        add_recent(s, path);
     } else {
         s.db->project_file = old;
-        app_log(s, "couldn't save the project: " + err, 2);
+        s.db->project_has_program = old_program;
+        app_log(s, "couldn't save: " + err, 2);
     }
 }
 

@@ -180,4 +180,56 @@ struct byte_reader {
     }
 };
 
+// base64 (standard alphabet, with padding), for the program copy inside a .ceasta database
+inline std::string base64_encode(const uint8_t* data, size_t n)
+{
+    static const char* digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((n + 2) / 3 * 4);
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)data[i] << 16;
+        if (i + 1 < n)
+            v |= (uint32_t)data[i + 1] << 8;
+        if (i + 2 < n)
+            v |= data[i + 2];
+        out += digits[(v >> 18) & 63];
+        out += digits[(v >> 12) & 63];
+        out += i + 1 < n ? digits[(v >> 6) & 63] : '=';
+        out += i + 2 < n ? digits[v & 63] : '=';
+    }
+    return out;
+}
+
+// appends the decoded bytes; skips anything that isn't a base64 digit (line breaks). false on
+// a stray character in the middle of the data
+inline bool base64_decode(const std::string& in, std::vector<uint8_t>& out)
+{
+    uint32_t v = 0;
+    int bits = 0;
+    for (char c : in) {
+        int d;
+        if (c >= 'A' && c <= 'Z')
+            d = c - 'A';
+        else if (c >= 'a' && c <= 'z')
+            d = c - 'a' + 26;
+        else if (c >= '0' && c <= '9')
+            d = c - '0' + 52;
+        else if (c == '+')
+            d = 62;
+        else if (c == '/')
+            d = 63;
+        else if (c == '=' || c == '\n' || c == '\r' || c == ' ')
+            continue;
+        else
+            return false;
+        v = (v << 6) | (uint32_t)d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((uint8_t)(v >> bits));
+        }
+    }
+    return true;
+}
+
 }

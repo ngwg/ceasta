@@ -26,7 +26,7 @@ static void welcome(app_state& s)
     ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 2.2f);
     centered_text("ceasta", theme::func);
     ImGui::PopFont();
-    centered_text("disassembler + debugger for windows and linux binaries", theme::addr);
+    centered_text("disassembler, decompiler and debugger for windows and linux binaries", theme::addr);
     ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));
 
     float bw = ImGui::CalcTextSize("Open as raw code...").x + ImGui::GetStyle().FramePadding.x * 2;
@@ -37,7 +37,7 @@ static void welcome(app_state& s)
     if (ImGui::Button("Open as raw code...", ImVec2(bw, 0)))
         dialogs::open(s, dialog_kind::open_raw, 0);
     ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight() * 0.5f));
-    centered_text("or drop a file on the window  -  .exe .dll .sys, elf binaries, raw shellcode", theme::nop);
+    centered_text("or drop a file on the window  -  .exe .dll .sys, elf binaries, raw shellcode, .ceasta databases", theme::nop);
 
     if (!s.recent.empty()) {
         ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));

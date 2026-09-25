@@ -93,15 +93,21 @@ public:
     std::vector<uint64_t> find_bytes(const std::string& pattern, uint64_t from, size_t max_results) const;
 
     std::string db_path() const;
-    std::string project_file;                      // set by "save as" or by opening a project
+    std::string project_file;                      // the project / database this session saves to
+    bool project_has_program = false;              // it carries a copy of the program (like an ida .i64)
     std::string project_path() const;              // project_file, else "<binary>.ceasta" next to the file
     std::string annotations_path() const;          // what loading reads: the project if it exists, else db_path
-    std::string serialize() const;                 // the annotations file text (sorted, diffable)
-    bool save(std::string& err) const;             // private copy, and the project file if it exists
-    bool save_project(std::string& err) const;     // write the project file next to the binary
-    bool write_annotations(const std::string& path, std::string& err) const;
+    // the annotations file text (sorted, diffable); with_program appends the program's bytes
+    std::string serialize(bool with_program = false) const;
+    // the private copy in the user folder, and the project file when there is one
+    bool save(std::string& err) const;
+    bool save_project(std::string& err) const;     // write the project file (creating it)
+    bool write_annotations(const std::string& path, std::string& err, bool with_program = false) const;
     bool load_annotations(std::string& err);
     bool dirty = false; // unsaved user changes
+    // where you were, kept in the project (the app sets them before saving, reads them after loading)
+    uint64_t saved_cursor = 0;
+    int saved_view = 0;
 
 private:
     std::string auto_name(uint64_t a) const;
@@ -124,6 +130,23 @@ std::unique_ptr<database> open_database(const std::string& path, const load_opti
 
 // true for a ceasta project file name ("*.ceasta")
 bool is_project_file(const std::string& path);
-// the file a project belongs to: "<x>.ceasta" sits next to "<x>", or its "file <name>" line
-// names a file in the same folder. "" when neither is there; name_out gets the recorded name.
-std::string project_binary(const std::string& project, std::string& name_out);
+
+// what a project / database file says about the program it belongs to
+struct project_info {
+    std::string name;          // the program's file name
+    uint32_t crc = 0;          // of the program, when recorded
+    bool has_crc = false;
+    bool has_program = false;  // a copy of the program is inside
+    load_options opts;         // raw loads keep their arch and base
+};
+bool read_project_info(const std::string& project, project_info& out, std::string& err);
+
+// the program to open for a project: the file next to it ("<x>.ceasta" -> "<x>") or the recorded
+// name in the same folder, when its crc matches; else the copy inside the project, written out to
+// the user folder. "" when there's none. note says what was picked when it isn't the obvious file.
+std::string project_program(const std::string& project, const project_info& info, std::string& note);
+
+// open_database for a path the user gave: a .ceasta project / database opens its program (see
+// project_program) with the project's annotations. note, when set, says which copy was used.
+std::unique_ptr<database> open_any(const std::string& path, load_options opts, analysis_progress* progress,
+    std::string& err, std::string* note = nullptr);

@@ -145,7 +145,7 @@ int cmd_mcp(int argc, char** argv)
     }
 
     std::string err;
-    std::unique_ptr<database> db = open_database(file, opts, nullptr, err);
+    std::unique_ptr<database> db = open_any(file, opts, nullptr, err);
     if (!db) {
         fprintf(stderr, "can't open %s: %s\n", file.c_str(), err.c_str());
         return 1;

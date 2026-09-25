@@ -11,6 +11,8 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out, std::string& 
 // writes to a temp file first then renames, so a crash can't leave half a file
 bool write_file(const std::string& path, const std::string& data, std::string& err);
 bool exists(const std::string& path);
+// lets the owner run the file (a program written out of a database); no-op on windows
+void make_executable(const std::string& path);
 bool make_dirs(const std::string& path);
 // files in dir ending with ext (like ".lua"), sorted by name, full paths
 std::vector<std::string> list_files(const std::string& dir, const std::string& ext);

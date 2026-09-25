@@ -678,9 +678,9 @@ void add_edit_tools(std::vector<tool>& t)
     tool sp;
     sp.name = "save_project";
     sp.description =
-        "Write a project file next to the binary (\"<file>.ceasta\") holding every name, comment and "
-        "breakpoint. It's plain sorted text meant to be committed to version control, so a team - or the "
-        "next session - picks up the work. Once it exists, later renames update it automatically.";
+        "Save every name, comment and breakpoint to the project file: the database the user has open, or "
+        "\"<file>.ceasta\" next to the binary (plain sorted text, meant for version control), so the user - or "
+        "the next session - picks up the work.";
     sp.schema = schema({});
     sp.writes = true;
     sp.run = [](mcp_server& s, const json::value&, std::string& out) {

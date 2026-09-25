@@ -693,11 +693,13 @@ bool database::add_xref(uint64_t from, uint64_t to, xref_type type)
     return true;
 }
 
-std::string database::serialize() const
+std::string database::serialize(bool with_program) const
 {
     // sorted (user_names / user_comments are std::map, breakpoints std::set), so the file is
     // stable line by line and diffs cleanly
-    std::string s = "ceasta 1\nfile " + bin.name + "\n";
+    std::string s = "ceasta 1\nfile " + bin.name + "\n" + util::fmt("crc %08X\n", crc);
+    if (bin.format == bin_format::raw)
+        s += util::fmt("load raw %s %llx\n", bin.is64() ? "x64" : "x86", (unsigned long long)bin.base);
     for (const auto& n : user_names)
         s += "name " + util::hex(n.first) + " " + n.second + "\n";
     for (const auto& c : user_comments)
@@ -706,12 +708,22 @@ std::string database::serialize() const
         s += "bp " + util::hex(b) + "\n";
     for (const xref& x : extra_xrefs)
         s += "xref " + util::hex(x.from) + " " + util::hex(x.to) + " " + std::to_string((int)x.type) + "\n";
+    if (saved_cursor)
+        s += util::fmt("view %llx %d\n", (unsigned long long)saved_cursor, saved_view);
+    if (with_program && !bin.file.empty()) {
+        // the program itself, so the database opens without the original file
+        s += util::fmt("program %zu %08X\n", bin.file.size(), crc);
+        std::string b64 = util::base64_encode(bin.file.data(), bin.file.size());
+        for (size_t i = 0; i < b64.size(); i += 76)
+            s += b64.substr(i, 76) + "\n";
+        s += "end\n";
+    }
     return s;
 }
 
-bool database::write_annotations(const std::string& path, std::string& err) const
+bool database::write_annotations(const std::string& path, std::string& err, bool with_program) const
 {
-    std::string s = serialize();
+    std::string s = serialize(with_program);
     size_t slash = path.find_last_of("/\\");
     if (slash != std::string::npos)
         os::make_dirs(path.substr(0, slash));
@@ -720,17 +732,23 @@ bool database::write_annotations(const std::string& path, std::string& err) cons
 
 bool database::save(std::string& err) const
 {
-    // keep the private copy in the user dir up to date, and, if the user has started a project
-    // file next to the binary, update that too
+    // keep the private copy in the user dir up to date, and the project / database file this
+    // session works with (a project the user started next to the binary counts too)
     bool ok = write_annotations(db_path(), err);
-    if (os::exists(project_path())) {
+    if (!project_file.empty() || os::exists(project_path())) {
         std::string e;
-        ok = write_annotations(project_path(), e) && ok;
+        if (!write_annotations(project_path(), e, project_has_program)) {
+            err = e;
+            ok = false;
+        }
     }
     return ok;
 }
 
-bool database::save_project(std::string& err) const { return write_annotations(project_path(), err); }
+bool database::save_project(std::string& err) const
+{
+    return write_annotations(project_path(), err, project_has_program);
+}
 
 bool database::load_annotations(std::string& err)
 {
@@ -758,10 +776,33 @@ bool database::load_annotations(std::string& err)
             }
             continue;
         }
+        if (line.compare(0, 8, "program ") == 0) {
+            // the program's bytes: loading already has them. skip its lines up to the one that is
+            // just "end" (a base64 line is never 3 characters long)
+            project_has_program = true;
+            while (pos < text.size()) {
+                size_t e = text.find('\n', pos);
+                size_t len = (e == std::string::npos ? text.size() : e) - pos;
+                bool last = (len == 3 || (len == 4 && text[pos + 3] == '\r')) && text.compare(pos, 3, "end") == 0;
+                pos = e == std::string::npos ? text.size() : e + 1;
+                if (last)
+                    break;
+            }
+            continue;
+        }
         size_t sp1 = line.find(' ');
         if (sp1 == std::string::npos)
             continue;
         std::string kind = line.substr(0, sp1);
+        if (kind == "view") { // "view <cursor> <mode>"
+            uint64_t c = 0;
+            size_t sp = line.find(' ', sp1 + 1);
+            if (util::parse_hex(line.substr(sp1 + 1, sp == std::string::npos ? std::string::npos : sp - sp1 - 1), c)) {
+                saved_cursor = c;
+                saved_view = sp == std::string::npos ? 0 : atoi(line.c_str() + sp + 1);
+            }
+            continue;
+        }
         size_t sp2 = line.find(' ', sp1 + 1);
         uint64_t a;
         if (!util::parse_hex(line.substr(sp1 + 1, sp2 == std::string::npos ? std::string::npos : sp2 - sp1 - 1), a))
@@ -808,6 +849,8 @@ std::unique_ptr<database> open_database(const std::string& path, const load_opti
     }
     db->build();
     db->project_file = opts.project;
+    if (db->project_file.empty() && os::exists(db->project_path()))
+        db->project_file = db->project_path(); // a project someone started next to the file
     std::string e;
     if (!db->load_annotations(e))
         db->bin.notes.push_back("couldn't read saved names: " + e);
@@ -821,30 +864,157 @@ bool is_project_file(const std::string& path)
     return l.size() > 7 && l.compare(l.size() - 7, 7, ".ceasta") == 0;
 }
 
-std::string project_binary(const std::string& project, std::string& name_out)
+bool read_project_info(const std::string& project, project_info& out, std::string& err)
 {
-    name_out.clear();
+    out = project_info();
     std::vector<uint8_t> bytes;
-    std::string err;
-    if (os::read_file(project, bytes, err)) {
-        // "ceasta 1" then "file <name>"
-        std::vector<std::string> lines = util::split(std::string(bytes.begin(), bytes.end()), "\n");
-        if (lines.size() > 1 && lines[1].compare(0, 5, "file ") == 0) {
-            std::string n = util::trim(lines[1].substr(5));
-            if (n.find_first_of("/\\") == std::string::npos && n != "." && n != "..")
-                name_out = n;
+    if (!os::read_file(project, bytes, err))
+        return false;
+    std::string text(bytes.begin(), bytes.end());
+    if (text.compare(0, 6, "ceasta") != 0) {
+        err = "not a ceasta project";
+        return false;
+    }
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = nl == std::string::npos ? text.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.compare(0, 5, "file ") == 0) {
+            std::string n = util::trim(line.substr(5));
+            // a bare file name only: the project decides nothing about other folders
+            if (n.find_first_of("/\\:") == std::string::npos && n != "." && n != "..")
+                out.name = n;
+        } else if (line.compare(0, 4, "crc ") == 0) {
+            uint64_t c = 0;
+            if (util::parse_hex(line.substr(4), c)) {
+                out.crc = (uint32_t)c;
+                out.has_crc = true;
+            }
+        } else if (line.compare(0, 9, "load raw ") == 0) {
+            out.opts.force_raw = true;
+            out.opts.raw_arch = line.compare(9, 3, "x86") == 0 ? bin_arch::x86 : bin_arch::x64;
+            size_t sp = line.find(' ', 9);
+            if (sp != std::string::npos)
+                util::parse_hex(line.substr(sp + 1), out.opts.raw_base);
+        } else if (line.compare(0, 8, "program ") == 0) {
+            out.has_program = true;
+            break; // the rest is the program's bytes
         }
     }
-    if (is_project_file(project)) {
-        std::string next_to = project.substr(0, project.size() - 7);
-        if (os::exists(next_to))
-            return next_to;
+    return true;
+}
+
+namespace {
+
+bool crc_matches(const std::string& path, const project_info& info)
+{
+    if (!os::exists(path))
+        return false;
+    if (!info.has_crc)
+        return true;
+    std::vector<uint8_t> b;
+    std::string e;
+    return os::read_file(path, b, e) && util::crc32(b.data(), b.size()) == info.crc;
+}
+
+// decode the program inside the project into a file
+bool extract_program(const std::string& project, const std::string& to, std::string& err)
+{
+    std::vector<uint8_t> bytes;
+    if (!os::read_file(project, bytes, err))
+        return false;
+    std::string text(bytes.begin(), bytes.end());
+    size_t at = text.find("\nprogram ");
+    if (at == std::string::npos) {
+        err = "the project has no copy of the program";
+        return false;
     }
-    if (!name_out.empty()) {
+    size_t nl = text.find('\n', at + 1);
+    size_t size = (size_t)strtoull(text.c_str() + at + 9, nullptr, 10);
+    std::vector<uint8_t> prog;
+    prog.reserve(size);
+    size_t pos = nl == std::string::npos ? text.size() : nl + 1;
+    while (pos < text.size()) {
+        size_t e = text.find('\n', pos);
+        std::string line = text.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+        pos = e == std::string::npos ? text.size() : e + 1;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line == "end")
+            break;
+        if (!util::base64_decode(line, prog)) {
+            err = "the program inside the project is damaged";
+            return false;
+        }
+    }
+    if (prog.size() != size) {
+        err = "the program inside the project is cut short";
+        return false;
+    }
+    size_t slash = to.find_last_of("/\\");
+    if (slash != std::string::npos)
+        os::make_dirs(to.substr(0, slash));
+    if (!os::write_file(to, std::string(prog.begin(), prog.end()), err))
+        return false;
+    os::make_executable(to); // so the debugger can start it
+    return true;
+}
+
+} // namespace
+
+std::string project_program(const std::string& project, const project_info& info, std::string& note)
+{
+    note.clear();
+    std::vector<std::string> candidates;
+    if (is_project_file(project))
+        candidates.push_back(project.substr(0, project.size() - 7)); // "<x>.ceasta" -> "<x>"
+    if (!info.name.empty()) {
         size_t slash = project.find_last_of("/\\");
-        std::string in_dir = slash == std::string::npos ? name_out : os::join(project.substr(0, slash), name_out);
-        if (os::exists(in_dir))
-            return in_dir;
+        candidates.push_back(slash == std::string::npos ? info.name : os::join(project.substr(0, slash), info.name));
     }
+    for (const std::string& c : candidates)
+        if (crc_matches(c, info))
+            return c;
+    if (info.has_program) {
+        // the copy inside, written out once to the user folder (by crc, so versions don't clash)
+        std::string name = info.name.empty() ? std::string("program") : info.name;
+        std::string out = os::join(os::join(os::join(os::user_dir(), "programs"), util::fmt("%08X", info.crc)), name);
+        std::string err;
+        if (crc_matches(out, info) || extract_program(project, out, err)) {
+            note = "using the copy of " + name + " saved inside the project";
+            return out;
+        }
+        note = err;
+    }
+    for (const std::string& c : candidates)
+        if (os::exists(c)) {
+            note = c + " changed since the project was saved - names and comments may not line up";
+            return c;
+        }
     return std::string();
+}
+
+std::unique_ptr<database> open_any(const std::string& path, load_options opts, analysis_progress* progress,
+    std::string& err, std::string* note)
+{
+    if (!is_project_file(path) || opts.force_raw)
+        return open_database(path, opts, progress, err);
+    project_info info;
+    if (!read_project_info(path, info, err))
+        return nullptr;
+    std::string n;
+    std::string target = project_program(path, info, n);
+    if (note)
+        *note = n;
+    if (target.empty()) {
+        err = "can't find " + (info.name.empty() ? std::string("the program") : info.name) + " for " + path +
+              " (and the project holds no copy of it)";
+        return nullptr;
+    }
+    load_options o = info.opts;
+    o.project = path;
+    return open_database(target, o, progress, err);
 }
