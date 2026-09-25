@@ -214,7 +214,9 @@ bool database::set_name(uint64_t a, const std::string& name, std::string& err)
         return false;
     }
     auto old = user_names.find(a);
+    std::string before = old != user_names.end() ? old->second : std::string();
     if (n.empty()) {
+        record(edit_kind::name, a, before, std::string());
         if (old != user_names.end()) {
             auto b = by_name_.find(old->second);
             if (b != by_name_.end() && b->second == a)
@@ -256,6 +258,7 @@ bool database::set_name(uint64_t a, const std::string& name, std::string& err)
         if (b != by_name_.end() && b->second == a)
             by_name_.erase(b);
     }
+    record(edit_kind::name, a, before, n);
     user_names[a] = n;
     by_name_[n] = a;
     dirty = true;
@@ -277,11 +280,97 @@ std::string database::comment_at(uint64_t a) const
 
 void database::set_comment(uint64_t a, const std::string& text)
 {
+    record(edit_kind::comment, a, comment_at(a), text);
     if (text.empty())
         user_comments.erase(a);
     else
         user_comments[a] = text;
     dirty = true;
+}
+
+void database::set_bookmark(uint64_t a, bool on, const std::string& note)
+{
+    auto it = bookmarks.find(a);
+    // "+note" stands for a bookmark (even with an empty note), "" for none
+    std::string before = it == bookmarks.end() ? std::string() : "+" + it->second;
+    std::string after = on ? "+" + note : std::string();
+    record(edit_kind::bookmark, a, before, after);
+    if (on)
+        bookmarks[a] = note;
+    else if (it != bookmarks.end())
+        bookmarks.erase(it);
+    dirty = true;
+}
+
+void database::record(edit_kind k, uint64_t a, const std::string& before, const std::string& after)
+{
+    if (!record_edits || applying_ || before == after)
+        return;
+    undo_log_.push_back({k, a, before, after, edit_group});
+    if (undo_log_.size() > 10000)
+        undo_log_.erase(undo_log_.begin(), undo_log_.begin() + 1000);
+    redo_log_.clear();
+}
+
+// puts one edit's before (undo) or after (redo) state back
+std::string database::apply(const edit& e, bool forward)
+{
+    const std::string& v = forward ? e.after : e.before;
+    std::string where = fmt_addr(e.addr), err;
+    switch (e.kind) {
+    case edit_kind::name:
+        set_name(e.addr, v, err);
+        return v.empty() ? "name at " + where : "name " + v + " at " + where;
+    case edit_kind::comment:
+        set_comment(e.addr, v);
+        return "comment at " + where;
+    case edit_kind::bookmark:
+        set_bookmark(e.addr, !v.empty(), v.empty() ? std::string() : v.substr(1));
+        return "bookmark at " + where;
+    }
+    return std::string();
+}
+
+std::string database::undo()
+{
+    if (undo_log_.empty())
+        return std::string();
+    uint64_t g = undo_log_.back().group;
+    std::string what;
+    int n = 0;
+    applying_ = true;
+    while (!undo_log_.empty() && undo_log_.back().group == g) {
+        edit e = undo_log_.back();
+        undo_log_.pop_back();
+        what = apply(e, false);
+        redo_log_.push_back(e);
+        n++;
+    }
+    applying_ = false;
+    dirty = true;
+    rows_dirty_ = true;
+    return n > 1 ? util::fmt("%d changes", n) : what;
+}
+
+std::string database::redo()
+{
+    if (redo_log_.empty())
+        return std::string();
+    uint64_t g = redo_log_.back().group;
+    std::string what;
+    int n = 0;
+    applying_ = true;
+    while (!redo_log_.empty() && redo_log_.back().group == g) {
+        edit e = redo_log_.back();
+        redo_log_.pop_back();
+        what = apply(e, true);
+        undo_log_.push_back(e);
+        n++;
+    }
+    applying_ = false;
+    dirty = true;
+    rows_dirty_ = true;
+    return n > 1 ? util::fmt("%d changes", n) : what;
 }
 
 bool database::resolve(const std::string& text, uint64_t& out) const
@@ -706,6 +795,8 @@ std::string database::serialize(bool with_program) const
         s += "comment " + util::hex(c.first) + " " + escape_line(c.second) + "\n";
     for (uint64_t b : breakpoints)
         s += "bp " + util::hex(b) + "\n";
+    for (const auto& b : bookmarks)
+        s += "bookmark " + util::hex(b.first) + (b.second.empty() ? std::string() : " " + escape_line(b.second)) + "\n";
     for (const xref& x : extra_xrefs)
         s += "xref " + util::hex(x.from) + " " + util::hex(x.to) + " " + std::to_string((int)x.type) + "\n";
     if (saved_cursor)
@@ -815,6 +906,8 @@ bool database::load_annotations(std::string& err)
             set_comment(a, unescape_line(rest));
         else if (kind == "bp" && bin.is_mapped(a))
             breakpoints.insert(a);
+        else if (kind == "bookmark" && bin.is_mapped(a))
+            bookmarks[a] = unescape_line(rest);
         else if (kind == "xref") {
             // "xref <from> <to> <kind>": a runtime-learned cross reference
             uint64_t to = 0;

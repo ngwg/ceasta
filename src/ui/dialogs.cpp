@@ -27,6 +27,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::save_changes: return "Save changes?###dlg";
     case dialog_kind::ai: return "Connect an AI###dlg";
     case dialog_kind::palette: return "Actions###dlg";
+    case dialog_kind::bookmarks: return "Bookmarks###dlg";
     default: return "###dlg";
     }
 }
@@ -34,7 +35,7 @@ static const char* title(dialog_kind k)
 static bool needs_file(dialog_kind k)
 {
     return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
-           k == dialog_kind::search || k == dialog_kind::find;
+           k == dialog_kind::search || k == dialog_kind::find || k == dialog_kind::bookmarks;
 }
 
 void open(app_state& s, dialog_kind kind, uint64_t addr)
@@ -491,6 +492,79 @@ static void save_changes(app_state& s, dialog_state& d)
     }
 }
 
+// the bookmarks: pick one to jump there; a note per bookmark; delete removes it
+static void bookmarks(app_state& s, dialog_state& d)
+{
+    database& db = *s.db;
+    if (db.bookmarks.empty()) {
+        ImGui::TextDisabled("no bookmarks yet - alt+m marks the line you're on");
+        if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+            ImGui::CloseCurrentPopup();
+        return;
+    }
+    std::vector<uint64_t> addrs;
+    for (const auto& b : db.bookmarks)
+        addrs.push_back(b.first);
+    int n = (int)addrs.size();
+    d.sel = std::max(0, std::min(n - 1, d.sel));
+    uint64_t go = 0;
+    ImVec2 size(ImGui::GetFontSize() * 46, ImGui::GetTextLineHeightWithSpacing() * 12);
+    if (ImGui::BeginTable("##bm", 3, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+            ImGuiTableFlags_BordersInnerV, size)) {
+        ImGui::TableSetupColumn("Address");
+        ImGui::TableSetupColumn("Where");
+        ImGui::TableSetupColumn("Note", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < n; i++) {
+            uint64_t a = addrs[(size_t)i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(i);
+            if (ImGui::Selectable(util::hex(a).c_str(), i == d.sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                if (d.sel != i)
+                    d.buf[0] = 0, d.refocus = true;
+                d.sel = i;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    go = a;
+            }
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(db.location(a).c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", db.bookmarks[a].c_str());
+        }
+        ImGui::EndTable();
+    }
+    uint64_t cur = addrs[(size_t)d.sel];
+    if (ImGui::IsWindowAppearing() || d.refocus)
+        snprintf(d.buf, sizeof(d.buf), "%s", db.bookmarks[cur].c_str());
+    d.refocus = false;
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30);
+    if (ImGui::InputTextWithHint("##note", "a note for this bookmark (enter keeps it)", d.buf, sizeof(d.buf),
+            ImGuiInputTextFlags_EnterReturnsTrue)) {
+        db.set_bookmark(cur, true, util::trim(d.buf));
+        app_names_changed(s);
+    }
+    bool typing = ImGui::GetIO().WantTextInput;
+    if (ImGui::Button("Jump", ImVec2(ImGui::GetFontSize() * 6, 0)))
+        go = cur;
+    ImGui::SameLine();
+    if (ImGui::Button("Remove", ImVec2(ImGui::GetFontSize() * 6, 0)) || (!typing && ImGui::IsKeyPressed(ImGuiKey_Delete))) {
+        db.set_bookmark(cur, false);
+        app_names_changed(s);
+        d.refocus = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+        ImGui::CloseCurrentPopup();
+    if (!typing && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))
+        go = cur;
+    if (go) {
+        app_jump(s, go);
+        ImGui::CloseCurrentPopup();
+    }
+}
+
 // a line of text the user copies: shown in a read-only box, with a copy button
 static void copy_line(const char* id, const std::string& text)
 {
@@ -571,6 +645,7 @@ static void shortcuts(app_state&, dialog_state&)
         {"G", "jump to address / name"},    {"Enter / double click", "follow the operand"},
         {"Esc / Alt+Left / mouse back", "back"}, {"Ctrl+Enter / Alt+Right / mouse fwd", "forward"},
         {"N", "rename"},                    {";", "comment"},
+        {"Ctrl+Z / Ctrl+Y", "undo / redo"},  {"Alt+M / Ctrl+M", "bookmark / bookmarks"},
         {"X", "references to here"},        {"Space", "listing / graph"},
         {"F5", "pseudocode (decompiler)"},  {"Ctrl+F", "search names, imports, strings, ..."},
         {"Alt+B", "search bytes"},
@@ -643,6 +718,7 @@ void draw(app_state& s)
         case dialog_kind::save_changes: save_changes(s, d); break;
         case dialog_kind::ai: ai(s, d); break;
         case dialog_kind::palette: palette::draw(s, d); break;
+        case dialog_kind::bookmarks: bookmarks(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

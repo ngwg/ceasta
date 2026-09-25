@@ -41,6 +41,10 @@ static const std::vector<action>& actions()
         {"File", "Close file", "", has_file, [](app_state& s) { app_close_file(s); }},
         {"File", "Exit", "Alt+F4", always, [](app_state& s) { app_quit(s); }},
 
+        {"Edit", "Undo", "Ctrl+Z", [](const app_state& s) { return s.db && s.db->can_undo(); }, [](app_state& s) { app_undo(s); }},
+        {"Edit", "Redo", "Ctrl+Y", [](const app_state& s) { return s.db && s.db->can_redo(); }, [](app_state& s) { app_redo(s); }},
+        {"Edit", "Bookmark this line", "Alt+M", has_file, [](app_state& s) { app_toggle_bookmark(s, s.cursor); }},
+        {"Edit", "Bookmarks...", "Ctrl+M", has_file, [](app_state& s) { open_dialog(s, dialog_kind::bookmarks); }},
         {"Edit", "Rename...", "N", has_file, [](app_state& s) { open_dialog(s, dialog_kind::rename); }},
         {"Edit", "Comment...", ";", has_file, [](app_state& s) { open_dialog(s, dialog_kind::comment); }},
         {"Edit", "Search names, imports, strings...", "Ctrl+F", has_file, [](app_state& s) { open_dialog(s, dialog_kind::find); }},

@@ -243,6 +243,7 @@ static void finish_job(app_state& s)
     add_recent(s, s.db->project_file.empty() ? b.path : s.db->project_file);
     set_title(s);
     s.lua.fire("load");
+    s.db->record_edits = true; // from here on, edits can be undone
     app_names_changed(s);
 }
 
@@ -415,6 +416,40 @@ bool app_follow(app_state& s, uint64_t addr)
 void app_names_changed(app_state& s)
 {
     s.version++;
+}
+
+void app_undo(app_state& s)
+{
+    if (!s.db)
+        return;
+    std::string what = s.db->undo();
+    if (what.empty())
+        return;
+    app_log(s, "undid: " + what);
+    app_names_changed(s);
+}
+
+void app_redo(app_state& s)
+{
+    if (!s.db)
+        return;
+    std::string what = s.db->redo();
+    if (what.empty())
+        return;
+    app_log(s, "redid: " + what);
+    app_names_changed(s);
+}
+
+void app_toggle_bookmark(app_state& s, uint64_t addr)
+{
+    if (!s.db || !s.db->bin.is_mapped(addr))
+        return;
+    uint64_t a = s.db->an.item_head(addr);
+    bool on = !s.db->bookmarks.count(a);
+    s.db->set_bookmark(a, on);
+    app_log(s, std::string(on ? "bookmark at " : "bookmark removed at ") + s.db->location(a) +
+        (on ? " (ctrl+m lists them)" : ""));
+    app_names_changed(s);
 }
 
 void app_set_font_size(app_state& s, float size)
@@ -826,6 +861,13 @@ static void shortcuts(app_state& s)
         app_save(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S))
         app_save_as(s);
+    // undo / redo, unless a text box is taking them
+    if (!io.WantTextInput) {
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
+            app_undo(s);
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z))
+            app_redo(s);
+    }
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Equal) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadAdd))
         app_set_font_size(s, s.font_size + 1);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Minus) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadSubtract))
@@ -885,10 +927,17 @@ static void shortcuts(app_state& s)
         dialogs::open(s, dialog_kind::search, s.cursor);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
         dialogs::open(s, dialog_kind::find, s.cursor);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_M))
+        app_toggle_bookmark(s, s.cursor);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_M))
+        dialogs::open(s, dialog_kind::bookmarks, s.cursor);
 }
 
 void app_frame(app_state& s)
 {
+    s.frame_no++;
+    if (s.db)
+        s.db->edit_group = s.frame_no; // what happens in one frame undoes as one step
     finish_job(s);
     app_mcp_pump(s);
     if ((s.db && s.db->dirty) != s.title_dirty)

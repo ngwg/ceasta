@@ -86,6 +86,8 @@ static void row_menu(app_state& s, uint64_t a)
         dialogs::open(s, dialog_kind::comment, a);
     if (ImGui::MenuItem("References...", "X"))
         dialogs::open(s, dialog_kind::xrefs, a);
+    if (ImGui::MenuItem(db.bookmarks.count(db.an.item_head(a)) ? "Remove bookmark" : "Bookmark", "Alt+M"))
+        app_toggle_bookmark(s, a);
     ImGui::Separator();
     if (ImGui::MenuItem("Toggle breakpoint", "F2"))
         app_toggle_bp(s, a);
@@ -198,6 +200,9 @@ static void listing(app_state& s)
             float gx = p.x + x_gutter - ImGui::GetStyle().WindowPadding.x + cw * 0.9f;
             if (item_row && db.breakpoints.count(r.addr))
                 dl->AddCircleFilled(ImVec2(gx, mid), lh * 0.28f, theme::bp);
+            if (item_row && db.bookmarks.count(r.addr)) // a bookmark: a bar at the left edge
+                dl->AddRectFilled(ImVec2(p.x - ImGui::GetStyle().WindowPadding.x + 1, p.y + 2),
+                    ImVec2(p.x - ImGui::GetStyle().WindowPadding.x + 4, p.y + lh - 2), theme::label);
             if (has_pc && item_row && r.addr == pc) {
                 float ax = gx + cw * 0.9f;
                 dl->AddTriangleFilled(ImVec2(ax - cw * 0.5f, mid - lh * 0.3f), ImVec2(ax - cw * 0.5f, mid + lh * 0.3f),

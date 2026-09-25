@@ -43,6 +43,11 @@ static void edit_menu(app_state& s)
     if (!ImGui::BeginMenu("Edit"))
         return;
     bool has = s.db != nullptr;
+    if (ImGui::MenuItem("Undo", "Ctrl+Z", false, has && s.db->can_undo()))
+        app_undo(s);
+    if (ImGui::MenuItem("Redo", "Ctrl+Y", false, has && s.db->can_redo()))
+        app_redo(s);
+    ImGui::Separator();
     if (ImGui::MenuItem("Rename...", "N", false, has))
         dialogs::open(s, dialog_kind::rename, s.cursor);
     if (ImGui::MenuItem("Comment...", ";", false, has))
@@ -54,6 +59,11 @@ static void edit_menu(app_state& s)
         dialogs::open(s, dialog_kind::search, s.cursor);
     if (ImGui::MenuItem("Copy address", nullptr, false, has))
         ImGui::SetClipboardText(s.db->fmt_addr(s.cursor).c_str());
+    ImGui::Separator();
+    if (ImGui::MenuItem("Bookmark this line", "Alt+M", false, has))
+        app_toggle_bookmark(s, s.cursor);
+    if (ImGui::MenuItem("Bookmarks...", "Ctrl+M", false, has))
+        dialogs::open(s, dialog_kind::bookmarks, s.cursor);
     ImGui::EndMenu();
 }
 

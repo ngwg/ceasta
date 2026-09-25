@@ -39,7 +39,7 @@ struct load_job {
 enum class center_view { listing, graph, pseudo };
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai, palette };
+    save_changes, ai, palette, bookmarks };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
@@ -73,6 +73,7 @@ struct app_state {
     lua_host lua;
     debugger dbg;
     uint64_t version = 0; // bumps whenever names / comments / analysis change
+    uint64_t frame_no = 0;
 
     // navigation
     uint64_t cursor = 0;
@@ -174,6 +175,9 @@ void app_back(app_state& s);
 void app_forward(app_state& s);
 bool app_follow(app_state& s, uint64_t addr); // jump to what the line at addr points at
 void app_names_changed(app_state& s);
+void app_undo(app_state& s);
+void app_redo(app_state& s);
+void app_toggle_bookmark(app_state& s, uint64_t addr);
 void app_set_font_size(app_state& s, float size);
 void app_set_theme(app_state& s, theme::ui_theme t);
 void app_open_dialog_kind(app_state& s, dialog_kind kind, uint64_t addr = 0);

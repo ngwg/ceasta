@@ -109,7 +109,32 @@ public:
     uint64_t saved_cursor = 0;
     int saved_view = 0;
 
+    // bookmarks: address -> a note (may be empty)
+    std::map<uint64_t, std::string> bookmarks;
+    void set_bookmark(uint64_t a, bool on, const std::string& note = std::string());
+
+    // undo / redo of your edits: names, comments, bookmarks. edits in the same group (the app
+    // uses one per frame, so a plugin or the ai renaming many things is one step) go together
+    enum class edit_kind : uint8_t { name, comment, bookmark };
+    struct edit {
+        edit_kind kind;
+        uint64_t addr;
+        std::string before, after; // "" = nothing there
+        uint64_t group;
+    };
+    bool record_edits = false; // on once the file is loaded, so loading isn't an edit
+    uint64_t edit_group = 0;
+    bool can_undo() const { return !undo_log_.empty(); }
+    bool can_redo() const { return !redo_log_.empty(); }
+    std::string undo(); // what it undid, "" when there was nothing
+    std::string redo();
+
 private:
+    void record(edit_kind k, uint64_t a, const std::string& before, const std::string& after);
+    std::string apply(const edit& e, bool forward);
+    std::vector<edit> undo_log_, redo_log_;
+    bool applying_ = false;
+
     std::string auto_name(uint64_t a) const;
     void build_names();
     void build_rows();
