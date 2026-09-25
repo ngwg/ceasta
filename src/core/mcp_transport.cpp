@@ -3,9 +3,12 @@
 #include "core/mcp.h"
 #include "core/util.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #include <io.h>
@@ -148,6 +151,30 @@ struct net_init {
     }
 };
 
+// sockets stay out of child processes (a program being debugged, say): a copy held there would
+// keep a closed connection open and the port taken
+void no_inherit(socket_t s)
+{
+#ifdef _WIN32
+    SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
+#else
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+#endif
+}
+
+// accept, with the new socket kept out of child processes from the start where the system can
+socket_t accept_client(socket_t srv)
+{
+#if defined(__linux__)
+    return accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
+#else
+    socket_t c = accept(srv, nullptr, nullptr);
+    if (c != bad_socket)
+        no_inherit(c);
+    return c;
+#endif
+}
+
 void set_nonblocking(socket_t s)
 {
 #ifdef _WIN32
@@ -168,20 +195,27 @@ bool would_block()
 #endif
 }
 
-// read an http request (headers + body by Content-Length) from a blocking-ish socket. returns
-// false on disconnect or a request with no proper end of headers within the size cap.
-bool read_http_request(socket_t c, std::string& method, std::string& path, std::string& body)
+// read an http request (headers + body by Content-Length) from a non-blocking socket. returns
+// false on disconnect, on a request with no proper end of headers within the size cap, when the
+// client stalls for 10 s, or when the server is asked to stop.
+bool read_http_request(socket_t c, std::string& method, std::string& path, std::string& head, std::string& body,
+                       const std::function<bool()>& should_stop)
 {
     std::string buf;
     char tmp[4096];
     size_t header_end = std::string::npos;
+    uint64_t deadline = os::now_ms() + 10000;
+    auto wait_more = [&]() {
+        if (os::now_ms() >= deadline || (should_stop && should_stop()))
+            return false;
+        os::sleep_ms(2);
+        return true;
+    };
     while (header_end == std::string::npos) {
         int n = (int)recv(c, tmp, sizeof(tmp), 0);
         if (n <= 0) {
-            if (n < 0 && would_block()) {
-                os::sleep_ms(2);
+            if (n < 0 && would_block() && wait_more())
                 continue;
-            }
             return false;
         }
         buf.append(tmp, (size_t)n);
@@ -189,7 +223,7 @@ bool read_http_request(socket_t c, std::string& method, std::string& path, std::
         if (buf.size() > 8 * 1024 * 1024)
             return false;
     }
-    std::string head = buf.substr(0, header_end);
+    head = buf.substr(0, header_end);
     size_t sp1 = head.find(' ');
     size_t sp2 = sp1 == std::string::npos ? std::string::npos : head.find(' ', sp1 + 1);
     if (sp1 == std::string::npos || sp2 == std::string::npos)
@@ -201,14 +235,14 @@ bool read_http_request(socket_t c, std::string& method, std::string& path, std::
     size_t cl = util::lower(head).find("content-length:");
     if (cl != std::string::npos)
         len = (size_t)strtoull(head.c_str() + cl + 15, nullptr, 10);
+    if (len > 64 * 1024 * 1024)
+        return false;
     body = buf.substr(header_end + 4);
     while (body.size() < len) {
         int n = (int)recv(c, tmp, sizeof(tmp), 0);
         if (n <= 0) {
-            if (n < 0 && would_block()) {
-                os::sleep_ms(2);
+            if (n < 0 && would_block() && wait_more())
                 continue;
-            }
             return false;
         }
         body.append(tmp, (size_t)n);
@@ -233,17 +267,73 @@ void send_all(socket_t c, const std::string& s)
     }
 }
 
-void http_reply(socket_t c, int status, const char* status_text, const std::string& ctype, const std::string& body)
+// cors headers go only to a page served from this machine (allow_origin is its origin)
+void http_reply(socket_t c, int status, const char* status_text, const std::string& ctype, const std::string& body,
+                const std::string& allow_origin = std::string())
 {
     std::string r = util::fmt("HTTP/1.1 %d %s\r\n", status, status_text);
     r += "Content-Type: " + ctype + "\r\n";
     r += util::fmt("Content-Length: %zu\r\n", body.size());
-    r += "Access-Control-Allow-Origin: *\r\n";
-    r += "Access-Control-Allow-Headers: Content-Type, Mcp-Session-Id, Mcp-Protocol-Version\r\n";
-    r += "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n";
+    if (!allow_origin.empty()) {
+        r += "Access-Control-Allow-Origin: " + allow_origin + "\r\n";
+        r += "Access-Control-Allow-Headers: Content-Type, Mcp-Session-Id, Mcp-Protocol-Version\r\n";
+        r += "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n";
+        r += "Vary: Origin\r\n";
+    }
     r += "Connection: close\r\n\r\n";
     r += body;
     send_all(c, r);
+}
+
+// the value of a request header ("" when missing), matched without case
+std::string header_value(const std::string& head, const char* name)
+{
+    std::string want = util::lower(name) + ":";
+    size_t pos = head.find("\r\n");
+    while (pos != std::string::npos) {
+        size_t start = pos + 2;
+        size_t end = head.find("\r\n", start);
+        std::string line = head.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (util::lower(line.substr(0, want.size())) == want)
+            return util::trim(line.substr(want.size()));
+        pos = end;
+    }
+    return std::string();
+}
+
+// a loopback ipv4 literal: four numbers, the first 127 (so "127.example.com" is not one)
+bool is_loopback_ipv4(const std::string& h)
+{
+    std::vector<std::string> parts = util::split(h, ".");
+    if (parts.size() != 4 || std::count(h.begin(), h.end(), '.') != 3)
+        return false;
+    for (const std::string& p : parts)
+        if (p.empty() || p.size() > 3 || p.find_first_not_of("0123456789") != std::string::npos || atoi(p.c_str()) > 255)
+            return false;
+    return parts[0] == "127";
+}
+
+// "127.0.0.1", "localhost" or "::1", with or without a port
+bool is_local_host(std::string host)
+{
+    if (!host.empty() && host[0] == '[') { // [::1]:port
+        size_t end = host.find(']');
+        host = end == std::string::npos ? host : host.substr(1, end - 1);
+    } else if (host.find(':') != std::string::npos && host.find(':') == host.rfind(':')) {
+        host = host.substr(0, host.find(':')); // name:port (a bare ipv6 has more than one ':')
+    }
+    host = util::lower(host);
+    return host == "localhost" || host == "::1" || is_loopback_ipv4(host);
+}
+
+// an Origin header ("http://localhost:3000") that belongs to this machine
+bool is_local_origin(const std::string& origin)
+{
+    size_t scheme = origin.find("://");
+    if (scheme == std::string::npos)
+        return false; // includes "null" (a sandboxed page or a file)
+    std::string rest = origin.substr(scheme + 3);
+    return is_local_host(rest.substr(0, rest.find('/')));
 }
 
 } // namespace
@@ -261,6 +351,7 @@ int mcp_serve_http(mcp_server& server, int port, const std::string& bind_addr, s
         err = "couldn't create a socket";
         return 1;
     }
+    no_inherit(srv);
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
     sockaddr_in addr{};
@@ -278,23 +369,33 @@ int mcp_serve_http(mcp_server& server, int port, const std::string& bind_addr, s
     if (on_listen)
         on_listen(util::fmt("http://%s:%d/mcp", host.c_str(), port));
 
+    bool loopback = is_local_host(host);
     while (!(should_stop && should_stop())) {
-        socket_t c = accept(srv, nullptr, nullptr);
+        socket_t c = accept_client(srv);
         if (c == bad_socket) {
             os::sleep_ms(15);
             continue;
         }
-        std::string method, path, body;
-        if (read_http_request(c, method, path, body)) {
-            if (method == "OPTIONS") {
-                http_reply(c, 204, "No Content", "text/plain", "");
+        set_nonblocking(c);
+        std::string method, path, head, body;
+        if (read_http_request(c, method, path, head, body, should_stop)) {
+            // any web page open in a browser can send requests to a local server too. mcp
+            // clients send no Origin, so refuse pages from other sites; and on loopback refuse
+            // a Host that isn't this machine (a dns rebinding page)
+            std::string origin = header_value(head, "Origin");
+            std::string host_header = header_value(head, "Host");
+            if ((!origin.empty() && !is_local_origin(origin)) ||
+                (loopback && !host_header.empty() && !is_local_host(host_header))) {
+                http_reply(c, 403, "Forbidden", "text/plain", "only clients on this machine may use this server\n");
+            } else if (method == "OPTIONS") {
+                http_reply(c, 204, "No Content", "text/plain", "", origin);
             } else if (method == "GET" && (path == "/health" || path == "/")) {
-                http_reply(c, 200, "OK", "text/plain", "ceasta mcp\n");
+                http_reply(c, 200, "OK", "text/plain", "ceasta mcp\n", origin);
             } else if (method == "POST") {
                 std::string reply = server.handle(body);
-                http_reply(c, 200, "OK", "application/json", reply.empty() ? std::string("{}") : reply);
+                http_reply(c, 200, "OK", "application/json", reply.empty() ? std::string("{}") : reply, origin);
             } else {
-                http_reply(c, 405, "Method Not Allowed", "text/plain", "use POST\n");
+                http_reply(c, 405, "Method Not Allowed", "text/plain", "use POST\n", origin);
             }
         }
         close_socket(c);

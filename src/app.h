@@ -39,7 +39,9 @@ struct load_job {
 enum class center_view { listing, graph, pseudo };
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes };
+    save_changes, ai };
+
+struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
 struct dialog_state {
     dialog_kind kind = dialog_kind::none;
@@ -128,6 +130,12 @@ struct app_state {
     int win_h = 0;
     bool win_max = false;
 
+    // the ai server (ai menu): serves the open file over mcp to a client on this machine
+    std::shared_ptr<app_mcp> mcp;
+    int mcp_port = 8744;
+    bool mcp_allow_debug = false;
+    bool mcp_allow_lua = false;
+
     // unsaved changes: what to do once "save changes?" is answered (close, open, quit)
     std::function<void()> pending_close;
     bool quit_confirmed = false; // the window may close without asking again
@@ -141,6 +149,8 @@ struct app_state {
 void app_init(app_state& s, const platform_api& platform, const std::vector<std::string>& args);
 // before ImGui::NewFrame: applies the font size
 void app_pre_frame(app_state& s);
+// instead of a frame while the window is minimized: keeps the debugger and the ai server going
+void app_background(app_state& s);
 // between ImGui::NewFrame and ImGui::Render
 void app_frame(app_state& s);
 void app_shutdown(app_state& s);
@@ -180,6 +190,16 @@ void dbg_pause(app_state& s);
 void dbg_stop(app_state& s);
 void dbg_detach(app_state& s);
 bool app_to_static(const app_state& s, uint64_t runtime, uint64_t& out);
+
+// the ai server: an mcp client (claude code, cursor, ...) on this machine works on the open file.
+// tool calls run on the ui thread, between frames
+bool app_mcp_start(app_state& s);
+void app_mcp_stop(app_state& s);
+bool app_mcp_running(const app_state& s);    // started and not failed
+std::string app_mcp_url(const app_state& s); // where it listens, "" until then
+std::string app_mcp_error(const app_state& s);
+int app_mcp_calls(const app_state& s);
+void app_mcp_pump(app_state& s);             // every frame: runs the tool calls that are waiting
 uint64_t app_to_runtime(const app_state& s, uint64_t addr);
 // static address of the debuggee's pc, when it's inside the loaded image
 bool app_pc_static(const app_state& s, uint64_t& out);

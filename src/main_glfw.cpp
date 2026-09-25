@@ -149,12 +149,9 @@ int main(int argc, char** argv)
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
-        // while minimized, don't render, but keep the debugger moving
+        // while minimized, don't render, but keep the debugger (and the ai server) going
         if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
-            if (state.dbg.state() == dbg_state::running)
-                state.dbg.poll(10);
-            else
-                os::sleep_ms(10);
+            app_background(state);
             continue;
         }
 

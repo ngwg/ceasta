@@ -1,5 +1,6 @@
 #pragma once
 #include "core/json.h"
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -48,6 +49,9 @@ public:
     std::function<void(const std::function<void()>&)> on_owner;
     std::function<void(const std::string&)> on_activity; // a line per tool call, for a log
     std::function<void()> on_changed;                    // names, comments or breakpoints changed
+    // set while the host shuts the server down: owner-thread work is skipped and waits end, so
+    // a request in flight finishes quickly (with an error)
+    std::atomic<bool> stopping{false};
 
     // one json-rpc message (or a batch) in, the reply out; "" when nothing goes back
     std::string handle(const std::string& message);

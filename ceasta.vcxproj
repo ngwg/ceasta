@@ -53,6 +53,7 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\app.cpp" />
+    <ClCompile Include="src\app_mcp.cpp" />
     <ClCompile Include="src\ui\bottom_panel.cpp" />
     <ClCompile Include="src\ui\cpu_panel.cpp" />
     <ClCompile Include="src\ui\dialogs.cpp" />

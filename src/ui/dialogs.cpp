@@ -24,6 +24,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::about: return "About ceasta###dlg";
     case dialog_kind::shortcuts: return "Keyboard shortcuts###dlg";
     case dialog_kind::save_changes: return "Save changes?###dlg";
+    case dialog_kind::ai: return "Connect an AI###dlg";
     default: return "###dlg";
     }
 }
@@ -488,6 +489,77 @@ static void save_changes(app_state& s, dialog_state& d)
     }
 }
 
+// a line of text the user copies: shown in a read-only box, with a copy button
+static void copy_line(const char* id, const std::string& text)
+{
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", text.c_str());
+    ImGui::PushID(id);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 36);
+    ImGui::InputText("##text", buf, sizeof(buf), ImGuiInputTextFlags_ReadOnly);
+    ImGui::SameLine();
+    if (ImGui::Button("Copy"))
+        ImGui::SetClipboardText(text.c_str());
+    ImGui::PopID();
+}
+
+// the ai server: start / stop it, what the ai may do, and how to connect a client
+static void ai(app_state& s, dialog_state&)
+{
+    float wrap = ImGui::GetFontSize() * 42;
+    ImGui::PushTextWrapPos(wrap);
+    ImGui::TextUnformatted("Let an AI client (Claude Code, Cursor, ...) work on the file you have open: it can read, "
+                           "decompile, search, rename and comment - and, if you allow it, run the program under the "
+                           "debugger. You see everything it does here.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+
+    bool running = app_mcp_running(s);
+    std::string url = app_mcp_url(s), err = app_mcp_error(s);
+    if (ImGui::Button(running ? "Stop the server" : "Start the server", ImVec2(ImGui::GetFontSize() * 9, 0))) {
+        if (running)
+            app_mcp_stop(s);
+        else
+            app_mcp_start(s);
+    }
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    if (running && !url.empty())
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "listening on %s  (%d calls)", url.c_str(), app_mcp_calls(s));
+    else if (running)
+        ImGui::TextDisabled("starting...");
+    else if (!err.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", err.c_str());
+    else
+        ImGui::TextDisabled("not running");
+
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+    if (ImGui::InputInt("port", &s.mcp_port, 0, 0))
+        s.mcp_port = std::min(65535, std::max(1024, s.mcp_port));
+    ImGui::BeginDisabled(!debugger::supported() || s.sandboxed);
+    ImGui::Checkbox("let it use the debugger (the program runs on this computer)", &s.mcp_allow_debug);
+    ImGui::EndDisabled();
+    ImGui::Checkbox("let it run Lua (any code, with file and shell access)", &s.mcp_allow_lua);
+    ImGui::EndDisabled();
+    if (running)
+        ImGui::TextDisabled("stop the server to change these");
+
+    ImGui::Separator();
+    std::string u = url.empty() ? util::fmt("http://127.0.0.1:%d/mcp", s.mcp_port) : url;
+    ImGui::TextUnformatted("Claude Code - run this once:");
+    copy_line("cc", "claude mcp add --transport http ceasta " + u);
+    ImGui::TextUnformatted("Cursor, VS Code and other clients - add an MCP server with this URL:");
+    copy_line("url", u);
+    ImGui::PushTextWrapPos(wrap);
+    ImGui::TextDisabled("Only programs on this computer can connect. Renames and comments from the AI wait for your "
+                        "save, like your own. The server stops when you close ceasta.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+        ImGui::CloseCurrentPopup();
+}
+
 static void shortcuts(app_state&, dialog_state&)
 {
     static const char* const keys[][2] = {
@@ -563,6 +635,7 @@ void draw(app_state& s)
         case dialog_kind::about: about(s, d); break;
         case dialog_kind::shortcuts: shortcuts(s, d); break;
         case dialog_kind::save_changes: save_changes(s, d); break;
+        case dialog_kind::ai: ai(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

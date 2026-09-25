@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/user.h>
@@ -549,19 +550,31 @@ bool debugger::start(const std::string& exe, const std::string& args, const std:
         if (!a.empty())
             argv.push_back(a);
 
+    // everything the child needs is prepared before fork: another thread may hold a lock
+    std::vector<char*> cargv;
+    for (auto& s : argv)
+        cargv.push_back(const_cast<char*>(s.c_str()));
+    cargv.push_back(nullptr);
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0 || max_fd > 65536)
+        max_fd = 65536;
+
     pid_t child = fork();
     if (child < 0) {
         err = "fork failed: " + errno_str(errno);
         return false;
     }
     if (child == 0) {
+        // the program gets stdin / stdout / stderr, not ceasta's other files and sockets (an
+        // inherited socket of the ai server would keep its connections open)
+#ifdef SYS_close_range
+        if (syscall(SYS_close_range, 3u, ~0u, 0u) != 0)
+#endif
+            for (long fd = 3; fd < max_fd; fd++)
+                close((int)fd);
         ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
         if (!cwd.empty() && chdir(cwd.c_str()) != 0)
             _exit(127);
-        std::vector<char*> cargv;
-        for (auto& s : argv)
-            cargv.push_back(const_cast<char*>(s.c_str()));
-        cargv.push_back(nullptr);
         execv(exe.c_str(), cargv.data());
         _exit(127); // execv failed
     }

@@ -60,6 +60,12 @@ static void load_settings(app_state& s)
             s.debug_args = v;
         else if (k == "step_count")
             s.step_count = std::min(100000, std::max(1, atoi(v.c_str())));
+        else if (k == "mcp_port")
+            s.mcp_port = std::min(65535, std::max(1024, atoi(v.c_str())));
+        else if (k == "mcp_allow_debug")
+            s.mcp_allow_debug = v == "1";
+        else if (k == "mcp_allow_lua")
+            s.mcp_allow_lua = v == "1";
         else if (k == "win_w")
             s.win_w = atoi(v.c_str());
         else if (k == "win_h")
@@ -84,6 +90,7 @@ static void save_settings(app_state& s)
     o += std::string("theme=") + tname + "\n";
     o += "debug_args=" + s.debug_args + "\n";
     o += util::fmt("step_count=%d\n", s.step_count);
+    o += util::fmt("mcp_port=%d\nmcp_allow_debug=%d\nmcp_allow_lua=%d\n", s.mcp_port, s.mcp_allow_debug, s.mcp_allow_lua);
     for (const std::string& r : s.recent)
         o += "recent=" + r + "\n";
     std::string err;
@@ -731,8 +738,20 @@ void app_pre_frame(app_state& s)
     ImGui::GetStyle().FontSizeBase = s.font_size;
 }
 
+void app_background(app_state& s)
+{
+    app_mcp_pump(s);
+    if (dbg_stepping(s))
+        run_steps(s);
+    if (s.dbg.state() == dbg_state::running)
+        s.dbg.poll(10);
+    else
+        os::sleep_ms(10);
+}
+
 void app_shutdown(app_state& s)
 {
+    app_mcp_stop(s);
     if (s.job) {
         s.job->progress.cancel.store(true);
         s.job->worker.join();
@@ -821,6 +840,7 @@ static void shortcuts(app_state& s)
 void app_frame(app_state& s)
 {
     finish_job(s);
+    app_mcp_pump(s);
     if ((s.db && s.db->dirty) != s.title_dirty)
         set_title(s);
     if (dbg_stepping(s))

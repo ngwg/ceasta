@@ -153,12 +153,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int)
         if (done)
             break;
 
-        // keep the debugger pumping while the window is minimized / hidden
+        // keep the debugger (and the ai server) going while the window is minimized / hidden
         if (g_occluded && g_swapchain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
-            if (state.dbg.state() == dbg_state::running)
-                state.dbg.poll(10);
-            else
-                ::Sleep(10);
+            app_background(state);
             continue;
         }
         g_occluded = false;

@@ -154,6 +154,31 @@ static void debug_menu(app_state& s)
     ImGui::EndMenu();
 }
 
+static void ai_menu(app_state& s)
+{
+    if (!ImGui::BeginMenu("AI"))
+        return;
+    bool running = app_mcp_running(s);
+    if (ImGui::MenuItem("Connect an AI..."))
+        dialogs::open(s, dialog_kind::ai, 0);
+    if (ImGui::MenuItem(running ? "Stop the AI server" : "Start the AI server")) {
+        if (running)
+            app_mcp_stop(s);
+        else
+            app_mcp_start(s);
+    }
+    ImGui::SetItemTooltip("serves the open file over MCP to an AI client on this computer");
+    if (ImGui::MenuItem("Copy the Claude Code command"))
+        ImGui::SetClipboardText(util::fmt("claude mcp add --transport http ceasta http://127.0.0.1:%d/mcp", s.mcp_port).c_str());
+    ImGui::Separator();
+    ImGui::MenuItem("Let it use the debugger", nullptr, &s.mcp_allow_debug, !running && debugger::supported());
+    ImGui::SetItemTooltip("start, step and inspect the program (it runs on this computer)%s",
+        running ? "\nstop the server to change this" : "");
+    ImGui::MenuItem("Let it run Lua", nullptr, &s.mcp_allow_lua, !running);
+    ImGui::SetItemTooltip("any code, with file and shell access%s", running ? "\nstop the server to change this" : "");
+    ImGui::EndMenu();
+}
+
 static void plugins_menu(app_state& s)
 {
     if (!ImGui::BeginMenu("Plugins"))
@@ -275,6 +300,7 @@ void draw(app_state& s)
         jump_menu(s);
         view_menu(s);
         debug_menu(s);
+        ai_menu(s);
         plugins_menu(s);
         help_menu(s);
         ImGui::EndMenuBar();

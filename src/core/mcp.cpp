@@ -1378,6 +1378,8 @@ std::vector<const mcp_server::tool*> mcp_server::tools() const
 
 void mcp_server::run(const std::function<void()>& fn)
 {
+    if (stopping)
+        return;
     if (on_owner)
         on_owner(fn);
     else
@@ -1397,7 +1399,7 @@ bool mcp_server::wait_stop(int timeout_ms)
         });
         if (done)
             return true;
-        if (os::now_ms() >= until)
+        if (os::now_ms() >= until || stopping)
             return false;
         os::sleep_ms(10);
     }

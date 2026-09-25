@@ -105,6 +105,7 @@ ceasta_warnings(ceasta_core)
 
 set(ui_sources
     src/app.cpp
+    src/app_mcp.cpp
     src/ui/bottom_panel.cpp
     src/ui/cpu_panel.cpp
     src/ui/dialogs.cpp
