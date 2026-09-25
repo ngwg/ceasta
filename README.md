@@ -131,7 +131,7 @@ ceasta-cli graph file.exe start     basic blocks of a function
 ceasta-cli decompile file.exe main  pseudocode for a function
 ceasta-cli xrefs file.exe CreateFileW
 ceasta-cli find file.exe "48 8b ?? 05"
-ceasta-cli search file.exe usage      find text in names, imports, strings, comments
+ceasta-cli search file.exe usage    find text in names, imports, strings, comments
 ceasta-cli run file.exe script.lua  run a plugin / script
 ceasta-cli dbg ./program [args]     interactive debugger (linux + windows)
 ceasta-cli diff old.exe new.exe     match functions, show what changed

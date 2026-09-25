@@ -551,26 +551,26 @@ static std::string pc_where(const app_state& s)
 }
 
 // one line for a whole multi-step, instead of one per instruction
-static void steps_finished(app_state& s, int wanted)
+static void steps_finished(app_state& s)
 {
-    int done = s.steps_done;
-    const char* what = s.step_over_mode ? "stepped over" : "stepped into";
+    int done = s.steps_done, wanted = s.steps_wanted;
+    std::string why = s.dbg.stop_reason();
     if (s.dbg.state() != dbg_state::stopped)
         app_log(s, util::fmt("[debug] the program ended after %d of %d steps", done, wanted));
-    else if (done < wanted)
-        app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, s.dbg.stop_reason().c_str(),
-            pc_where(s).c_str()));
+    else if (why != "step" && why != "step over") // a breakpoint, a fault, a pause
+        app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, why.c_str(), pc_where(s).c_str()));
     else
-        app_log(s, util::fmt("[debug] %s %d instructions, now at %s", what, done, pc_where(s).c_str()));
+        app_log(s, util::fmt("[debug] %s %d instructions, now at %s", s.step_over_mode ? "stepped over" : "stepped into", done,
+            pc_where(s).c_str()));
 }
 
 // runs the steps of a multi-step for about 10 ms per frame, so thousands of them don't freeze
 // the window. a breakpoint, a fault or the exit ends it early.
 static void run_steps(app_state& s)
 {
-    int wanted = s.steps_done + s.steps_left + (s.step_in_flight ? 1 : 0);
     uint64_t until = os::now_ms() + 10;
-    uint64_t step_began = os::now_ms();
+    // a step still under way from the last frame is a long one: no quick re-checks for it
+    uint64_t step_began = s.step_in_flight ? 0 : os::now_ms();
     for (;;) {
         if (s.dbg.state() == dbg_state::running) {
             // a single step lands within microseconds: check again right away at first, and
@@ -607,7 +607,7 @@ static void run_steps(app_state& s)
         step_began = os::now_ms();
     }
     s.steps_left = 0;
-    steps_finished(s, wanted);
+    steps_finished(s);
 }
 
 static void begin_steps(app_state& s, bool over)
@@ -622,7 +622,7 @@ static void begin_steps(app_state& s, bool over)
         dbg_do(s, over ? &debugger::step_over : &debugger::step_into);
         return;
     }
-    s.steps_left = s.step_count;
+    s.steps_left = s.steps_wanted = s.step_count;
     s.steps_done = 0;
     s.step_over_mode = over;
     s.step_in_flight = false;

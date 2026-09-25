@@ -115,6 +115,7 @@ struct app_state {
     int step_count = 1;        // instructions per step: f7 / f8 and the step buttons use it
     int steps_left = 0;        // a multi-instruction step in progress (run a batch per frame)
     int steps_done = 0;
+    int steps_wanted = 0;
     bool step_over_mode = false;
     bool step_in_flight = false;
     bool dbg_mapped = false;   // runtime addresses of the main image map onto the listing
