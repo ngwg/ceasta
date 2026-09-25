@@ -1,5 +1,32 @@
 # changelog
 
+## v0.12.0 - 2026-09-25
+
+- **macos**: `ceasta-x.y.z-macos.dmg` (the app) and `ceasta-cli-x.y.z-macos.tar.gz`, one build
+  for apple silicon and intel, macos 11 or newer. the app uses the system's open / save panels
+  and cmd for the shortcuts; plugins you add go in `~/Library/Application Support/ceasta`.
+  signed ad-hoc, not notarized: the first launch needs right-click > open (or open anyway in
+  privacy & security). no debugger on macos yet
+- **mach-o files**, on every system: macos / ios programs, libraries, bundles and object
+  files, x86_64 and arm64 (arm64e too), and universal files (`--arch x64|arm64`, the palette's
+  "part" actions, and a `.ceasta` file remembers which part). imports come from dyld's bind
+  info or chained fixups (the pointers are decoded, so data reads right), stubs call imports by
+  name, exports from the export trie, exact function starts, and c++ / rust landing pads stay
+  inside their function. names lose mach-o's leading underscore (`printf`, not `_printf`), so
+  prototypes and calls that don't return are known
+- **file info for mach-o**: minimum os and sdk, uuid, libraries and rpaths, pie / nx / canary /
+  fortify / pac, the code signature (signer and team, ad-hoc, hardened runtime, library
+  validation) and the entitlements, with warnings for the ones that let code in
+  (get-task-allow, disable-library-validation, dyld environment variables, jit), fairplay
+  encryption, upx and overlays
+- kuna reads mach-o files too (a universal file's part is handed over on its own)
+- analysis: in a file that lists every function start, code found by heuristics (a switch
+  nobody resolved, a pointer into the middle) stays in the function around it; an
+  instruction decoded past a call that doesn't return can't swallow the next function
+- fixes: "open my plugins folder" works on linux too; a client hanging up on the http mcp
+  server can't end ceasta with SIGPIPE; a kuna run finished while debugging on linux doesn't
+  wait out its time limit
+
 ## v0.11.0 - 2026-09-25
 
 - **arm64**: pe (windows on arm) and elf (linux) arm64 programs open next to x86 / x64 ones -

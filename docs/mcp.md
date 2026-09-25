@@ -10,6 +10,7 @@ ceasta-cli mcp <file>                 # talk over stdin/stdout (what the clients
 ceasta-cli mcp <file> --http 8744     # or a localhost http server
 ceasta-cli mcp <file> --allow-debug   # also expose the tools that run the program
 ceasta-cli mcp <file> --allow-lua     # also expose run_lua (runs arbitrary lua)
+ceasta-cli mcp <file> --arch arm64    # a universal mac file: its arm64 part (default x86_64)
 ```
 
 ## from the app

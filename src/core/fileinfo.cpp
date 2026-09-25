@@ -2,6 +2,7 @@
 #include "core/util.h"
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -850,7 +851,7 @@ void macho_signature(const binary& b, uint64_t off, uint64_t size, file_info& ou
             }
         } else if (type == 5 && magic == 0xfade7171) {
             // entitlements, an xml plist: the keys that aren't <false/>
-            std::string x(f.begin() + (ptrdiff_t)blob + 8, f.begin() + (ptrdiff_t)(blob + len));
+            std::string x(f.begin() + (std::ptrdiff_t)blob + 8, f.begin() + (std::ptrdiff_t)(blob + len));
             size_t at = 0;
             while ((at = x.find("<key>", at)) != std::string::npos && ents.size() < 64) {
                 size_t e = x.find("</key>", at);
@@ -870,8 +871,8 @@ void macho_signature(const binary& b, uint64_t off, uint64_t size, file_info& ou
                 "Software Signing"};
             for (const char* w : who) {
                 size_t wl = strlen(w);
-                auto it = std::search(f.begin() + (ptrdiff_t)blob, f.begin() + (ptrdiff_t)(blob + len), w, w + wl);
-                if (it == f.begin() + (ptrdiff_t)(blob + len))
+                auto it = std::search(f.begin() + (std::ptrdiff_t)blob, f.begin() + (std::ptrdiff_t)(blob + len), w, w + wl);
+                if (it == f.begin() + (std::ptrdiff_t)(blob + len))
                     continue;
                 // a der string: its tag and length come just before the text
                 size_t at = (size_t)(it - f.begin()), n = 0;
@@ -879,7 +880,7 @@ void macho_signature(const binary& b, uint64_t off, uint64_t size, file_info& ou
                 if ((tag == 0x0c || tag == 0x13 || tag == 0x14 || tag == 0x16) && dl >= wl && dl < 0x80)
                     n = dl;
                 std::string name;
-                for (; it != f.begin() + (ptrdiff_t)(blob + len) && *it >= 0x20 && *it < 0x7f && name.size() < (n ? n : 128); ++it)
+                for (; it != f.begin() + (std::ptrdiff_t)(blob + len) && *it >= 0x20 && *it < 0x7f && name.size() < (n ? n : 128); ++it)
                     name += (char)*it;
                 signer = name == "Software Signing" ? "apple" : name;
                 break;
@@ -920,13 +921,20 @@ void inspect_macho(const binary& b, file_info& out)
                      : type == 1 ? "object file" : type == 0xb ? "kernel extension" : type == 7 ? "dynamic linker"
                      : type == 4 ? "core dump" : "file";
     std::string fmt = std::string("Mach-O 64-bit ") + kind;
-    if (!b.slices.empty()) {
+    if (b.slice_size) {
+        // the parts, by apple's names (x86_64, arm64, arm64e), from the universal header
         std::string all;
-        // apple's names: x86_64, arm64
-        auto mac_name = [](bin_arch a) { return a == bin_arch::x64 ? "x86_64" : arch_name(a); };
-        for (bin_arch a : b.slices)
-            all += std::string(all.empty() ? "" : ", ") + mac_name(a);
-        fmt += " - universal (" + all + "), this is its " + mac_name(b.arch) + " part";
+        uint32_t n = rd_be32(f, 4);
+        bool wide = rd_be32(f, 0) == 0xcafebabf;
+        for (uint32_t i = 0; i < n && i < 30; i++) {
+            uint64_t e = 8 + i * (wide ? 32ull : 20ull);
+            uint32_t c = rd_be32(f, e), st = rd_be32(f, e + 4) & 0xffffff;
+            const char* nm = c == 0x01000007 ? "x86_64" : c == 0x0100000c ? (st == 2 ? "arm64e" : "arm64") : c == 7 ? "i386"
+                           : c == 12 ? "arm" : "other";
+            all += std::string(all.empty() ? "" : ", ") + nm;
+        }
+        bool e = cpu == 0x0100000c && sub == 2;
+        fmt += " - universal (" + all + "), this is its " + (cpu == 0x01000007 ? "x86_64" : e ? "arm64e" : "arm64") + " part";
     }
     out.header.push_back({"format", fmt});
     bool arm64e = cpu == 0x0100000c && sub == 2;
@@ -1042,12 +1050,7 @@ void inspect_macho(const binary& b, file_info& out)
             crypt_size = r.u32(off + 12);
             cryptid = r.u32(off + 16);
             break;
-        case 0x2: // symtab: any local names left?
-            symbols = r.u32(off + 12) > 0;
-            break;
-        case 0xb: // dysymtab: local symbols
-            symbols = r.u32(off + 12) > 0;
-            break;
+
         default:
             break;
         }
@@ -1110,7 +1113,13 @@ void inspect_macho(const binary& b, file_info& out)
         sec += ", encrypted";
     if (type != 1) // an object file isn't run, none of it applies
         out.header.push_back({"security", sec});
-    out.header.push_back({"symbols", symbols ? "yes (not stripped)" : "stripped"});
+    // stripped: no function names beyond what's exported
+    size_t named = 0;
+    for (const symbol_entry& y : b.symbols)
+        if (y.func && std::none_of(b.exports.begin(), b.exports.end(), [&](const export_entry& x) { return x.addr == y.addr; }))
+            named++;
+    symbols = named > 0;
+    out.header.push_back({"symbols", symbols ? util::fmt("yes, %zu function names (not stripped)", named) : std::string("stripped")});
     if (!ents.empty()) {
         std::string e;
         for (const std::string& k : ents)

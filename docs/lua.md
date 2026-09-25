@@ -84,7 +84,7 @@ addresses; while debugging, translate with `ceasta.dbg.to_static` /
 
 ```lua
 { path, name, format, arch, kind, base, entry, has_entry, bits }
--- format: "pe" | "elf" | "raw"   arch: "x86" | "x64" | "arm64"   bits: 32 | 64
+-- format: "pe" | "elf" | "mach-o" | "raw"   arch: "x86" | "x64" | "arm64"   bits: 32 | 64
 -- kind: "exe (console)", "dll", "elf pie", ...
 ```
 

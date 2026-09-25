@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 # macos: runs on 11 (big sur, the first for apple silicon) and later. set before project()
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "the oldest macos ceasta runs on")
-project(ceasta VERSION 0.11.0 LANGUAGES C CXX)
+project(ceasta VERSION 0.12.0 LANGUAGES C CXX)
 
 # ceasta: disassembler + debugger.
 #   core (loaders, analysis, lua, debugger) builds everywhere. the gui: windows / directx 11,

@@ -167,7 +167,9 @@ int main(int argc, char** argv)
 
     GLFWwindow* window = glfwCreateWindow(1280, 800, "ceasta", nullptr, nullptr);
     if (!window) {
-        std::fprintf(stderr, "couldn't create a window\n");
+        // the usual reason: no opengl 3 with hardware behind it (a virtual machine without 3d)
+        std::fprintf(stderr, "couldn't create a window: no opengl 3 here (no graphics driver, or a virtual machine "
+                             "without 3d acceleration). ceasta-cli works without one\n");
         glfwTerminate();
         return 1;
     }

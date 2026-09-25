@@ -209,6 +209,11 @@ jobs:
           if kill -0 $pid 2>/dev/null; then
             echo "the app ran until it was stopped"
             kill $pid
+          elif grep -q "suitable pixel format" app.log; then
+            # github's mac runners are virtual machines without a gpu: macos gives them no
+            # accelerated opengl, so the window can't open here (it does on a mac)
+            cat app.log
+            echo "::warning::no accelerated opengl on this runner, the app's window wasn't tried"
           else
             cat app.log
             exit 1

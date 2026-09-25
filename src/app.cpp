@@ -246,7 +246,7 @@ static void finish_job(app_state& s)
     for (const std::string& n : b.notes)
         app_log(s, n, 1);
     if (b.slices.size() > 1)
-        app_log(s, "the other part of this universal file: ctrl+shift+p, \"part\"", 1);
+        app_log(s, theme::keys("the other part of this universal file: ctrl+shift+p, \"part\""), 1);
     for (const std::string& w : s.db->info.warnings) // packed, an embedded program, an overlay, ...
         app_log(s, "note: " + w, 1);
     app_log(s, util::fmt("%s: %s %s %s, %zu functions, %zu imports, %zu strings", b.name.c_str(), format_name(b.format),
