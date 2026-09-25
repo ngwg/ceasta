@@ -1,4 +1,5 @@
 #include "ui/top_bar.h"
+#include "theme.h"
 #include "core/os.h"
 #include "core/util.h"
 #include "imgui.h"
@@ -11,7 +12,7 @@ static void file_menu(app_state& s)
 {
     if (!ImGui::BeginMenu("File"))
         return;
-    if (ImGui::MenuItem("Open...", "Ctrl+O", false, !app_loading(s)))
+    if (ImGui::MenuItem("Open...", theme::keys("Ctrl+O"), false, !app_loading(s)))
         app_open_dialog(s);
     if (ImGui::MenuItem("Open as raw code...", nullptr, false, !app_loading(s)))
         dialogs::open(s, dialog_kind::open_raw, 0);
@@ -25,10 +26,10 @@ static void file_menu(app_state& s)
             app_open(s, pick);
     }
     ImGui::Separator();
-    if (ImGui::MenuItem("Save", "Ctrl+S", false, s.db && (s.db->dirty || s.db->project_file.empty())))
+    if (ImGui::MenuItem("Save", theme::keys("Ctrl+S"), false, s.db && (s.db->dirty || s.db->project_file.empty())))
         app_save(s);
     ImGui::SetItemTooltip("one .ceasta file with the program and all your work - open it later or on another pc");
-    if (ImGui::MenuItem("Save as...", "Ctrl+Shift+S", false, s.db && s.platform.save_file_dialog))
+    if (ImGui::MenuItem("Save as...", theme::keys("Ctrl+Shift+S"), false, s.db && s.platform.save_file_dialog))
         app_save_as(s);
     if (ImGui::MenuItem("Close file", nullptr, false, s.db != nullptr))
         app_close_file(s);
@@ -47,7 +48,7 @@ static void file_menu(app_state& s)
         app_import_names(s);
     ImGui::SetItemTooltip("an x64dbg database, a .map file, or the .json of scripts/ida_to_ceasta.py or ghidra_to_ceasta.py");
     ImGui::Separator();
-    if (ImGui::MenuItem("Exit", "Alt+F4"))
+    if (ImGui::MenuItem("Exit", theme::keys("Alt+F4")))
         app_quit(s);
     ImGui::EndMenu();
 }
@@ -57,9 +58,9 @@ static void edit_menu(app_state& s)
     if (!ImGui::BeginMenu("Edit"))
         return;
     bool has = s.db != nullptr;
-    if (ImGui::MenuItem("Undo", "Ctrl+Z", false, has && s.db->can_undo()))
+    if (ImGui::MenuItem("Undo", theme::keys("Ctrl+Z"), false, has && s.db->can_undo()))
         app_undo(s);
-    if (ImGui::MenuItem("Redo", "Ctrl+Y", false, has && s.db->can_redo()))
+    if (ImGui::MenuItem("Redo", theme::keys("Ctrl+Y"), false, has && s.db->can_redo()))
         app_redo(s);
     ImGui::Separator();
     if (ImGui::MenuItem("Rename...", "N", false, has))
@@ -67,7 +68,7 @@ static void edit_menu(app_state& s)
     if (ImGui::MenuItem("Comment...", ";", false, has))
         dialogs::open(s, dialog_kind::comment, s.cursor);
     ImGui::Separator();
-    if (ImGui::MenuItem("Search...", "Ctrl+F", false, has))
+    if (ImGui::MenuItem("Search...", theme::keys("Ctrl+F"), false, has))
         dialogs::open(s, dialog_kind::find, s.cursor);
     if (ImGui::MenuItem("Search bytes...", "Alt+B", false, has))
         dialogs::open(s, dialog_kind::search, s.cursor);
@@ -76,7 +77,7 @@ static void edit_menu(app_state& s)
     ImGui::Separator();
     if (ImGui::MenuItem("Bookmark this line", "Alt+M", false, has))
         app_toggle_bookmark(s, s.cursor);
-    if (ImGui::MenuItem("Bookmarks...", "Ctrl+M", false, has))
+    if (ImGui::MenuItem("Bookmarks...", theme::keys("Ctrl+M"), false, has))
         dialogs::open(s, dialog_kind::bookmarks, s.cursor);
     ImGui::EndMenu();
 }
@@ -92,7 +93,7 @@ static void jump_menu(app_state& s)
         app_follow(s, s.cursor);
     if (ImGui::MenuItem("Back", "Esc", false, !s.back.empty()))
         app_back(s);
-    if (ImGui::MenuItem("Forward", "Ctrl+Enter", false, !s.forward.empty()))
+    if (ImGui::MenuItem("Forward", theme::keys("Ctrl+Enter"), false, !s.forward.empty()))
         app_forward(s);
     ImGui::Separator();
     if (ImGui::MenuItem("Entry point", nullptr, false, has && s.db->bin.has_entry))
@@ -131,11 +132,11 @@ static void view_menu(app_state& s)
             app_set_theme(s, theme::ui_theme::contrast);
         ImGui::EndMenu();
     }
-    if (ImGui::MenuItem("Bigger text", "Ctrl+="))
+    if (ImGui::MenuItem("Bigger text", theme::keys("Ctrl+=")))
         app_set_font_size(s, s.font_size + 1);
-    if (ImGui::MenuItem("Smaller text", "Ctrl+-"))
+    if (ImGui::MenuItem("Smaller text", theme::keys("Ctrl+-")))
         app_set_font_size(s, s.font_size - 1);
-    if (ImGui::MenuItem("Reset text size", "Ctrl+0"))
+    if (ImGui::MenuItem("Reset text size", theme::keys("Ctrl+0")))
         app_set_font_size(s, 15);
     ImGui::EndMenu();
 }
@@ -158,7 +159,7 @@ static void debug_menu(app_state& s)
         dbg_step_into(s);
     if (ImGui::MenuItem(("Step over" + times).c_str(), "F8", false, can_step))
         dbg_step_over(s);
-    if (ImGui::MenuItem("Step out (run until return)", "Ctrl+F9", false, can_step))
+    if (ImGui::MenuItem("Step out (run until return)", theme::keys("Ctrl+F9"), false, can_step))
         dbg_step_out(s);
     if (ImGui::MenuItem(("Step back" + times).c_str(), "Shift+F7", false, can_step && s.dbg.steps_recorded()))
         dbg_step_back(s);
@@ -170,7 +171,7 @@ static void debug_menu(app_state& s)
         dbg_run_to_cursor(s);
     if (ImGui::MenuItem("Pause", "F12", false, st == dbg_state::running))
         dbg_pause(s);
-    if (ImGui::MenuItem("Stop (kill process)", "Ctrl+F2", false, st != dbg_state::none))
+    if (ImGui::MenuItem("Stop (kill process)", theme::keys("Ctrl+F2"), false, st != dbg_state::none))
         dbg_stop(s);
     if (ImGui::MenuItem("Detach", nullptr, false, st != dbg_state::none))
         dbg_detach(s);
@@ -253,7 +254,7 @@ static void help_menu(app_state& s)
 {
     if (!ImGui::BeginMenu("Help"))
         return;
-    if (ImGui::MenuItem("All actions...", "Ctrl+Shift+P"))
+    if (ImGui::MenuItem("All actions...", theme::keys("Ctrl+Shift+P")))
         dialogs::open(s, dialog_kind::palette, s.cursor);
     if (ImGui::MenuItem("Keyboard shortcuts", "F1"))
         dialogs::open(s, dialog_kind::shortcuts, 0);
@@ -285,7 +286,8 @@ static void search_field(app_state& s, float width)
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(4);
     ImGui::EndDisabled();
-    ImGui::SetItemTooltip("functions, names, imports, strings, comments or an address (Ctrl+F)\nevery action: Ctrl+Shift+P");
+    ImGui::SetItemTooltip("%s", theme::keys("functions, names, imports, strings, comments or an address (Ctrl+F)\n"
+                                            "every action: Ctrl+Shift+P"));
     if (clicked)
         dialogs::open(s, dialog_kind::find, s.cursor);
 }
@@ -320,7 +322,7 @@ static void debug_buttons(app_state& s)
         s.step_count = std::min(100000, std::max(1, s.step_count));
     ImGui::SetItemTooltip("instructions per step: F7 / F8 run this many at once");
     ImGui::SameLine();
-    if (tool("Step out", "run until this function returns (Ctrl+F9)", stopped))
+    if (tool("Step out", theme::keys("run until this function returns (Ctrl+F9)"), stopped))
         dbg_step_out(s);
     ImGui::SameLine();
     size_t back = s.dbg.steps_recorded();
@@ -332,7 +334,7 @@ static void debug_buttons(app_state& s)
     if (tool("Pause", "break into the running program (F12)", ds == dbg_state::running || dbg_stepping(s)))
         dbg_pause(s);
     ImGui::SameLine();
-    if (tool("Stop", "end the debugged program (Ctrl+F2)", true))
+    if (tool("Stop", theme::keys("end the debugged program (Ctrl+F2)"), true))
         dbg_stop(s);
 }
 
@@ -340,13 +342,13 @@ static void toolbar(app_state& s)
 {
     ImGuiStyle& st = ImGui::GetStyle();
     ImGui::SetCursorPos(ImVec2(st.ItemSpacing.x, ImGui::GetCursorPosY() + st.ItemSpacing.y));
-    if (tool("Open", "open a file or a .ceasta database (Ctrl+O)", !app_loading(s)))
+    if (tool("Open", theme::keys("open a file or a .ceasta database (Ctrl+O)"), !app_loading(s)))
         app_open_dialog(s);
     ImGui::SameLine();
     if (tool("<", "back (Esc, mouse back)", !s.back.empty()))
         app_back(s);
     ImGui::SameLine(0, 2);
-    if (tool(">", "forward (Ctrl+Enter, mouse forward)", !s.forward.empty()))
+    if (tool(">", theme::keys("forward (Ctrl+Enter, mouse forward)"), !s.forward.empty()))
         app_forward(s);
     ImGui::SameLine();
     search_field(s, ImGui::GetFontSize() * 18);

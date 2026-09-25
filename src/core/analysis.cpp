@@ -165,6 +165,9 @@ struct worker {
     // starts that only come from heuristics (pointer scans, prologues, gap sweep). a switch
     // that jumps there proves it's a case label, so these get demoted again
     std::unordered_set<uint64_t> weak_starts;
+    // code heuristics found in a file that lists every function start: it joins the function
+    // it's in rather than starting one
+    std::vector<uint64_t> orphans;
     std::vector<uint64_t> work;
     std::vector<uint64_t> deferred;               // code pointers seen in operands
     std::vector<xref> xrefs;
@@ -235,6 +238,13 @@ struct worker {
     {
         if (!code_at(a) || (arm && (a & 3)))
             return;
+        if (weak && b.starts_complete && !func_starts.count(a)) {
+            if (!(an.flags_at(a) & fl_code)) {
+                push_code(a);
+                orphans.push_back(a);
+            }
+            return;
+        }
         if (func_starts.insert(a).second) {
             work.push_back(a);
             if (weak)
@@ -274,8 +284,8 @@ struct worker {
     bool got_value(uint64_t slot, uint64_t& v) const
     {
         const segment* s = b.seg_at(slot);
-        return s && s->name.compare(0, 4, ".got") == 0 && !an.slot_import.count(slot) && b.read_ptr(slot, v) &&
-               v && b.is_mapped(v);
+        bool got = s && (s->name.compare(0, 4, ".got") == 0 || s->name == "__got" || s->name == "__auth_got");
+        return got && !an.slot_import.count(slot) && b.read_ptr(slot, v) && v && b.is_mapped(v);
     }
 
     // runs one instruction over the register state. what it uses (an add of a known page, a load
@@ -839,8 +849,9 @@ struct worker {
             if (!dis.decode(b, a, in) || !code_at(a + in.size - 1))
                 return;
             for (uint32_t k = 1; k < in.size; k++)
-                if (an.flags_at(a + k) & (fl_code | fl_tail | fl_str | fl_data))
-                    return; // would overlap something we already know
+                if ((an.flags_at(a + k) & (fl_code | fl_tail | fl_str | fl_data)) ||
+                    (func_starts.count(a + k) && !weak_starts.count(a + k)))
+                    return; // would overlap something we already know, or a function yet to explore
             mark_item(a, in.size, fl_code);
             an.insn_count++;
             if (arm && a != first) {
@@ -1212,9 +1223,11 @@ struct worker {
     {
         std::vector<uint64_t> starts(func_starts.begin(), func_starts.end());
         std::sort(starts.begin(), starts.end());
+        std::sort(orphans.begin(), orphans.end());
         an.funcs.reserve(starts.size());
         size_t done = 0;
-        for (uint64_t s : starts) {
+        for (size_t si = 0; si < starts.size(); si++) {
+            uint64_t s = starts[si];
             if ((++done & 255) == 0) {
                 if (stop_requested())
                     return;
@@ -1226,6 +1239,19 @@ struct worker {
             f.start = s;
             f.end = s;
             std::vector<uint64_t> stack{s};
+            // the function's landing pads, reached through the unwinder rather than a jump
+            auto pads = std::equal_range(b.landing_pads.begin(), b.landing_pads.end(), std::make_pair(s, (uint64_t)0),
+                [](const std::pair<uint64_t, uint64_t>& x, const std::pair<uint64_t, uint64_t>& y) { return x.first < y.first; });
+            for (auto it = pads.first; it != pads.second; ++it)
+                stack.push_back(it->second);
+            // orphan code up to the next function, in the same section
+            if (!orphans.empty()) {
+                uint64_t next = si + 1 < starts.size() ? starts[si + 1] : ~0ull;
+                const segment* seg = b.seg_at(s);
+                for (auto it = std::lower_bound(orphans.begin(), orphans.end(), s); it != orphans.end() && *it < next; ++it)
+                    if (b.seg_at(*it) == seg)
+                        stack.push_back(*it);
+            }
             std::unordered_set<uint64_t> seen;
             while (!stack.empty() && seen.size() < 200000) {
                 uint64_t a = stack.back();
@@ -1374,7 +1400,8 @@ struct worker {
     {
         mask = b.is64() ? ~0ull : 0xffffffffull;
         arm = b.arch == bin_arch::arm64;
-        imm_refs = (b.format == bin_format::pe || b.format == bin_format::elf) && b.base >= 0x10000;
+        imm_refs = (b.format == bin_format::pe || b.format == bin_format::elf || b.format == bin_format::macho) &&
+                   b.base >= 0x10000;
         if (!dis.open(b.arch))
             return false;
         an = analysis();
@@ -1409,6 +1436,9 @@ struct worker {
         for (const export_entry& e : b.exports)
             if (e.addr)
                 add_func(e.addr);
+        // landing pads are code, but part of their function: no starts of their own
+        for (const auto& lp : b.landing_pads)
+            push_code(lp.second);
         run_work();
         if (cancelled)
             return false;

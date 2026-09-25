@@ -21,12 +21,16 @@ std::vector<std::string> list_files(const std::string& dir, const std::string& e
 std::string join(const std::string& a, const std::string& b);
 
 std::string exe_dir();
-// per user data dir (%APPDATA%\ceasta, ~/.config/ceasta), created on first use
+// where what ships with ceasta is (the plugins folder): next to the program, or on macos the
+// app bundle's Resources folder
+std::string data_dir();
+// per user data dir (%APPDATA%\ceasta, ~/.config/ceasta, ~/Library/Application Support/ceasta),
+// created on first use
 std::string user_dir();
 
 uint64_t now_ms();
 void sleep_ms(uint32_t ms);
-// opens a folder or file with the system shell. no-op where unsupported
+// opens a folder or file with the system's file manager (explorer, finder, xdg-open)
 void open_in_shell(const std::string& path);
 
 #ifdef _WIN32

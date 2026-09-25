@@ -1,8 +1,8 @@
 #ifndef CEASTA_VERSION_H
 #define CEASTA_VERSION_H
 
-#define CEASTA_VERSION "0.11.0"
+#define CEASTA_VERSION "0.12.0"
 // the same as numbers, for the windows file properties (ceasta.rc)
-#define CEASTA_VERSION_NUMBERS 0, 11, 0, 0
+#define CEASTA_VERSION_NUMBERS 0, 12, 0, 0
 
 #endif

@@ -21,8 +21,10 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -237,6 +239,24 @@ std::string find_program(const std::string& name)
 
 #else
 
+namespace {
+
+// a pipe whose ends other programs ceasta starts don't get
+bool cloexec_pipe(int p[2])
+{
+#ifdef __linux__
+    return pipe2(p, O_CLOEXEC) == 0;
+#else
+    if (pipe(p) != 0)
+        return false;
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    return true;
+#endif
+}
+
+} // namespace
+
 process_result run_process(const std::vector<std::string>& argv, uint32_t timeout_ms, const std::atomic<bool>* cancel,
     size_t max_output)
 {
@@ -246,11 +266,11 @@ process_result run_process(const std::vector<std::string>& argv, uint32_t timeou
         return r;
     }
     int out_p[2], err_p[2];
-    if (pipe2(out_p, O_CLOEXEC) != 0) {
+    if (!cloexec_pipe(out_p)) {
         r.error = std::string("couldn't make a pipe: ") + strerror(errno);
         return r;
     }
-    if (pipe2(err_p, O_CLOEXEC) != 0) {
+    if (!cloexec_pipe(err_p)) {
         r.error = std::string("couldn't make a pipe: ") + strerror(errno);
         close(out_p[0]);
         close(out_p[1]);
@@ -272,7 +292,7 @@ process_result run_process(const std::vector<std::string>& argv, uint32_t timeou
             dup2(nul, 0);
         dup2(out_p[1], 1);
         dup2(err_p[1], 2);
-#ifdef SYS_close_range
+#if defined(__linux__) && defined(SYS_close_range)
         if (syscall(SYS_close_range, 3u, ~0u, 0u) != 0)
 #endif
             for (long fd = 3; fd < max_fd; fd++)
@@ -308,7 +328,8 @@ process_result run_process(const std::vector<std::string>& argv, uint32_t timeou
         if (fds[0].fd < 0 && fds[1].fd < 0) {
             // both pipes are closed: wait for the exit itself
             pid_t w = waitpid(pid, &status, WNOHANG);
-            if (w == pid) {
+            if (w == pid || (w < 0 && errno == ECHILD)) {
+                // ECHILD: someone else collected it (the linux debugger waits for any child)
                 exited = true;
                 break;
             }

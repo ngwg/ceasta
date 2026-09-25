@@ -58,6 +58,8 @@ static void usage()
            "  --raw32 / --raw64             load the file as raw x86 / x64 code\n"
            "  --raw-arm64                   load the file as raw arm64 code\n"
            "  --base <hex>                  base address for raw files\n"
+           "  --arch x64|arm64              which part of a universal (fat) mach-o file to open\n"
+           "                                (default: x64 when it has one, the decompiler reads it)\n"
            "  --kuna / --kuna-path <file>   decompile with kuna (github.com/Noelo-Lab/kuna) instead\n"
            "\"where\" is a hex address or any name (sub_401000, start, main, ...)\n",
         CEASTA_VERSION);
@@ -208,11 +210,17 @@ static int cmd_diff(const std::vector<std::string>& args, const load_options& op
     }
     std::string ea, eb;
     std::unique_ptr<database> a = open_any(args[1], opts, nullptr, ea);
-    std::unique_ptr<database> b = open_any(args[2], opts, nullptr, eb);
     if (!a) {
         fprintf(stderr, "can't open %s: %s\n", args[1].c_str(), ea.c_str());
         return 1;
     }
+    // two universal mach-o files: compare the same part of each
+    load_options ob = opts;
+    if (!ob.has_slice && a->bin.format == bin_format::macho) {
+        ob.has_slice = true;
+        ob.slice = a->bin.arch;
+    }
+    std::unique_ptr<database> b = open_any(args[2], ob, nullptr, eb);
     if (!b) {
         fprintf(stderr, "can't open %s: %s\n", args[2].c_str(), eb.c_str());
         return 1;
@@ -269,6 +277,12 @@ int main(int argc, char** argv)
         } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
             opts.force_raw = true;
             opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
+        } else if (a == "--arch" && i + 1 < argc) {
+            opts.has_slice = true;
+            if (!parse_arch(argv[++i], opts.slice)) {
+                fprintf(stderr, "--arch takes x64 or arm64\n");
+                return 2;
+            }
         } else if (a == "--base" && i + 1 < argc) {
             if (!util::parse_hex(argv[++i], opts.raw_base)) {
                 fprintf(stderr, "bad base address\n");
@@ -425,7 +439,12 @@ int main(int argc, char** argv)
                 fprintf(stderr, "%s\n", why.c_str());
                 return 1;
             }
-            kuna_result k = kuna_decompile(exe, b.path, f->start);
+            std::string input = kuna_input(b, why);
+            if (input.empty()) {
+                fprintf(stderr, "%s\n", why.c_str());
+                return 1;
+            }
+            kuna_result k = kuna_decompile(exe, input, f->start);
             if (!k.ok) {
                 fprintf(stderr, "%s\n", k.error.c_str());
                 return 1;

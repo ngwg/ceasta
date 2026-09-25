@@ -13,6 +13,7 @@ const char* format_name(bin_format f)
     case bin_format::pe: return "pe";
     case bin_format::elf: return "elf";
     case bin_format::raw: return "raw";
+    case bin_format::macho: return "mach-o";
     default: return "none";
     }
 }
@@ -220,7 +221,8 @@ void raw(std::vector<uint8_t> bytes, const std::string& path, uint64_t base, bin
         out.func_hints.push_back(base);
 }
 
-bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out, std::string& err)
+bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out, std::string& err,
+    const options& o)
 {
     const uint8_t* p = bytes.data();
     size_t n = bytes.size();
@@ -230,8 +232,9 @@ bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out
         is_pe = (uint64_t)lfanew + 4 <= n && memcmp(p + lfanew, "PE\0\0", 4) == 0;
     }
     bool is_elf = n >= 16 && memcmp(p, "\x7f" "ELF", 4) == 0;
+    bool is_mach = !is_pe && !is_elf && is_macho(bytes);
 
-    if (!is_pe && !is_elf) {
+    if (!is_pe && !is_elf && !is_mach) {
         raw(std::move(bytes), path, 0, bin_arch::x64, out);
         out.notes.push_back("unknown file format, loaded as raw x64 code at 0");
         return true;
@@ -242,7 +245,7 @@ bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out
     out.name = base_name(path);
     out.file = std::move(bytes);
     // the parsers map segments themselves (finish_segments) before reading tables
-    bool ok = is_pe ? pe(out, err) : elf(out, err);
+    bool ok = is_pe ? pe(out, err) : is_elf ? elf(out, err) : macho(out, err, o);
     if (!ok)
         return false;
     if (out.segments.empty()) {
@@ -276,15 +279,15 @@ bool peek_arch(const std::string& path, bin_arch& out)
         out = m == 0x14c ? bin_arch::x86 : m == 0x8664 ? bin_arch::x64 : bin_arch::arm64;
         return true;
     }
-    return false;
+    return macho_arch(head, out);
 }
 
-bool open(const std::string& path, binary& out, std::string& err)
+bool open(const std::string& path, binary& out, std::string& err, const options& o)
 {
     std::vector<uint8_t> bytes;
     if (!os::read_file(path, bytes, err))
         return false;
-    return from_bytes(std::move(bytes), path, out, err);
+    return from_bytes(std::move(bytes), path, out, err, o);
 }
 
 }

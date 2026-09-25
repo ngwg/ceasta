@@ -18,7 +18,16 @@
 #include <windows.h>
 #include <shellapi.h>
 #else
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
+#ifndef _WIN32
+extern char** environ;
 #endif
 
 namespace fs = std::filesystem;
@@ -195,6 +204,17 @@ std::string exe_dir()
         return ".";
     buf.resize(n);
     return from_path(fs::path(buf).parent_path());
+#elif defined(__APPLE__)
+    uint32_t n = 0;
+    _NSGetExecutablePath(nullptr, &n);
+    std::string buf(n + 1, '\0');
+    if (_NSGetExecutablePath(&buf[0], &n) != 0)
+        return ".";
+    std::error_code ec;
+    fs::path p = fs::canonical(fs::path(buf.c_str()), ec);
+    if (ec)
+        p = fs::path(buf.c_str());
+    return from_path(p.parent_path());
 #else
     std::error_code ec;
     fs::path p = fs::read_symlink("/proc/self/exe", ec);
@@ -202,6 +222,19 @@ std::string exe_dir()
         return ".";
     return from_path(p.parent_path());
 #endif
+}
+
+std::string data_dir()
+{
+    std::string dir = exe_dir();
+#ifdef __APPLE__
+    // inside ceasta.app the program is in Contents/MacOS and what ships with it in Resources
+    std::string res = join(from_path(to_path(dir).parent_path()), "Resources");
+    std::error_code ec;
+    if (fs::is_directory(to_path(join(res, "plugins")), ec))
+        return res;
+#endif
+    return dir;
 }
 
 std::string user_dir()
@@ -212,6 +245,10 @@ std::string user_dir()
     DWORD n = GetEnvironmentVariableW(L"APPDATA", &appdata[0], (DWORD)appdata.size());
     if (n > 0 && n < appdata.size())
         dir = join(narrow(appdata.substr(0, n)), "ceasta");
+#elif defined(__APPLE__)
+    const char* home = getenv("HOME");
+    if (home && *home)
+        dir = join(join(join(home, "Library"), "Application Support"), "ceasta");
 #else
     const char* xdg = getenv("XDG_CONFIG_HOME");
     const char* home = getenv("HOME");
@@ -242,7 +279,20 @@ void open_in_shell(const std::string& path)
 #ifdef _WIN32
     ShellExecuteW(nullptr, L"open", widen(path).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #else
-    (void)path;
+    // finder / the desktop's file manager: open on macos, xdg-open elsewhere, without a shell
+#ifdef __APPLE__
+    const char* tool = "open";
+#else
+    const char* tool = "xdg-open";
+#endif
+    std::string arg = path;
+    char* argv[] = {const_cast<char*>(tool), const_cast<char*>(arg.c_str()), nullptr};
+    pid_t pid = 0;
+    if (posix_spawnp(&pid, tool, nullptr, nullptr, argv, environ) == 0)
+        std::thread([pid]() {
+            int st = 0;
+            waitpid(pid, &st, 0);
+        }).detach();
 #endif
 }
 

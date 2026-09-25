@@ -245,6 +245,8 @@ static void finish_job(app_state& s)
     s.scroll_to_cursor = true;
     for (const std::string& n : b.notes)
         app_log(s, n, 1);
+    if (b.slices.size() > 1)
+        app_log(s, theme::keys("the other part of this universal file: ctrl+shift+p, \"part\""), 1);
     for (const std::string& w : s.db->info.warnings) // packed, an embedded program, an overlay, ...
         app_log(s, "note: " + w, 1);
     app_log(s, util::fmt("%s: %s %s %s, %zu functions, %zu imports, %zu strings", b.name.c_str(), format_name(b.format),
@@ -504,6 +506,9 @@ bool app_can_debug(const app_state& s, std::string* why)
 #ifdef _WIN32
     const bin_format native = bin_format::pe;
     const char* native_name = "a windows .exe";
+#elif defined(__APPLE__)
+    const bin_format native = bin_format::macho;
+    const char* native_name = "a macos program";
 #else
     const bin_format native = bin_format::elf;
     const char* native_name = "a linux elf executable";
@@ -511,7 +516,11 @@ bool app_can_debug(const app_state& s, std::string* why)
     if (s.sandboxed)
         w = "debugging is disabled in this session";
     else if (!debugger::supported())
+#ifdef __APPLE__
+        w = "the debugger isn't on macos yet (the windows and linux builds have one)";
+#else
         w = "the debugger isn't available in this build";
+#endif
     else if (!s.db)
         w = std::string("open ") + native_name + " first";
     else if (s.db->bin.format != native)
@@ -1032,7 +1041,7 @@ static void setup_lua(app_state& s)
     s.lua.init(br);
     std::string user_plugins = os::join(os::user_dir(), "plugins");
     os::make_dirs(user_plugins);
-    int ok = s.lua.load_plugins({os::join(os::exe_dir(), "plugins"), user_plugins});
+    int ok = s.lua.load_plugins({os::join(os::data_dir(), "plugins"), user_plugins});
     if (!s.lua.plugin_files().empty())
         app_log(s, util::fmt("loaded %d of %zu plugins, %zu commands in the plugins menu", ok, s.lua.plugin_files().size(),
             s.lua.commands().size()));

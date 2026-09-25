@@ -169,11 +169,23 @@ socket_t accept_client(socket_t srv)
     return accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
 #else
     socket_t c = accept(srv, nullptr, nullptr);
-    if (c != bad_socket)
+    if (c != bad_socket) {
         no_inherit(c);
+#ifdef SO_NOSIGPIPE
+        // a client that hangs up mid-reply is an error from send, not a signal that ends ceasta
+        int one = 1;
+        setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+    }
     return c;
 #endif
 }
+
+#ifdef MSG_NOSIGNAL
+static const int send_flags = MSG_NOSIGNAL; // see SO_NOSIGPIPE above
+#else
+static const int send_flags = 0;
+#endif
 
 void set_nonblocking(socket_t s)
 {
@@ -255,7 +267,7 @@ void send_all(socket_t c, const std::string& s)
 {
     size_t sent = 0;
     while (sent < s.size()) {
-        int n = (int)send(c, s.data() + sent, (int)(s.size() - sent), 0);
+        int n = (int)send(c, s.data() + sent, (int)(s.size() - sent), send_flags);
         if (n <= 0) {
             if (n < 0 && would_block()) {
                 os::sleep_ms(2);

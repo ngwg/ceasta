@@ -29,8 +29,13 @@ struct kuna_result {
 // PATH. "" when there isn't one
 std::string kuna_find(const std::string& configured = std::string());
 
-// why kuna can't read this file ("" when it can): it takes pe and elf files from disk
+// why kuna can't read this file ("" when it can): it takes pe, elf and mach-o files from disk
 std::string kuna_unsupported(const binary& b);
+
+// the file to give kuna for b: the program itself, or for a universal mach-o file the part
+// ceasta shows (so the addresses are the same), written out once to the user folder.
+// "" when that can't be written (err says why)
+std::string kuna_input(const binary& b, std::string& err);
 
 // decompiles the function at addr of the program file with kuna, waiting up to timeout_ms.
 // a set cancel stops it

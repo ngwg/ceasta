@@ -382,7 +382,13 @@ static const kuna_entry* kuna_for(app_state& s, uint64_t func)
         k.running = func;
         k.started_ms = os::now_ms();
         k.result = kuna_result();
-        std::string exe = s.kuna_exe, file = s.db->bin.path;
+        std::string exe = s.kuna_exe, err, file = kuna_input(s.db->bin, err);
+        if (file.empty()) {
+            k.result.error = err;
+            k.finished = true;
+            k.worker = std::thread([] {});
+            return nullptr;
+        }
         k.worker = std::thread([exe, file, func] {
             g_kuna.result = kuna_decompile(exe, file, func, 120000, &g_kuna.cancel);
             g_kuna.finished = true;

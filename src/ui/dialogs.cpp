@@ -182,7 +182,7 @@ static void rename(app_state& s, dialog_state& d)
 static void comment(app_state& s, dialog_state& d)
 {
     ImGui::Text("comment at %s", s.db->location(d.addr).c_str());
-    ImGui::TextDisabled("enter saves, ctrl+enter starts a new line. empty removes the comment");
+    ImGui::TextDisabled("%s", theme::keys("enter saves, ctrl+enter starts a new line. empty removes the comment"));
     focus_first();
     bool save = ImGui::InputTextMultiline("##comment", d.buf, sizeof(d.buf), ImVec2(ImGui::GetFontSize() * 32, ImGui::GetTextLineHeight() * 6),
         ImGuiInputTextFlags_CtrlEnterForNewLine | ImGuiInputTextFlags_EnterReturnsTrue);
@@ -717,7 +717,7 @@ static void review(app_state& s, dialog_state& d)
     size_t n = db.suggestions.size();
     ImGui::Text("%zu name%s an AI suggested", n, n == 1 ? "" : "s");
     ImGui::SameLine();
-    ImGui::TextDisabled("nothing changes until you accept one. ctrl+z takes an accept back");
+    ImGui::TextDisabled("%s", theme::keys("nothing changes until you accept one. ctrl+z takes an accept back"));
     d.sel = std::max(0, std::min(d.sel, (int)n - 1));
     if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
         d.sel = std::min(d.sel + 1, (int)n - 1);
@@ -968,7 +968,7 @@ static void shortcuts(app_state&, dialog_state&)
         for (const auto& k : keys) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::call), "%s", k[0]);
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::call), "%s", theme::keys(k[0]));
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(k[1]);
         }

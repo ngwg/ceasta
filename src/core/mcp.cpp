@@ -333,7 +333,8 @@ void add_read_tools(std::vector<tool>& t)
                     return;
                 }
                 why = kuna_unsupported(db->bin);
-                file = db->bin.path;
+                if (why.empty())
+                    file = kuna_input(db->bin, why);
                 start = f->start;
                 name = db->location(f->start);
                 ok = true;
@@ -612,6 +613,9 @@ void add_query_tools(std::vector<tool>& t)
                 return false;
             std::string path = arg_str(args, "path"), err;
             load_options lo;
+            // two universal mach-o files: compare the same part of each
+            lo.has_slice = db->bin.format == bin_format::macho;
+            lo.slice = db->bin.arch;
             std::unique_ptr<database> other = open_database(path, lo, nullptr, err);
             if (!other) {
                 out = "can't open " + path + ": " + err;

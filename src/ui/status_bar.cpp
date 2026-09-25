@@ -37,7 +37,7 @@ void draw(app_state& s)
         ImGui::SameLine();
         ImGui::TextDisabled("%s", db.location(s.cursor).c_str());
         ImGui::SameLine(0, 24);
-        ImGui::TextDisabled("|  %zu functions  %s%s", db.an.funcs.size(), db.dirty ? "  unsaved changes (ctrl+s)" : "",
+        ImGui::TextDisabled("|  %zu functions  %s%s", db.an.funcs.size(), db.dirty ? theme::keys("  unsaved changes (ctrl+s)") : "",
             db.breakpoints.empty() ? "" : util::fmt("  %zu breakpoints", db.breakpoints.size()).c_str());
     }
     // names an ai suggested: a click opens the review

@@ -1184,6 +1184,8 @@ std::string database::serialize(bool with_program) const
     std::string s = "ceasta 1\nfile " + bin.name + "\n" + util::fmt("crc %08X\n", crc);
     if (bin.format == bin_format::raw)
         s += util::fmt("load raw %s %llx\n", arch_name(bin.arch), (unsigned long long)bin.base);
+    else if (bin.slices.size() > 1)
+        s += util::fmt("load slice %s\n", arch_name(bin.arch)); // which part of a universal file
     for (const auto& n : user_names)
         s += "name " + util::hex(n.first) + " " + n.second + "\n";
     for (const auto& c : user_comments)
@@ -1356,8 +1358,12 @@ std::unique_ptr<database> open_database(const std::string& path, const load_opti
         if (!os::read_file(path, bytes, err))
             return nullptr;
         loader::raw(std::move(bytes), path, opts.raw_base, opts.raw_arch, db->bin);
-    } else if (!loader::open(path, db->bin, err)) {
-        return nullptr;
+    } else {
+        loader::options lo;
+        lo.has_slice = opts.has_slice;
+        lo.slice = opts.slice;
+        if (!loader::open(path, db->bin, err, lo))
+            return nullptr;
     }
     if (!analyze(db->bin, db->an, progress)) {
         err = (progress && progress->cancel.load()) ? "cancelled" : "analysis failed";
@@ -1417,6 +1423,8 @@ bool read_project_info(const std::string& project, project_info& out, std::strin
                 out.opts.raw_arch = bin_arch::x64;
             if (sp != std::string::npos)
                 util::parse_hex(line.substr(sp + 1), out.opts.raw_base);
+        } else if (line.compare(0, 11, "load slice ") == 0) {
+            out.opts.has_slice = parse_arch(util::trim(line.substr(11)), out.opts.slice);
         } else if (line.compare(0, 8, "program ") == 0) {
             out.has_program = true;
             break; // the rest is the program's bytes

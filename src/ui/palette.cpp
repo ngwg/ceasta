@@ -29,6 +29,25 @@ bool can_start(const app_state& s) { return (s.dbg.state() == dbg_state::none &&
 
 void open_dialog(app_state& s, dialog_kind k) { dialogs::open(s, k, s.cursor); }
 
+// a universal mach-o file has another part in this architecture
+template <bin_arch A>
+bool other_part(const app_state& s)
+{
+    if (!s.db || app_loading(s) || s.db->bin.arch == A)
+        return false;
+    const std::vector<bin_arch>& sl = s.db->bin.slices;
+    return std::find(sl.begin(), sl.end(), A) != sl.end();
+}
+
+template <bin_arch A>
+void open_part(app_state& s)
+{
+    load_options o;
+    o.has_slice = true;
+    o.slice = A;
+    app_open(s, s.db->bin.path, o);
+}
+
 } // namespace
 
 static const std::vector<action>& actions()
@@ -36,6 +55,8 @@ static const std::vector<action>& actions()
     static const std::vector<action> list = {
         {"File", "Open...", "Ctrl+O", not_loading, [](app_state& s) { app_open_dialog(s); }},
         {"File", "Open as raw code...", "", not_loading, [](app_state& s) { open_dialog(s, dialog_kind::open_raw); }},
+        {"File", "Show the x86_64 part (a universal mac file)", "", other_part<bin_arch::x64>, open_part<bin_arch::x64>},
+        {"File", "Show the arm64 part (a universal mac file)", "", other_part<bin_arch::arm64>, open_part<bin_arch::arm64>},
         {"File", "Save", "Ctrl+S", dirty, [](app_state& s) { app_save(s); }},
         {"File", "Save as...", "Ctrl+Shift+S", has_file, [](app_state& s) { app_save_as(s); }},
         {"File", "Close file", "", has_file, [](app_state& s) { app_close_file(s); }},
@@ -202,7 +223,7 @@ void draw(app_state& s, dialog_state& d)
             ImGui::PopID();
             ImGui::TableNextColumn();
             if (!plugin && list[(size_t)idx].keys[0])
-                ImGui::TextDisabled("%s", list[(size_t)idx].keys);
+                ImGui::TextDisabled("%s", theme::keys(list[(size_t)idx].keys));
         }
         ImGui::EndTable();
     }

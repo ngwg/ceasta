@@ -2,10 +2,10 @@
   <img src="docs/icon.png" width="96" height="96" alt="ceasta">
 </p>
 <h1 align="center">ceasta</h1>
-<p align="center">a disassembler, decompiler and debugger in one — for windows and linux, x86, x64 and arm64</p>
+<p align="center">a disassembler, decompiler and debugger in one — for windows, linux and macos, x86, x64 and arm64</p>
 <p align="center">
   <a href="https://github.com/ngwg/ceasta/releases"><img src="https://img.shields.io/github/v/release/ngwg/ceasta?color=2ea043&label=release" alt="latest release"></a>
-  <img src="https://img.shields.io/badge/platform-windows%20%7C%20linux-555" alt="platforms">
+  <img src="https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-555" alt="platforms">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/ngwg/ceasta?color=blue" alt="license"></a>
   <img src="https://img.shields.io/badge/c%2B%2B-17-00599C" alt="c++17">
 </p>
@@ -73,16 +73,18 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 | `ceasta-x.y.z-windows-x64.zip` | windows x64 | the full app, portable — unzip and run `ceasta.exe` |
 | `ceasta-x.y.z-linux-x64.AppImage` | linux x64 | the full app — `chmod +x` and run ([on linux](#on-linux)) |
 | `ceasta-cli-x.y.z-linux-x64.tar.gz` | linux x64 | `ceasta-cli` + plugins: analysis, disassembly, decompiler, scripting, terminal debugger, binary diff, signatures, and the [MCP server](docs/mcp.md) |
+| `ceasta-x.y.z-macos.dmg` | macos 11+, apple silicon and intel | the app, no debugger yet — drag it to Applications ([on a mac](#on-a-mac)) |
+| `ceasta-cli-x.y.z-macos.tar.gz` | macos 11+, apple silicon and intel | `ceasta-cli` + plugins, everything above but the debugger |
 
 ## what it does
 
-- opens pe files (exe, dll, sys — x86, x64 and arm64), elf (x86, x64, arm64) and raw code
-- auto analysis: functions (entry, exports, symbols, .pdata, unwind tables, tls callbacks, calls, pointers in data), switch tables, xrefs, strings (ascii + utf-16), imports / exports, thunks, noreturn calls
+- opens pe files (exe, dll, sys — x86, x64 and arm64), elf (x86, x64, arm64), mach-o (macos / ios programs and libraries, x86_64 and arm64, universal files too) and raw code
+- auto analysis: functions (entry, exports, symbols, .pdata, unwind tables, mach-o function starts, tls callbacks, calls, pointers in data), switch tables, xrefs, strings (ascii + utf-16), imports / exports, thunks, noreturn calls
 - ida-style listing: names instead of addresses, labels, xref and string comments, the arguments each instruction passes to a known api
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
 - decompiler (f5, x86 / x64): c-like pseudocode — if / else, loops, switch, stack variables, calls with their arguments (~350 known api prototypes). click a name: `n` renames it, `y` sets a type or a prototype. shift+f5 shows it next to the listing
 - a second decompiler if you want one: with [kuna](https://github.com/Noelo-Lab/kuna) installed (a decompiler ported from ghidra's), the pseudocode view gets a `kuna` switch — its output for the same function, lines linked to the listing, arm64 too. [more below](#second-decompiler-kuna)
-- file info: headers, security flags (aslr, dep, cfg / pie, nx, relro, canary), md5 / sha256 / imphash, section entropy, resources, version info, and warnings when it looks packed
+- file info: headers, security flags (aslr, dep, cfg / pie, nx, relro, canary / hardened runtime), md5 / sha256 / imphash, section entropy, resources, version info, a mac program's code signature and entitlements, and warnings when it looks packed
 - search everything (ctrl+f): functions, names, imports, exports, strings, comments and segments in one box, and the strings say where they're used
 - debugger (x86 / x64, windows and linux): start or attach, breakpoints (with conditions: `rdi == 3`), watchpoints on variables, step into / over / out, step back, run to cursor, pause, registers, stack, call stack, memory map, live memory
   - the pseudocode marks the line you're stopped on
@@ -226,7 +228,7 @@ cd ceasta-cli-*-linux-x64
 ./ceasta-cli dbg ./program                  debug it (break, step, registers, memory)
 ```
 
-both read elf and windows pe files alike (x86, x64, arm64), so you can look at a windows exe — or an arm64 phone or server binary — from linux too.
+both read elf, windows pe and mac mach-o files alike (x86, x64, arm64), so you can look at a windows exe — or an arm64 phone or server binary, or a mac app — from linux too.
 
 the terminal debugger (`dbg`) is a ptrace debugger with ceasta's names, disassembly and decompiler built in:
 
@@ -242,6 +244,26 @@ the terminal debugger (`dbg`) is a ptrace debugger with ceasta's names, disassem
 (ceasta) back / finish     step back / step out
 (ceasta) lua ...           run lua against the live process
 ```
+
+## on a mac
+
+the app comes as `ceasta-x.y.z-macos.dmg`: open it and drag ceasta to Applications. one app runs on apple silicon and intel macs (macos 11 or newer). it's signed ad-hoc but not notarized by apple, so the first time macos stops it — right-click ceasta.app > **Open** (on macos 15 and later: System Settings > Privacy & Security > **Open Anyway**), or once in a terminal:
+
+```
+xattr -dr com.apple.quarantine /Applications/ceasta.app
+```
+
+the shortcuts use cmd where the others use ctrl (cmd+s, cmd+z, cmd+shift+p, ...). plugins you add go in `~/Library/Application Support/ceasta/plugins`.
+
+it reads mach-o files: programs, libraries, bundles and `.o` files, x86_64 and arm64 (arm64e too, apple's own). names show without the underscore mach-o puts in front (`main`, `printf`), like on the other systems. a universal file opens its x86_64 part (the decompiler reads it) and the arm64 part is one cmd+shift+p away ("part"), or `--arch arm64` on the command line. the file tab shows what a mac program says about itself: the minimum macos and sdk, the libraries and rpaths, the code signature (who signed it, hardened runtime, library validation) and its entitlements, with a warning for the ones that let code in (`get-task-allow`, `disable-library-validation`, dyld environment variables, jit). to read an app, open the program inside it: the open panel goes into `.app` bundles (Contents/MacOS/...).
+
+```
+./ceasta-cli info /bin/ls                        universal, arm64e, signed by apple
+./ceasta-cli funcs /bin/ls --arch arm64          the arm64 part
+./ceasta-cli decompile /Applications/Foo.app/Contents/MacOS/Foo main
+```
+
+there's no debugger on macos yet: that needs apple's debugging interfaces and a signed, entitled build. the windows and linux builds have one, and they read mac files too.
 
 ## build
 
@@ -262,17 +284,23 @@ cmake -S . -B build && cmake --build build -j
 cmake -S . -B build -DCEASTA_LINUX_GUI=ON && cmake --build build -j
 ```
 
+**macos** (the app needs glfw: `brew install glfw`; without it only `ceasta-cli` is built)
+```
+cmake -S . -B build && cmake --build build -j      # build/ceasta.app and build/ceasta-cli
+```
+ci builds glfw and ceasta for arm64 and x86_64 at once (`-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`) and packs the dmg, see `.github/workflows/build.yml`.
+
 ## code
 
 - `src/app.*` — state, actions and the main layout; `src/app_mcp.cpp` runs the AI server from the app
 - `src/ui/` — one file per panel (top_bar, left_panel, ida_view, graph_view, pseudo_view, right_panel, cpu_panel, bottom_panel, status_bar, dialogs)
 - `src/widgets/` — small shared bits (nav_band, splitter)
-- `src/core/` — no ui: loaders (`binary`, `pe`, `elf`), `fileinfo`, `disasm` (capstone), `analysis`, `database`, `search`, `decompiler`, `protos` (known api prototypes), `lua_host`, `debugger` (win32) + `debugger_linux` (ptrace) + `dbg_stack` (call stacks), `mcp` + `mcp_transport` (the AI server), `diff`, `signatures`, `exchange` (ida / ghidra / x64dbg), `os`
+- `src/core/` — no ui: loaders (`binary`, `pe`, `elf`, `macho`), `fileinfo`, `disasm` (capstone), `analysis`, `database`, `search`, `decompiler`, `protos` (known api prototypes), `lua_host`, `debugger` (win32) + `debugger_linux` (ptrace) + `dbg_stack` (call stacks), `mcp` + `mcp_transport` (the AI server), `diff`, `signatures`, `exchange` (ida / ghidra / x64dbg), `os`
 - `src/cli/` — ceasta-cli and the `dbg` terminal debugger
 - `plugins/` — lua plugins that ship with it
 - `scripts/` — `ida_to_ceasta.py` and `ghidra_to_ceasta.py`: your names from those tools, for file > import names
 - `docs/` — the [lua guide](docs/lua.md), the [changelog](docs/CHANGELOG.md), third-party licenses, screenshots
-- `installer/` — inno setup script and packaging; `packaging/linux/` — the AppImage's desktop entry and icon
+- `installer/` — inno setup script and packaging; `packaging/linux/` — the AppImage's desktop entry and icon; `packaging/macos/` — the app's Info.plist and icon; `src/mac_platform.mm` — the mac open / save panels
 - `third_party/` — imgui, capstone (x86 and arm64), lua 5.4
 
 ## license
