@@ -131,7 +131,7 @@ the decompiler (f5), here next to the listing (shift+f5) — a click in one move
 
 ## plugins
 
-plugins are lua files in `plugins/` (next to the program) or in `%APPDATA%\ceasta\plugins`. they add commands to the plugins menu. five come with it: file summary, crypto finder, wrapper namer, strings report, call tracer (debugger).
+plugins are lua files in `plugins/` (next to the program) or in your own plugins folder (`%APPDATA%\ceasta\plugins`, `~/.config/ceasta/plugins`). they add commands to the plugins menu. five come with it: file summary, crypto finder, wrapper namer, strings report, call tracer (debugger).
 
 ```lua
 ceasta.register_command("Count calls", function()
