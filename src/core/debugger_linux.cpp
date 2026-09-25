@@ -679,10 +679,10 @@ void debugger::poll(uint32_t timeout_ms)
 
 dbg_state debugger::state() const { return d->state; }
 
-bool debugger::cont(std::string& err) { return d->resume(impl::step::none, err); }
-bool debugger::step_into(std::string& err) { return d->resume(impl::step::into, err); }
+bool debugger::raw_cont(std::string& err) { return d->resume(impl::step::none, err); }
+bool debugger::raw_step_into(std::string& err) { return d->resume(impl::step::into, err); }
 
-bool debugger::step_over(std::string& err)
+bool debugger::raw_step_over(std::string& err)
 {
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
@@ -700,10 +700,10 @@ bool debugger::step_over(std::string& err)
         }
         return d->resume(impl::step::none, err);
     }
-    return step_into(err);
+    return raw_step_into(err);
 }
 
-bool debugger::run_to(uint64_t addr, std::string& err)
+bool debugger::raw_run_to(uint64_t addr, std::string& err)
 {
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
@@ -877,7 +877,7 @@ bool debugger::write(uint64_t addr, const void* in, size_t n, std::string& err)
     return true;
 }
 
-bool debugger::call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err)
+bool debugger::raw_call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err)
 {
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";

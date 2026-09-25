@@ -220,3 +220,155 @@ bool is_suspicious(unsigned id)
 }
 
 }
+
+// ---- what an instruction writes (for undoing steps) ----
+
+namespace {
+
+// the full register a sub-register lives in, named the way the debugger names it
+const char* full_reg_name(unsigned r, bool x64)
+{
+    if (r == X86_REG_EIP || r == X86_REG_IP || r == X86_REG_RIP)
+        return x64 ? "rip" : "eip";
+    static const struct {
+        unsigned r64;
+        const char* n64;
+        const char* n32;
+    } table[] = {
+        {X86_REG_RAX, "rax", "eax"}, {X86_REG_RBX, "rbx", "ebx"}, {X86_REG_RCX, "rcx", "ecx"},
+        {X86_REG_RDX, "rdx", "edx"}, {X86_REG_RSI, "rsi", "esi"}, {X86_REG_RDI, "rdi", "edi"},
+        {X86_REG_RBP, "rbp", "ebp"}, {X86_REG_RSP, "rsp", "esp"}, {X86_REG_R8, "r8", nullptr},
+        {X86_REG_R9, "r9", nullptr}, {X86_REG_R10, "r10", nullptr}, {X86_REG_R11, "r11", nullptr},
+        {X86_REG_R12, "r12", nullptr}, {X86_REG_R13, "r13", nullptr}, {X86_REG_R14, "r14", nullptr},
+        {X86_REG_R15, "r15", nullptr},
+    };
+    for (const auto& t : table)
+        if (regs::same_reg(r, t.r64))
+            return x64 ? t.n64 : t.n32;
+    return nullptr;
+}
+
+bool is_32bit_reg(unsigned r)
+{
+    switch (r) {
+    case X86_REG_EAX: case X86_REG_EBX: case X86_REG_ECX: case X86_REG_EDX: case X86_REG_ESI: case X86_REG_EDI:
+    case X86_REG_EBP: case X86_REG_ESP: case X86_REG_EIP: case X86_REG_R8D: case X86_REG_R9D: case X86_REG_R10D:
+    case X86_REG_R11D: case X86_REG_R12D: case X86_REG_R13D: case X86_REG_R14D: case X86_REG_R15D:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+bool disassembler::writes(const uint8_t* buf, size_t n, uint64_t addr,
+    const std::function<bool(const char* reg, uint64_t& value)>& reg, std::vector<mem_write>& out)
+{
+    out.clear();
+    if (!handle_ || !buf || n == 0)
+        return false;
+    const uint8_t* code = buf;
+    size_t size = std::min<size_t>(n, 15);
+    uint64_t a = addr;
+    cs_insn* ci = (cs_insn*)scratch_;
+    if (!cs_disasm_iter((csh)handle_, &code, &size, &a, ci))
+        return false;
+    const cs_detail* d = ci->detail;
+    const cs_x86& x = d->x86;
+    bool x64 = arch_ == bin_arch::x64;
+    uint64_t ptr = x64 ? 8 : 4;
+    auto value = [&](unsigned r, uint64_t& v) {
+        const char* name = full_reg_name(r, x64);
+        if (!name || !reg(name, v))
+            return false;
+        if (!x64 || is_32bit_reg(r))
+            v &= 0xffffffffull;
+        return true;
+    };
+    unsigned id = ci->id;
+
+    // the kernel, or a far transfer, can write anywhere
+    if (in_group(d, CS_GRP_INT) || id == X86_INS_SYSCALL || id == X86_INS_SYSENTER || id == X86_INS_INT ||
+        id == X86_INS_INTO || id == X86_INS_LCALL || id == X86_INS_ENTER || id == X86_INS_MASKMOVDQU ||
+        id == X86_INS_MASKMOVQ || id == X86_INS_VMASKMOVDQU)
+        return false;
+
+    // the stack: push and call write just below the stack pointer
+    uint64_t sp = 0;
+    uint32_t pushed = 0;
+    if (id == X86_INS_CALL)
+        pushed = (uint32_t)ptr;
+    else if (id == X86_INS_PUSH)
+        pushed = x.op_count && x.operands[0].size ? x.operands[0].size : (uint32_t)ptr;
+    else if (id == X86_INS_PUSHFQ)
+        pushed = 8;
+    else if (id == X86_INS_PUSHFD)
+        pushed = 4;
+    else if (id == X86_INS_PUSHF)
+        pushed = 2;
+    else if (id == X86_INS_PUSHAL)
+        pushed = 32;
+    else if (id == X86_INS_PUSHAW)
+        pushed = 16;
+    if (pushed) {
+        if (!value(x64 ? X86_REG_RSP : X86_REG_ESP, sp))
+            return false;
+        out.push_back({sp - pushed, pushed});
+        if (id != X86_INS_PUSH) // a push can still read memory, but it writes only the stack
+            return true;
+    }
+
+    // string writes: stos / movs, maybe repeated rcx times, up or down by the direction flag
+    bool str = id == X86_INS_STOSB || id == X86_INS_STOSW || id == X86_INS_STOSD || id == X86_INS_STOSQ ||
+               id == X86_INS_MOVSB || id == X86_INS_MOVSW || id == X86_INS_MOVSQ ||
+               (id == X86_INS_MOVSD && x.op_count == 2 && x.operands[0].type == X86_OP_MEM && x.operands[1].type == X86_OP_MEM);
+    if (str) {
+        uint32_t elem = x.op_count ? x.operands[0].size : 0;
+        if (!elem)
+            return false;
+        uint64_t di = 0, count = 1, flags = 0;
+        if (!value(x64 ? X86_REG_RDI : X86_REG_EDI, di) || !reg("eflags", flags))
+            return false;
+        if (x.prefix[0] == X86_PREFIX_REP || x.prefix[0] == X86_PREFIX_REPNE) {
+            if (!value(x64 ? X86_REG_RCX : X86_REG_ECX, count))
+                return false;
+            if (count == 0)
+                return true; // nothing happens
+        }
+        if (count > (1u << 20) / elem)
+            return false; // too much to keep
+        uint64_t len = count * elem;
+        bool down = (flags >> 10) & 1;
+        out.push_back({down ? di + elem - len : di, (uint32_t)len});
+        return true;
+    }
+
+    // everything else: memory operands it writes
+    for (uint8_t i = 0; i < x.op_count && i < 8; i++) {
+        const cs_x86_op& op = x.operands[i];
+        if (op.type != X86_OP_MEM || !(op.access & CS_AC_WRITE))
+            continue;
+        if (op.mem.segment == X86_REG_FS || op.mem.segment == X86_REG_GS || op.size == 0)
+            return false;
+        uint64_t ea = (uint64_t)op.mem.disp;
+        if (op.mem.base == X86_REG_RIP || op.mem.base == X86_REG_EIP) {
+            ea += addr + ci->size;
+        } else if (op.mem.base != X86_REG_INVALID) {
+            uint64_t b = 0;
+            if (!value(op.mem.base, b))
+                return false;
+            ea += b;
+        }
+        if (op.mem.index != X86_REG_INVALID) {
+            uint64_t ix = 0;
+            if (!value(op.mem.index, ix))
+                return false;
+            ea += ix * (uint64_t)op.mem.scale;
+        }
+        if (!x64)
+            ea &= 0xffffffffull;
+        out.push_back({ea, op.size});
+    }
+    return true;
+}

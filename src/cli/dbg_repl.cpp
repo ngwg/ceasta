@@ -178,6 +178,8 @@ void help()
         "  c                 continue\n"
         "  si [n]            step into (n times)\n"
         "  ni [n]            step over\n"
+        "  back [n]          step back: undo the last steps (memory + registers)\n"
+        "  finish            run until the current function returns\n"
         "  until <addr>      run to an address\n"
         "  b <addr>          set a breakpoint     bd <addr>  delete    bl  list\n"
         "  r                 registers            set <reg> <val>\n"
@@ -291,6 +293,28 @@ int cmd_dbg(int argc, char** argv)
             for (int i = 0; i < n && g_dbg.state() == dbg_state::stopped; i++) {
                 if (!g_dbg.step_over(err)) { printf("%s\n", err.c_str()); break; }
                 wait_stop();
+            }
+            show_stop();
+        } else if (c == "back" || c == "sb") {
+            int n = tok.size() > 1 ? atoi(tok[1].c_str()) : 1;
+            int done = 0;
+            for (; done < n; done++)
+                if (!g_dbg.step_back(err)) {
+                    printf("%s\n", err.c_str());
+                    break;
+                }
+            if (done)
+                printf("went back %d step%s (%zu more recorded)\n", done, done == 1 ? "" : "s", g_dbg.steps_recorded());
+            show_stop();
+        } else if (c == "finish" || c == "fin") {
+            // step over until a return has run: calls in between run at full speed
+            for (int guard = 0; guard < 1000000 && g_dbg.state() == dbg_state::stopped; guard++) {
+                bool last = g_dbg.about_to_return();
+                if (!g_dbg.step_over(err)) { printf("%s\n", err.c_str()); break; }
+                wait_stop(24 * 3600 * 1000);
+                std::string why = g_dbg.stop_reason();
+                if (last || g_dbg.state() != dbg_state::stopped || (why != "step" && why != "step over"))
+                    break;
             }
             show_stop();
         } else if (c == "until" || c == "runto") {

@@ -52,6 +52,15 @@ public:
     bool run_to(uint64_t addr, std::string& err);
     bool pause(std::string& err);
 
+    // going back: every step_into / step_over first notes the registers and the memory the
+    // instruction is about to write, and step_back puts them back, one step at a time. code that
+    // runs without being stepped (continue, run to, call, a call stepped over, a system call)
+    // isn't recorded, so going back stops there. the thread's own writes only
+    bool step_back(std::string& err);
+    size_t steps_recorded() const; // how many steps step_back can undo from here
+    // the instruction at the pc returns from the function (step out stops after it)
+    bool about_to_return() const;
+
     bool add_bp(uint64_t addr, std::string& err);
     bool del_bp(uint64_t addr);
     bool has_bp(uint64_t addr) const;
@@ -89,7 +98,17 @@ public:
     struct impl;
 
 private:
+    // the backends' own run / step / call; the public ones record steps around them
+    bool raw_cont(std::string& err);
+    bool raw_step_into(std::string& err);
+    bool raw_step_over(std::string& err);
+    bool raw_run_to(uint64_t addr, std::string& err);
+    bool raw_call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err);
+    void record_step(bool over);
+    void forget_steps();
+
     std::unique_ptr<impl> d;
+    std::shared_ptr<struct step_history> hist_;
 };
 
 // processes for the attach dialog (windows only, empty elsewhere)

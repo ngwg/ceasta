@@ -652,6 +652,7 @@ static void shortcuts(app_state&, dialog_state&)
         {"Up / Down / PgUp / PgDn", "move in the listing"},
         {"F9", "start debugging / continue"}, {"F7", "step into"},
         {"F8", "step over"},                {"F4", "run to cursor"},
+        {"Ctrl+F9", "step out (run until return)"}, {"Shift+F7", "step back (undo a step)"},
         {"F2", "toggle breakpoint"},        {"F12", "pause"},
         {"Ctrl+F2", "stop debugging"},      {"Ctrl+= / Ctrl+- / Ctrl+0", "text size"},
         {"Ctrl+wheel (graph)", "zoom"},     {"drag (graph)", "pan"},

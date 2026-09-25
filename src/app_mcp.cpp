@@ -4,8 +4,10 @@
 #include "app.h"
 #include "core/mcp.h"
 #include "core/mcp_transport.h"
+#include "core/os.h"
 #include "core/util.h"
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -46,6 +48,7 @@ struct app_mcp {
         if (stop)
             return;
         queue.push_back(&j);
+        cv.notify_all(); // the ui thread may be waiting for the next piece
         cv.wait(l, [&] { return j.done || (stop && !j.taken); });
         if (!j.done)
             queue.erase(std::remove(queue.begin(), queue.end(), &j), queue.end());
@@ -214,13 +217,21 @@ void app_mcp_pump(app_state& s)
     if (!s.mcp)
         return;
     app_mcp& m = *s.mcp;
-    // the waiting tool calls, one after another; each is short (a lookup, a decompile, a step)
-    for (int i = 0; i < 64; i++) {
+    // the waiting tool calls, one after another; each is short (a lookup, a decompile, a step).
+    // a tool that works in small pieces (stepping, waiting for a stop) sends the next one within
+    // microseconds, so wait a moment for it rather than a whole frame
+    uint64_t budget_end = os::now_ms() + 8;
+    for (int i = 0; i < 4096; i++) {
         app_mcp::job* j = nullptr;
         {
-            std::lock_guard<std::mutex> l(m.m);
-            if (m.queue.empty())
-                break;
+            std::unique_lock<std::mutex> l(m.m);
+            if (m.queue.empty()) {
+                if (i == 0 || os::now_ms() >= budget_end)
+                    break;
+                m.cv.wait_for(l, std::chrono::milliseconds(1), [&] { return !m.queue.empty() || m.stop.load(); });
+                if (m.queue.empty())
+                    break;
+            }
             j = m.queue.front();
             m.queue.pop_front();
             j->taken = true;

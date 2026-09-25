@@ -140,6 +140,10 @@ static void debug_menu(app_state& s)
         dbg_step_into(s);
     if (ImGui::MenuItem(("Step over" + times).c_str(), "F8", false, can_step))
         dbg_step_over(s);
+    if (ImGui::MenuItem("Step out (run until return)", "Ctrl+F9", false, can_step))
+        dbg_step_out(s);
+    if (ImGui::MenuItem(("Step back" + times).c_str(), "Shift+F7", false, can_step && s.dbg.steps_recorded()))
+        dbg_step_back(s);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 7);
     if (ImGui::InputInt("instructions per step", &s.step_count, 1, 10))
         s.step_count = std::min(100000, std::max(1, s.step_count));
@@ -289,6 +293,15 @@ static void debug_buttons(app_state& s)
     if (ImGui::InputInt("##step_count", &s.step_count, 0, 0))
         s.step_count = std::min(100000, std::max(1, s.step_count));
     ImGui::SetItemTooltip("instructions per step: F7 / F8 run this many at once");
+    ImGui::SameLine();
+    if (tool("Step out", "run until this function returns (Ctrl+F9)", stopped))
+        dbg_step_out(s);
+    ImGui::SameLine();
+    size_t back = s.dbg.steps_recorded();
+    if (tool("Back", back ? util::fmt("step back - undo the last step (Shift+F7), %zu can be undone", back).c_str()
+                          : "step back (Shift+F7): steps you take with F7 / F8 can be undone",
+            stopped && back))
+        dbg_step_back(s);
     ImGui::SameLine();
     if (tool("Pause", "break into the running program (F12)", ds == dbg_state::running || dbg_stepping(s)))
         dbg_pause(s);

@@ -929,6 +929,62 @@ void add_debug_tools(std::vector<tool>& t)
         },
         true);
 
+    add("debug_step_out", "Run until the current function returns (calls in between run at full speed), then stop in "
+        "the caller.",
+        schema({{"timeout_ms", prop("integer", "how long to keep stepping (default 15000)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            uint64_t until = os::now_ms() + (uint64_t)arg_int(args, "timeout_ms", 15000, 100, 120000);
+            for (int guard = 0; guard < 1000000; guard++) {
+                bool ok = false, last = false;
+                std::string err;
+                s.run([&] {
+                    debugger* d = stopped_dbg(s, out);
+                    if (!d)
+                        return;
+                    last = d->about_to_return();
+                    ok = s.debug.step_over && s.debug.step_over(err);
+                });
+                if (!ok) {
+                    if (out.empty())
+                        out = "can't step: " + err;
+                    return false;
+                }
+                out.clear();
+                if (!s.wait_stop((int)std::max<int64_t>(100, (int64_t)(until - std::min(until, os::now_ms())))))
+                    break;
+                std::string why;
+                s.run([&] {
+                    debugger* d = dbg_of(s);
+                    why = d ? d->stop_reason() : std::string();
+                });
+                if (last || (why != "step" && why != "step over") || os::now_ms() >= until)
+                    break;
+            }
+            return finish_run(s, 1000, out);
+        },
+        true);
+
+    add("debug_step_back", "Undo the last steps: puts back the memory and registers they changed. Only steps "
+        "(debug_step_into / debug_step_over) are recorded; continuing or stepping over a call starts over.",
+        schema({{"count", prop("integer", "how many steps (default 1)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            int n = arg_int(args, "count", 1, 1, 100000), done = 0;
+            std::string err;
+            s.run([&] {
+                debugger* d = stopped_dbg(s, out);
+                if (!d)
+                    return;
+                for (; done < n; done++)
+                    if (!d->step_back(err))
+                        break;
+                database* db = s.get_db ? s.get_db() : nullptr;
+                out = util::fmt("went back %d step%s", done, done == 1 ? "" : "s") + (done < n ? " (" + err + ")" : "") +
+                      util::fmt(", %zu more can be undone\n", d->steps_recorded()) + (db ? state_text(s, *db) : std::string());
+            });
+            return done > 0;
+        },
+        true);
+
     add("debug_run_to", "Run until an address or name is reached (or a breakpoint, or the timeout).",
         schema({{"address", prop("string", "hex address or name in the file")},
                 {"timeout_ms", prop("integer", "how long to wait (default 15000)")}},

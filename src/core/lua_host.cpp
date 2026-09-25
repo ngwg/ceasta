@@ -585,6 +585,33 @@ int dbg_cont(lua_State* L) { return dbg_action(L, &debugger::cont); }
 int dbg_step_into(lua_State* L) { return dbg_step(L, &debugger::step_into); }
 int dbg_step_over(lua_State* L) { return dbg_step(L, &debugger::step_over); }
 int dbg_pause(lua_State* L) { return dbg_action(L, &debugger::pause); }
+int dbg_step_back(lua_State* L) { return dbg_action(L, &debugger::step_back); }
+
+// step over until a return has run: ceasta.dbg.step_out() -> true when back in the caller
+int dbg_step_out(lua_State* L)
+{
+    debugger* d = need_dbg(L);
+    std::string err;
+    for (int guard = 0; guard < 1000000 && d->state() == dbg_state::stopped; guard++) {
+        bool last = d->about_to_return();
+        if (!d->step_over(err)) {
+            lua_pushboolean(L, false);
+            lua_pushstring(L, err.c_str());
+            return 2;
+        }
+        if (!wait_stopped(d, 30000))
+            break;
+        std::string why = d->stop_reason();
+        if (last) {
+            lua_pushboolean(L, true);
+            return 1;
+        }
+        if (why != "step" && why != "step over")
+            break; // a breakpoint or a fault on the way
+    }
+    lua_pushboolean(L, false);
+    return 1;
+}
 
 // runtime <-> listing addresses (they differ when the program was relocated by aslr)
 int dbg_to_static(lua_State* L)
@@ -765,6 +792,7 @@ static const luaL_Reg dbg_funcs[] = {
     {"read_ptr", dbg_read_ptr}, {"run_to", dbg_run_to},
     {"read", dbg_read}, {"write", dbg_write}, {"call", dbg_call}, {"trace", dbg_trace_fn},
     {"cont", dbg_cont}, {"step_into", dbg_step_into}, {"step_over", dbg_step_over}, {"pause", dbg_pause},
+    {"step_back", dbg_step_back}, {"step_out", dbg_step_out},
     {"wait", dbg_wait}, {"to_static", dbg_to_static}, {"to_runtime", dbg_to_runtime},
     {"add_bp", dbg_add_bp}, {"del_bp", dbg_del_bp},
     {nullptr, nullptr},

@@ -637,6 +637,8 @@ static void steps_finished(app_state& s)
         app_log(s, util::fmt("[debug] the program ended after %d of %d steps", done, wanted));
     else if (why != "step" && why != "step over") // a breakpoint, a fault, a pause
         app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, why.c_str(), pc_where(s).c_str()));
+    else if (s.step_until_return)
+        app_log(s, util::fmt("[debug] returned to %s (%d steps)", pc_where(s).c_str(), done));
     else
         app_log(s, util::fmt("[debug] %s %d instructions, now at %s", s.step_over_mode ? "stepped over" : "stepped into", done,
             pc_where(s).c_str()));
@@ -674,6 +676,8 @@ static void run_steps(app_state& s)
             break;
         if (os::now_ms() >= until)
             return;
+        if (s.step_until_return && s.dbg.about_to_return())
+            s.steps_left = 1; // this step leaves the function: the last one
         std::string err;
         if (!(s.step_over_mode ? s.dbg.step_over(err) : s.dbg.step_into(err))) {
             app_log(s, err, 1);
@@ -703,8 +707,43 @@ static void begin_steps(app_state& s, bool over)
     s.steps_left = s.steps_wanted = s.step_count;
     s.steps_done = 0;
     s.step_over_mode = over;
+    s.step_until_return = false;
     s.step_in_flight = false;
     run_steps(s);
+}
+
+void dbg_step_out(app_state& s)
+{
+    if (s.dbg.state() != dbg_state::stopped || dbg_stepping(s))
+        return;
+    // step over (calls run at full speed) until a return has run, a few steps per frame
+    s.steps_left = s.steps_wanted = 1000000;
+    s.steps_done = 0;
+    s.step_over_mode = true;
+    s.step_until_return = true;
+    s.step_in_flight = false;
+    run_steps(s);
+}
+
+void dbg_step_back(app_state& s)
+{
+    if (s.dbg.state() != dbg_state::stopped || dbg_stepping(s))
+        return;
+    int done = 0;
+    std::string err;
+    for (; done < s.step_count; done++)
+        if (!s.dbg.step_back(err))
+            break;
+    if (done) {
+        uint64_t st = 0;
+        if (app_to_static(s, s.dbg.pc(), st))
+            app_jump(s, st, false);
+        app_log(s, util::fmt("[debug] went back %d step%s to %s (%zu more can be undone)", done, done == 1 ? "" : "s",
+            pc_where(s).c_str(), s.dbg.steps_recorded()));
+        s.lua.fire("stop", (int64_t)(app_to_static(s, s.dbg.pc(), st) ? st : s.dbg.pc()));
+    }
+    if (done < s.step_count)
+        app_log(s, "[debug] " + err, 1);
 }
 
 void dbg_step_into(app_state& s)
@@ -889,10 +928,14 @@ static void shortcuts(app_state& s)
         dbg_stop(s);
     else if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F2, false))
         app_toggle_bp(s, s.cursor);
-    if (ImGui::IsKeyPressed(ImGuiKey_F9, false))
+    if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F9, false))
         dbg_continue(s);
-    if (ImGui::IsKeyPressed(ImGuiKey_F7, false))
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F7))
+        dbg_step_back(s);
+    else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F7, false))
         dbg_step_into(s);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F9))
+        dbg_step_out(s);
     if (ImGui::IsKeyPressed(ImGuiKey_F8, false))
         dbg_step_over(s);
     if (ImGui::IsKeyPressed(ImGuiKey_F4, false))

@@ -2,6 +2,8 @@
 #include "core/binary.h"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <vector>
 
 // thin wrapper over capstone. not thread safe, use one per thread.
 
@@ -58,6 +60,17 @@ public:
     bool decode(const uint8_t* buf, size_t n, uint64_t addr, insn& out);
     bool decode(const binary& b, uint64_t addr, insn& out);
     const char* reg_name(unsigned reg) const;
+
+    // the memory the instruction in buf writes when it runs, worked out from its operands and
+    // the registers' current values (reg gives one by name: "rdi", "esp", "eflags", ...). false
+    // when that can't be known ahead: a system call, an fs / gs relative write, a string write
+    // longer than 1 MB, ...
+    struct mem_write {
+        uint64_t addr;
+        uint32_t size;
+    };
+    bool writes(const uint8_t* buf, size_t n, uint64_t addr,
+        const std::function<bool(const char* reg, uint64_t& value)>& reg, std::vector<mem_write>& out);
 
 private:
     void close();

@@ -120,6 +120,7 @@ struct app_state {
     int steps_wanted = 0;
     bool step_over_mode = false;
     bool step_in_flight = false;
+    bool step_until_return = false; // the multi-step is a step out
     bool dbg_mapped = false;   // runtime addresses of the main image map onto the listing
     uint64_t dbg_delta = 0;    // runtime base - static base
     uint64_t dbg_image_size = 0;
@@ -191,6 +192,8 @@ void dbg_continue(app_state& s);
 void dbg_step_into(app_state& s);
 void dbg_step_over(app_state& s);
 bool dbg_stepping(const app_state& s); // a multi-instruction step is still going
+void dbg_step_out(app_state& s);       // run until the current function returns
+void dbg_step_back(app_state& s);      // undo the last steps (as many as a step does)
 void dbg_run_to_cursor(app_state& s);
 void dbg_pause(app_state& s);
 void dbg_stop(app_state& s);
