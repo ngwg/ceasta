@@ -980,6 +980,58 @@ std::vector<dbg_thread> debugger::threads() const
     return out;
 }
 
+// VirtualQueryEx over the address space: committed memory, named by the module it belongs to
+// or the thread whose stack it is
+std::vector<dbg_region> debugger::regions() const
+{
+    std::vector<dbg_region> out;
+    if (!d->process)
+        return out;
+    std::vector<std::pair<uint64_t, DWORD>> stacks; // a thread's sp, its id
+    if (d->state == dbg_state::stopped)
+        for (const auto& t : d->threads) {
+            thread_ctx c;
+            if (d->load_ctx(t.second, c))
+                stacks.push_back({c.sp(), t.first});
+        }
+    uint64_t a = 0, top = d->wow64 ? 0x100000000ull : 0x800000000000ull;
+    while (a < top) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (VirtualQueryEx(d->process, (LPCVOID)(uintptr_t)a, &mi, sizeof(mi)) != sizeof(mi))
+            break;
+        uint64_t base = (uint64_t)(uintptr_t)mi.BaseAddress, size = (uint64_t)mi.RegionSize;
+        if (size == 0)
+            break;
+        if (mi.State == MEM_COMMIT) {
+            DWORD p = mi.Protect & 0xFF;
+            dbg_region r;
+            r.base = base;
+            r.size = size;
+            r.perms = p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY ? "rwx"
+                    : p == PAGE_EXECUTE_READ ? "r-x"
+                    : p == PAGE_EXECUTE ? "--x"
+                    : p == PAGE_READWRITE || p == PAGE_WRITECOPY ? "rw-"
+                    : p == PAGE_READONLY ? "r--" : "---";
+            if (mi.Type == MEM_IMAGE) {
+                for (const dbg_module& m : d->modules)
+                    if (base >= m.base && base < m.base + (m.size ? m.size : 1))
+                        r.what = m.path.empty() ? m.name : m.path;
+            } else {
+                for (const auto& st : stacks)
+                    if (st.first >= base && st.first < base + size)
+                        r.what = util::fmt("[stack, thread %lu]", (unsigned long)st.second);
+                if (r.what.empty() && mi.Type == MEM_MAPPED)
+                    r.what = "[mapped]";
+            }
+            out.push_back(r);
+        }
+        if (base + size <= a)
+            break;
+        a = base + size;
+    }
+    return out;
+}
+
 bool debugger::select_thread(uint32_t tid)
 {
     if (!d->threads.count(tid))
@@ -1096,6 +1148,7 @@ uint32_t debugger::tid() const { return 0; }
 int debugger::exit_code() const { return 0; }
 std::string debugger::stop_reason() const { return std::string(); }
 std::vector<dbg_module> debugger::modules() const { return {}; }
+std::vector<dbg_region> debugger::regions() const { return {}; }
 std::vector<dbg_thread> debugger::threads() const { return {}; }
 bool debugger::select_thread(uint32_t) { return false; }
 std::vector<process_info> list_processes() { return {}; }

@@ -2,6 +2,7 @@
 
 #include "core/database.h"
 #include "core/debugger.h"
+#include "core/dbg_stack.h"
 #include "core/dbg_trace.h"
 #include "core/decompiler.h"
 #include "core/diff.h"
@@ -1194,6 +1195,57 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             }
             out = util::fmt("watching %s, %d byte%s: the program stops after a %s. debug_continue runs to it.",
                 watch_where(s, *db, *d, a).c_str(), size, size == 1 ? "" : "s", access ? "read or write" : "write");
+            return true;
+        });
+
+    add("debug_call_stack",
+        "How the stopped thread got here: the function it's in, then each caller (the call that made the frame "
+        "and where it returns to). Read from the stack without unwind tables, so treat deep frames as a good guess.",
+        schema({{"max_frames", prop("integer", "at most this many (default 32)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            auto func_start = [&s, db](uint64_t rt) -> uint64_t {
+                uint64_t st = 0;
+                if (!s.debug.to_static || !s.debug.to_static(rt, st))
+                    return 0;
+                const function* f = db->an.func_containing(st);
+                return f && s.debug.to_runtime ? s.debug.to_runtime(f->start) : 0;
+            };
+            std::vector<stack_frame> fr = dbg_call_stack(*d, arg_int(args, "max_frames", 32, 1, 256), func_start);
+            for (size_t i = 0; i < fr.size(); i++) {
+                std::string sym = symbolize(s, *db, *d, i ? fr[i].call : fr[i].pc);
+                out += util::fmt("#%zu  %s", i, (sym.empty() ? hexa(i ? fr[i].call : fr[i].pc) : sym).c_str());
+                out += i ? "  (call at " + hexa(fr[i].call) + ", returns to " + hexa(fr[i].pc) + ")\n" : "  (here, " + hexa(fr[i].pc) + ")\n";
+            }
+            return true;
+        });
+
+    add("debug_memory_map",
+        "The running program's memory map: each region's range, access (r/w/x) and what it is (a module or file, "
+        "[heap], [stack]). filter keeps the lines that contain it (e.g. \"libc\", \"rwx\", \"stack\").",
+        schema({{"filter", prop("string", "optional: only lines containing this")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            debugger* d = stopped_dbg(s, out);
+            if (!d)
+                return false;
+            std::string f = util::lower(util::trim(arg_str(args, "filter")));
+            int n = 0;
+            for (const dbg_region& r : d->regions()) {
+                std::string line = util::fmt("%s-%s %s %s", hexa(r.base).c_str(), hexa(r.base + r.size).c_str(), r.perms.c_str(),
+                    r.what.c_str());
+                if (!f.empty() && util::lower(line).find(f) == std::string::npos)
+                    continue;
+                out += line + "\n";
+                if (++n >= 2000) {
+                    out += "(more left out)\n";
+                    break;
+                }
+            }
+            if (out.empty())
+                out = f.empty() ? "no memory map\n" : "nothing matches " + f + "\n";
             return true;
         });
 

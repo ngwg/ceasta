@@ -113,6 +113,8 @@ struct app_state {
     uint64_t hex_addr = 0;
     bool hex_follow = true;
     bool hex_live = false;
+    bool hex_process = false; // the hex view shows the process's memory at hex_rt (heap, stack, ...)
+    uint64_t hex_rt = 0;
 
     dialog_state dialog;
 
@@ -128,6 +130,7 @@ struct app_state {
     bp_conditions conditions;         // evaluates breakpoint conditions
     std::map<uint64_t, int> bp_hits;  // per breakpoint (static address), this run
     bool auto_continue = false;       // a breakpoint whose condition was false: keep running
+    uint64_t stop_seq = 0;            // bumps at every stop: views keep what they read until then
     bool dbg_mapped = false;   // runtime addresses of the main image map onto the listing
     uint64_t dbg_delta = 0;    // runtime base - static base
     uint64_t dbg_image_size = 0;
@@ -200,7 +203,7 @@ void app_bp_key(app_state& s, uint64_t addr);
 // (the heap, the stack); del_watch takes the runtime address the debugger lists
 bool app_add_watch(app_state& s, uint64_t addr, int size, bool access, std::string& err);
 bool app_del_watch(app_state& s, uint64_t runtime);
-std::string app_where_runtime(const app_state& s, uint64_t runtime); // a name in the listing, or hex
+std::string app_where_runtime(const app_state& s, uint64_t runtime); // a name in the listing, module+offset, or hex
 std::string app_stop_text(const app_state& s); // the stop reason, a watched address by its name
 // a condition for the breakpoint at addr (adds the breakpoint); "" makes it unconditional
 bool app_set_bp_condition(app_state& s, uint64_t addr, const std::string& expr, std::string& err);
@@ -219,6 +222,11 @@ void dbg_pause(app_state& s);
 void dbg_stop(app_state& s);
 void dbg_detach(app_state& s);
 bool app_to_static(const app_state& s, uint64_t runtime, uint64_t& out);
+// the hex view on a runtime address: the file's bytes (live) when it's in the image, else the
+// process's memory there
+void app_show_memory(app_state& s, uint64_t runtime);
+// the function start (runtime) an address is in, 0 when it isn't in the image: for the call stack
+uint64_t app_func_start_runtime(const app_state& s, uint64_t runtime);
 
 // the ai server: an mcp client (claude code, cursor, ...) on this machine works on the open file.
 // tool calls run on the ui thread, between frames

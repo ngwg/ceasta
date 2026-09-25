@@ -52,6 +52,8 @@ static void registers(app_state& s)
             uint64_t st;
             if (ImGui::MenuItem("Show in listing", nullptr, false, app_to_static(s, r.value, st)))
                 app_jump(s, st);
+            if (ImGui::MenuItem("Show in hex"))
+                app_show_memory(s, r.value);
             ImGui::EndPopup();
         }
         ImGui::PopID();
@@ -104,6 +106,18 @@ static void stack(app_state& s)
             uint64_t st;
             if (app_to_static(s, v, st))
                 app_jump(s, st);
+        }
+        if (ImGui::BeginPopupContextItem("##stack_ctx")) {
+            uint64_t st;
+            if (ImGui::MenuItem("Show in listing", nullptr, false, app_to_static(s, v, st)))
+                app_jump(s, st);
+            if (ImGui::MenuItem("Show in hex (what it points to)"))
+                app_show_memory(s, v);
+            if (ImGui::MenuItem("Show this stack slot in hex"))
+                app_show_memory(s, sp + (uint64_t)(i * ps));
+            if (ImGui::MenuItem("Copy value"))
+                ImGui::SetClipboardText(vs.c_str());
+            ImGui::EndPopup();
         }
         ImGui::PopID();
         ImGui::TableNextColumn();

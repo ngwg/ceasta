@@ -514,6 +514,30 @@ uint64_t app_to_runtime(const app_state& s, uint64_t addr)
     return s.dbg_mapped ? addr + s.dbg_delta : addr;
 }
 
+void app_show_memory(app_state& s, uint64_t runtime)
+{
+    uint64_t st = 0;
+    if (app_to_static(s, runtime, st)) {
+        s.hex_process = false;
+        s.hex_addr = st;
+        s.hex_live = true;
+    } else {
+        s.hex_process = true;
+        s.hex_rt = runtime;
+    }
+    s.bottom_tab_request = 1;
+    s.show_bottom = true;
+}
+
+uint64_t app_func_start_runtime(const app_state& s, uint64_t runtime)
+{
+    uint64_t st = 0;
+    if (!app_to_static(s, runtime, st))
+        return 0;
+    const function* f = s.db->an.func_containing(st);
+    return f ? app_to_runtime(s, f->start) : 0;
+}
+
 bool app_pc_static(const app_state& s, uint64_t& out)
 {
     return s.dbg.state() == dbg_state::stopped && app_to_static(s, s.dbg.pc(), out);
@@ -618,7 +642,12 @@ void app_bp_key(app_state& s, uint64_t addr)
 std::string app_where_runtime(const app_state& s, uint64_t runtime)
 {
     uint64_t st = 0;
-    return app_to_static(s, runtime, st) ? s.db->location(st) : util::hex(runtime);
+    if (app_to_static(s, runtime, st))
+        return s.db->location(st);
+    for (const dbg_module& m : s.dbg.modules())
+        if (runtime >= m.base && runtime - m.base < m.size)
+            return m.name + "+" + util::hex(runtime - m.base);
+    return util::hex(runtime);
 }
 
 bool app_add_watch(app_state& s, uint64_t addr, int size, bool access, std::string& err)
@@ -838,6 +867,7 @@ void dbg_step_back(app_state& s)
         app_log(s, util::fmt("[debug] went back %d step%s to %s (%zu more can be undone)", done, done == 1 ? "" : "s",
             pc_where(s).c_str(), s.dbg.steps_recorded()));
         s.lua.fire("stop", (int64_t)(app_to_static(s, s.dbg.pc(), st) ? st : s.dbg.pc()));
+        s.stop_seq++;
     }
     if (done < s.step_count)
         app_log(s, "[debug] " + err, 1);
@@ -892,6 +922,7 @@ static void setup_debugger(app_state& s)
     s.dbg.on_log = [&s](const std::string& m) { app_log(s, "[debug] " + m); };
     s.dbg.on_created = [&s]() { map_debuggee(s); };
     s.dbg.on_stop = [&s]() {
+        s.stop_seq++;
         uint64_t pc_static = 0;
         bool mapped = app_to_static(s, s.dbg.pc(), pc_static);
         // a breakpoint with a condition stops only when the condition holds

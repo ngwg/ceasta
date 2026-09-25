@@ -132,6 +132,7 @@ struct debugger::impl {
     int exit_code = 0;
     std::string reason;
     std::vector<dbg_module> modules;
+    uint64_t stop_seq = 0, maps_seq = 0; // libraries load after exec: reread the maps after a stop
 
     void log(const std::string& s) const
     {
@@ -399,6 +400,7 @@ struct debugger::impl {
         reason = why;
         stepping = step::none;
         step_tid = 0;
+        stop_seq++;
         if (owner.on_stop)
             owner.on_stop();
     }
@@ -1154,7 +1156,42 @@ uint32_t debugger::pid() const { return (uint32_t)d->pid; }
 uint32_t debugger::tid() const { return (uint32_t)d->cur_tid; }
 int debugger::exit_code() const { return d->exit_code; }
 std::string debugger::stop_reason() const { return d->reason; }
-std::vector<dbg_module> debugger::modules() const { return d->modules; }
+std::vector<dbg_module> debugger::modules() const
+{
+    if (d->state == dbg_state::stopped && d->maps_seq != d->stop_seq) {
+        d->scan_maps();
+        d->maps_seq = d->stop_seq;
+    }
+    return d->modules;
+}
+
+// /proc/<pid>/maps: "lo-hi perms offset dev inode path"
+std::vector<dbg_region> debugger::regions() const
+{
+    std::vector<dbg_region> out;
+    if (!d->pid)
+        return out;
+    for (const std::string& line : util::split(slurp("/proc/" + std::to_string(d->pid) + "/maps"), "\n")) {
+        size_t dash = line.find('-'), sp1 = line.find(' ');
+        if (dash == std::string::npos || sp1 == std::string::npos || sp1 < dash)
+            continue;
+        dbg_region r;
+        r.base = strtoull(line.c_str(), nullptr, 16);
+        uint64_t hi = strtoull(line.c_str() + dash + 1, nullptr, 16);
+        if (hi <= r.base)
+            continue;
+        r.size = hi - r.base;
+        r.perms = line.substr(sp1 + 1, 3);
+        // the path is the sixth field, and may contain spaces
+        size_t at = sp1;
+        for (int field = 0; field < 4 && at != std::string::npos; field++)
+            at = line.find_first_not_of(' ', line.find(' ', at + 1));
+        if (at != std::string::npos && at < line.size())
+            r.what = util::trim(line.substr(at));
+        out.push_back(r);
+    }
+    return out;
+}
 
 std::vector<dbg_thread> debugger::threads() const
 {

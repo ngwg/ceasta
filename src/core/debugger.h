@@ -28,6 +28,14 @@ struct dbg_thread {
     uint64_t pc = 0;
 };
 
+// a range of the process's memory with one set of permissions
+struct dbg_region {
+    uint64_t base = 0;
+    uint64_t size = 0;
+    std::string perms; // "r-x", "rw-", "---"
+    std::string what;  // the module / file it maps, "[stack]", "[heap]", or "" for anonymous memory
+};
+
 class debugger {
 public:
     debugger();
@@ -99,6 +107,7 @@ public:
     int exit_code() const;
     std::string stop_reason() const;
     std::vector<dbg_module> modules() const;
+    std::vector<dbg_region> regions() const; // the memory map, by address
     std::vector<dbg_thread> threads() const;
     bool select_thread(uint32_t tid);
 

@@ -119,6 +119,7 @@ static void row_menu(app_state& s, uint64_t a)
     }
     if (ImGui::MenuItem("Show in hex")) {
         s.hex_addr = a;
+        s.hex_process = false;
         s.bottom_tab_request = 1;
         s.show_bottom = true;
     }

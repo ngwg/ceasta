@@ -2,6 +2,7 @@
 
 #include "core/bp_cond.h"
 #include "core/database.h"
+#include "core/dbg_stack.h"
 #include "core/dbg_trace.h"
 #include "core/debugger.h"
 #include "core/decompiler.h"
@@ -246,7 +247,8 @@ void help()
         "  r                 registers            set <reg> <val>\n"
         "  u [addr] [n]      disassemble          dec [addr]  decompile the function\n"
         "  x <addr> [n]      hex dump memory      k [n]  stack\n"
-        "  bt                where am i (pc + function)\n"
+        "  bt                call stack: how it got here\n"
+        "  maps [filter]     memory map (e.g. maps libc, maps rwx)\n"
         "  call <f> [args]   call a function, print its result (args: number, name, \"string\")\n"
         "  trace [n]         single-step n insns, record indirect call / jump targets as xrefs\n"
         "  mods              modules              threads / thread <tid>\n"
@@ -496,8 +498,20 @@ int cmd_dbg(int argc, char** argv)
         } else if (c == "k" || c == "stack") {
             cmd_stack(tok.size() > 1 ? atoi(tok[1].c_str()) : 8);
         } else if (c == "bt" || c == "where") {
-            uint64_t pc = g_dbg.pc();
-            printf("pc = %s (%s)\n", util::hex(pc).c_str(), loc_rt(pc).c_str());
+            auto func_start = [](uint64_t rt) -> uint64_t {
+                uint64_t st;
+                const function* f = in_image(rt, st) ? g_db->an.func_containing(st) : nullptr;
+                return f ? to_rt(f->start) : 0;
+            };
+            std::vector<stack_frame> fr = dbg_call_stack(g_dbg, 64, func_start);
+            for (size_t i = 0; i < fr.size(); i++)
+                printf("  #%-2zu %-32s %s\n", i, loc_rt(i ? fr[i].call : fr[i].pc).c_str(),
+                    i ? ("returns to " + util::hex(fr[i].pc)).c_str() : "");
+        } else if (c == "maps" || c == "vmmap") {
+            std::string f = tok.size() > 1 ? util::lower(tok[1]) : std::string();
+            for (const dbg_region& r : g_dbg.regions())
+                if (f.empty() || util::lower(r.perms + " " + r.what).find(f) != std::string::npos)
+                    printf("  %016" PRIx64 "-%016" PRIx64 " %s %s\n", r.base, r.base + r.size, r.perms.c_str(), r.what.c_str());
         } else if (c == "mods" || c == "modules") {
             for (const dbg_module& m : g_dbg.modules())
                 printf("  %016" PRIx64 "  %s\n", m.base, m.name.c_str());

@@ -75,6 +75,10 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
         d.addr = db.an.item_head(addr);
         auto c = db.bp_conditions.find(d.addr);
         snprintf(d.buf, sizeof(d.buf), "%s", c == db.bp_conditions.end() ? "" : c->second.c_str());
+    } else if (kind == dialog_kind::watch && !db.bin.is_mapped(addr)) {
+        // process memory (the heap, a stack): the address as it is
+        snprintf(d.buf, sizeof(d.buf), "%s", util::hex(addr).c_str());
+        d.watch_size = addr % 4 ? 1 : 4;
     } else if (kind == dialog_kind::watch) {
         // the variable under the cursor: its name, and its size when the cpu can watch that
         uint64_t head = db.an.item_head(addr);
