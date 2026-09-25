@@ -30,6 +30,7 @@ struct import_entry {
     std::string lib;
     std::string name;   // "#12" for ordinal only imports
     uint64_t slot = 0;  // iat / got slot the code reads the address from
+    bool delay = false; // a pe delay-load import
 };
 
 struct export_entry {

@@ -1,4 +1,5 @@
 #include "app.h"
+#include "core/exchange.h"
 #include "core/os.h"
 #include "core/util.h"
 #include "imgui.h"
@@ -237,6 +238,8 @@ static void finish_job(app_state& s)
     s.scroll_to_cursor = true;
     for (const std::string& n : b.notes)
         app_log(s, n, 1);
+    for (const std::string& w : s.db->info.warnings) // packed, an embedded program, an overlay, ...
+        app_log(s, "note: " + w, 1);
     app_log(s, util::fmt("%s: %s %s %s, %zu functions, %zu imports, %zu strings", b.name.c_str(), format_name(b.format),
         arch_name(b.arch), b.kind.c_str(), s.db->an.funcs.size(), b.imports.size(), s.db->an.strings.size()));
     if (!s.db->user_names.empty() || !s.db->user_comments.empty())
@@ -626,6 +629,44 @@ void app_toggle_bp(app_state& s, uint64_t addr)
     }
     s.db->dirty = true;
     s.version++;
+}
+
+void app_export_for(app_state& s, int tool)
+{
+    if (!s.db || !s.platform.save_file_dialog)
+        return;
+    static const char* const titles[] = {"Export for IDA (an IDAPython script)", "Export for Ghidra (a script)",
+                                          "Export for x64dbg (a database)"};
+    tool = std::max(0, std::min(2, tool));
+    std::string ext = tool == 0 ? ".ida.py" : tool == 1 ? ".ghidra.py" : s.db->bin.is64() ? ".dd64" : ".dd32";
+    std::string path = s.platform.save_file_dialog(titles[tool], s.db->bin.path + ext);
+    if (path.empty())
+        return;
+    std::string text = tool == 0 ? export_ida(*s.db) : tool == 1 ? export_ghidra(*s.db) : export_x64dbg(*s.db), err;
+    if (!os::write_file(path, text, err)) {
+        app_log(s, "can't write " + path + ": " + err, 2);
+        return;
+    }
+    static const char* const how[] = {"in IDA: File > Script file", "in Ghidra: Window > Script Manager, run it",
+                                      "in x64dbg: File > Import database"};
+    app_log(s, util::fmt("wrote %s: %zu names, %zu comments, %zu prototypes (%s)", path.c_str(), s.db->user_names.size(),
+        s.db->user_comments.size(), s.db->protos.size(), how[tool]));
+}
+
+void app_import_names(app_state& s)
+{
+    if (!s.db || !s.platform.open_file_dialog)
+        return;
+    std::string path = s.platform.open_file_dialog("Import names (x64dbg .dd64 / .dd32, .map, ida / ghidra .json)");
+    if (path.empty())
+        return;
+    import_result r = import_names(*s.db, path); // one frame: one undo step
+    if (!r.error.empty()) {
+        app_log(s, r.error, 2);
+        return;
+    }
+    app_names_changed(s);
+    app_log(s, "imported " + r.summary() + " - ctrl+z takes it back");
 }
 
 void app_bp_key(app_state& s, uint64_t addr)

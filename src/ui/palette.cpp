@@ -61,6 +61,12 @@ static const std::vector<action>& actions()
 
         {"View", "Listing", "Space", has_file, [](app_state& s) { s.view = center_view::listing; }},
         {"View", "Function graph", "Space", has_file, [](app_state& s) { s.view = center_view::graph; }},
+        {"File", "Export for IDA (an IDAPython script)...", "", has_file, [](app_state& s) { app_export_for(s, 0); }},
+        {"File", "Export for Ghidra (a script)...", "", has_file, [](app_state& s) { app_export_for(s, 1); }},
+        {"File", "Export for x64dbg (a database)...", "", has_file, [](app_state& s) { app_export_for(s, 2); }},
+        {"File", "Import names from IDA / Ghidra / x64dbg / a .map...", "", has_file, [](app_state& s) { app_import_names(s); }},
+        {"View", "File info: headers, hashes, sections, resources", "", has_file,
+            [](app_state& s) { s.right_tab_request = 3, s.show_right = true; }},
         {"View", "Pseudocode (decompiler)", "F5", has_file, [](app_state& s) { s.view = center_view::pseudo; }},
         {"View", "Listing and pseudocode side by side", "Shift+F5", has_file, [](app_state& s) { s.view = center_view::split; }},
         {"Edit", "Function prototype (return type, parameters)...", "Y in pseudocode",

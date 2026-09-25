@@ -86,6 +86,8 @@ add_library(ceasta_core STATIC
     src/core/diff.cpp
     src/core/disasm.cpp
     src/core/elf.cpp
+    src/core/exchange.cpp
+    src/core/fileinfo.cpp
     src/core/json.cpp
     src/core/lua_host.cpp
     src/core/mcp.cpp

@@ -33,6 +33,20 @@ static void file_menu(app_state& s)
     if (ImGui::MenuItem("Close file", nullptr, false, s.db != nullptr))
         app_close_file(s);
     ImGui::Separator();
+    if (ImGui::BeginMenu("Export for", s.db != nullptr)) {
+        if (ImGui::MenuItem("IDA..."))
+            app_export_for(s, 0);
+        if (ImGui::MenuItem("Ghidra..."))
+            app_export_for(s, 1);
+        if (ImGui::MenuItem("x64dbg..."))
+            app_export_for(s, 2);
+        ImGui::EndMenu();
+    }
+    ImGui::SetItemTooltip("your names, comments, prototypes and breakpoints, as a script / database that tool reads");
+    if (ImGui::MenuItem("Import names (IDA, Ghidra, x64dbg)...", nullptr, false, s.db && s.platform.open_file_dialog))
+        app_import_names(s);
+    ImGui::SetItemTooltip("an x64dbg database, a .map file, or the .json of scripts/ida_to_ceasta.py or ghidra_to_ceasta.py");
+    ImGui::Separator();
     if (ImGui::MenuItem("Exit", "Alt+F4"))
         app_quit(s);
     ImGui::EndMenu();

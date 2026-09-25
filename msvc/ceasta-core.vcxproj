@@ -55,6 +55,8 @@
     <ClCompile Include="..\src\core\diff.cpp" />
     <ClCompile Include="..\src\core\disasm.cpp" />
     <ClCompile Include="..\src\core\elf.cpp" />
+    <ClCompile Include="..\src\core\exchange.cpp" />
+    <ClCompile Include="..\src\core\fileinfo.cpp" />
     <ClCompile Include="..\src\core\json.cpp" />
     <ClCompile Include="..\src\core\lua_host.cpp" />
     <ClCompile Include="..\src\core\mcp.cpp" />

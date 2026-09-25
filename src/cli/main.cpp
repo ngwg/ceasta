@@ -2,6 +2,7 @@
 #include "cli/mcp_cmd.h"
 #include "core/database.h"
 #include "core/diff.h"
+#include "core/exchange.h"
 #include "core/os.h"
 #include "core/search.h"
 #include "core/signatures.h"
@@ -23,7 +24,8 @@ static void usage()
     printf("ceasta-cli %s\n\n"
            "usage: ceasta-cli <command> <file> [args] [options]\n\n"
            "commands:\n"
-           "  info <file>                   format, entry point, segments, loader notes\n"
+           "  info <file>                   what the file is: headers, security flags, hashes, sections\n"
+           "                                with entropy, resources, version info, warnings (packed, ...)\n"
            "  funcs <file>                  functions: address, size, name\n"
            "  imports <file>                imported functions\n"
            "  exports <file>                exported symbols\n"
@@ -38,6 +40,10 @@ static void usage()
            "                                comments and segments\n"
            "  diff <old> <new>              match functions between two files, show what changed\n"
            "  export <file>                 write a committable project file (<file>.ceasta)\n"
+           "    --ida out.py / --ghidra out.py / --x64dbg out.dd64\n"
+           "                                your names, comments and prototypes for those tools instead\n"
+           "  import <file> <names>         take names from an x64dbg database, a .map file, or the json\n"
+           "                                of scripts/ida_to_ceasta.py / ghidra_to_ceasta.py\n"
            "  sigmake <file> [out.sig]      make library signatures from a file that has symbols\n"
            "  sigapply <file> <in.sig>      name matching functions (--save to keep them)\n"
            "  run <file> <script.lua>       run a lua script against the file (ceasta.* api)\n"
@@ -313,6 +319,28 @@ int main(int argc, char** argv)
                 (unsigned long long)s.file_size);
         for (const std::string& n : b.notes)
             printf("note: %s\n", n.c_str());
+        const file_info& fi = db.info;
+        printf("\n");
+        for (const file_info::row& r : fi.header)
+            if (r.label != "file" && r.label != "entry point" && r.label != "image base")
+                printf("%-14s %s\n", r.label.c_str(), r.value.c_str());
+        printf("%-14s %s\n%-14s %s\n", "md5", fi.md5.c_str(), "sha256", fi.sha256.c_str());
+        if (!fi.imphash.empty())
+            printf("%-14s %s\n", "imphash", fi.imphash.c_str());
+        for (const file_info::row& r : fi.version)
+            printf("%-14s %s\n", r.label.c_str(), r.value.c_str());
+        printf("sections (entropy: 8 is random)\n");
+        for (const file_info::section& s : fi.sections)
+            printf("  %-12s %s  %8llx  %s  %.2f\n", s.name.c_str(), db.fmt_addr(s.addr).c_str(), (unsigned long long)s.size,
+                s.perms.c_str(), s.entropy);
+        if (!fi.resources.empty()) {
+            printf("resources\n");
+            for (const file_info::resource& r : fi.resources)
+                printf("  %-12s %-16s %8llu  %.2f  %s\n", r.type.c_str(), r.name.c_str(), (unsigned long long)r.size, r.entropy,
+                    r.note.c_str());
+        }
+        for (const std::string& w : fi.warnings)
+            printf("warning: %s\n", w.c_str());
         return 0;
     }
     if (cmd == "funcs") {
@@ -441,11 +469,46 @@ int main(int argc, char** argv)
     }
     if (cmd == "export") {
         std::string e;
+        bool other = false;
+        for (size_t i = 2; i + 1 < args.size(); i++) {
+            const std::string& o = args[i];
+            if (o != "--ida" && o != "--ghidra" && o != "--x64dbg")
+                continue;
+            other = true;
+            std::string text = o == "--ida" ? export_ida(db) : o == "--ghidra" ? export_ghidra(db) : export_x64dbg(db);
+            if (!os::write_file(args[i + 1], text, e)) {
+                fprintf(stderr, "can't write %s: %s\n", args[i + 1].c_str(), e.c_str());
+                return 1;
+            }
+            printf("wrote %s (%zu names, %zu comments, %zu prototypes)\n", args[i + 1].c_str(), db.user_names.size(),
+                db.user_comments.size(), db.protos.size());
+            i++;
+        }
+        if (other)
+            return 0;
         if (!db.save_project(e)) {
             fprintf(stderr, "can't write the project file: %s\n", e.c_str());
             return 1;
         }
         printf("wrote %s\n", db.project_path().c_str());
+        return 0;
+    }
+    if (cmd == "import") {
+        if (args.size() < 3) {
+            fprintf(stderr, "usage: ceasta-cli import <file> <x64dbg .dd64 | .map | names .json>\n");
+            return 2;
+        }
+        import_result r = import_names(db, args[2]);
+        if (!r.error.empty()) {
+            fprintf(stderr, "%s\n", r.error.c_str());
+            return 1;
+        }
+        std::string e;
+        if (!db.save_project(e)) {
+            fprintf(stderr, "can't write the project file: %s\n", e.c_str());
+            return 1;
+        }
+        printf("%s\nsaved to %s\n", r.summary().c_str(), db.project_path().c_str());
         return 0;
     }
     if (cmd == "sigmake") {

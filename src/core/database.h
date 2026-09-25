@@ -2,6 +2,7 @@
 #include "core/analysis.h"
 #include "core/binary.h"
 #include "core/disasm.h"
+#include "core/fileinfo.h"
 #include "core/protos.h"
 #include <map>
 #include <memory>
@@ -63,6 +64,7 @@ public:
     std::map<uint64_t, std::string> bp_conditions; // lua expressions (see bp_cond.h); no entry = always stop
     std::vector<xref> extra_xrefs;  // learned at runtime (indirect call / jump targets)
     uint32_t crc = 0;
+    file_info info;                 // headers, sections, resources, hashes, warnings (filled on load)
 
     // record a cross-reference the static analysis couldn't see (an indirect branch resolved
     // while debugging). merges into refs_to / refs_from and the listing. returns false if it

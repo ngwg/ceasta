@@ -211,8 +211,10 @@ void add_read_tools(std::vector<tool>& t)
     };
 
     add("get_binary_info",
-        "Overview of the loaded file: format, architecture, entry point, base address, segments, imported "
-        "libraries, and how many functions, imports, exports and strings the analysis found. A good first call.",
+        "Overview of the loaded file: format, architecture, entry point, base address, segments with their entropy, "
+        "imported libraries, security flags, hashes (md5, sha256, imphash), version info, resources, warnings "
+        "(packed, an embedded program, an overlay, .net), and how many functions, imports, exports and strings the "
+        "analysis found. A good first call.",
         schema({}), [](mcp_server& s, const json::value&, std::string& out) {
             database* db = need_db(s, out);
             if (!db)
@@ -237,6 +239,25 @@ void add_read_tools(std::vector<tool>& t)
                                  (sg.perms & perm_x) ? 'x' : '-');
             for (const std::string& n : b.notes)
                 out += "note: " + n + "\n";
+            const file_info& fi = db->info;
+            for (const file_info::row& r : fi.header)
+                if (r.label != "file" && r.label != "entry point" && r.label != "image base" && r.label != "format")
+                    out += util::fmt("%-9s %s\n", r.label.c_str(), r.value.c_str());
+            out += "md5       " + fi.md5 + "\nsha256    " + fi.sha256 + "\n";
+            if (!fi.imphash.empty())
+                out += "imphash   " + fi.imphash + "\n";
+            for (const file_info::row& r : fi.version)
+                out += "version   " + r.label + ": " + r.value + "\n";
+            out += "sections (entropy, 8 = random)\n";
+            for (const file_info::section& sc : fi.sections)
+                out += util::fmt("  %-12s %s  %s  %.2f\n", sc.name.c_str(), hexa(sc.addr).c_str(), sc.perms.c_str(), sc.entropy);
+            size_t shown = 0;
+            for (const file_info::resource& r : fi.resources)
+                if (shown++ < 40)
+                    out += util::fmt("resource  %s/%s %llu bytes, entropy %.2f%s\n", r.type.c_str(), r.name.c_str(),
+                        (unsigned long long)r.size, r.entropy, r.note.empty() ? "" : (", " + r.note).c_str());
+            for (const std::string& w : fi.warnings)
+                out += "warning: " + w + "\n";
             return true;
         });
 

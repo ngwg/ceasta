@@ -1295,6 +1295,7 @@ std::unique_ptr<database> open_database(const std::string& path, const load_opti
         return nullptr;
     }
     db->build();
+    db->info = inspect(db->bin);
     db->project_file = opts.project;
     if (db->project_file.empty() && os::exists(db->project_path()))
         db->project_file = db->project_path(); // a project someone started next to the file

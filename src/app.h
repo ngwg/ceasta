@@ -180,6 +180,10 @@ void app_open_dialog(app_state& s);
 void app_close_file(app_state& s);
 void app_save(app_state& s);
 void app_save_as(app_state& s); // pick where the project file goes
+// your names, comments, prototypes and breakpoints for another tool: 0 ida, 1 ghidra, 2 x64dbg
+void app_export_for(app_state& s, int tool);
+// names from an x64dbg database, a .map file, or the json of scripts/*_to_ceasta.py
+void app_import_names(app_state& s);
 // the window is about to close (its close button, alt+f4): true when it may close now. with
 // unsaved changes it asks first and returns false; the answer then closes it via platform.quit
 bool app_request_close(app_state& s);

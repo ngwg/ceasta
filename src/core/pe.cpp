@@ -91,7 +91,10 @@ void parse_delay_imports(binary& b, uint32_t rva)
         if (dll.empty() || iat == 0 || names == 0)
             continue;
         add_lib(b, dll);
+        size_t first = b.imports.size();
         read_thunks(b, dll, adj + names, adj + iat);
+        for (size_t k = first; k < b.imports.size(); k++)
+            b.imports[k].delay = true;
     }
 }
 
