@@ -275,18 +275,27 @@ static void header(app_state& s)
     } else {
         ImGui::TextDisabled("%s", db.location(s.cursor).c_str());
     }
-    float right = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
-    float bw = ImGui::CalcTextSize("Listing").x + ImGui::CalcTextSize("Graph").x + ImGui::CalcTextSize("Pseudocode").x +
-               ImGui::GetStyle().FramePadding.x * 6 + ImGui::GetStyle().ItemSpacing.x * 2 + ImGui::GetFrameHeight() * 3;
+    // the view switch: three small tabs on the right
+    static const char* const names[] = {"Listing", "Graph", "Pseudocode"};
+    static const char* const keys[] = {"Space switches listing / graph", "Space switches listing / graph", "F5"};
+    static const center_view views[] = {center_view::listing, center_view::graph, center_view::pseudo};
+    ImGuiStyle& st = ImGui::GetStyle();
+    float bw = st.ItemSpacing.x * 2;
+    for (const char* n : names)
+        bw += ImGui::CalcTextSize(n).x + st.FramePadding.x * 2 + 2;
+    float right = ImGui::GetWindowWidth() - st.WindowPadding.x;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX(), right - bw));
-    if (ImGui::RadioButton("Listing", s.view == center_view::listing))
-        s.view = center_view::listing;
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Graph", s.view == center_view::graph))
-        s.view = center_view::graph;
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Pseudocode", s.view == center_view::pseudo))
-        s.view = center_view::pseudo;
+    for (int i = 0; i < 3; i++) {
+        bool on = s.view == views[i];
+        ImGui::PushStyleColor(ImGuiCol_Button, on ? ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive) : ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(on ? ImGuiCol_Text : ImGuiCol_TextDisabled));
+        if (ImGui::Button(names[i]))
+            s.view = views[i];
+        ImGui::PopStyleColor(2);
+        ImGui::SetItemTooltip("%s", keys[i]);
+        if (i < 2)
+            ImGui::SameLine(0, 2);
+    }
 }
 
 void draw(app_state& s)

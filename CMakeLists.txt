@@ -112,6 +112,7 @@ set(ui_sources
     src/ui/graph_view.cpp
     src/ui/ida_view.cpp
     src/ui/left_panel.cpp
+    src/ui/palette.cpp
     src/ui/pseudo_view.cpp
     src/ui/right_panel.cpp
     src/ui/status_bar.cpp

@@ -2,7 +2,6 @@
 #include "core/util.h"
 #include "imgui.h"
 #include "theme.h"
-#include "ui/dialogs.h"
 #include <cstring>
 
 namespace cpu_panel {
@@ -17,40 +16,6 @@ static std::string describe(app_state& s, uint64_t v)
     if (str)
         return "\"" + util::escape(str->text, 40) + "\"";
     return s.db->location(st);
-}
-
-static void idle(app_state& s)
-{
-    std::string why;
-    bool can = app_can_debug(s, &why);
-    ImGui::TextDisabled("Debugger");
-    ImGui::Separator();
-    if (!can) {
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("%s", why.c_str());
-        ImGui::PopTextWrapPos();
-    }
-    ImGui::BeginDisabled(!can);
-    if (ImGui::Button("Start debugging (F9)"))
-        dbg_start(s);
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!debugger::supported());
-    if (ImGui::Button("Attach..."))
-        dialogs::open(s, dialog_kind::attach, 0);
-    ImGui::EndDisabled();
-    ImGui::Checkbox("stop at the entry point", &s.dbg.break_on_entry);
-    char args[512];
-    snprintf(args, sizeof(args), "%s", s.debug_args.c_str());
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputTextWithHint("##args", "program arguments", args, sizeof(args)))
-        s.debug_args = args;
-    ImGui::Spacing();
-    ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("F2 sets a breakpoint on the selected line. F7 / F8 step, F4 runs to the cursor.");
-    ImGui::PopTextWrapPos();
-    if (s.dbg.exit_code() != 0 || !s.dbg.stop_reason().empty())
-        ImGui::TextDisabled("last exit code: %d", s.dbg.exit_code());
 }
 
 static void registers(app_state& s)
@@ -151,33 +116,19 @@ static void stack(app_state& s)
 
 void draw(app_state& s)
 {
+    // the buttons live in the toolbar; this panel is what the program looks like right now
     dbg_state st = s.dbg.state();
     if (st == dbg_state::none) {
-        idle(s);
+        ImGui::TextDisabled("no program is being debugged");
         return;
     }
     if (st == dbg_state::running) {
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "running  (pid %u)", s.dbg.pid());
-        if (ImGui::Button("Pause (F12)"))
-            dbg_pause(s);
-        ImGui::SameLine();
-        if (ImGui::Button("Stop"))
-            dbg_stop(s);
         return;
     }
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::pc_arrow), "stopped: %s", s.dbg.stop_reason().c_str());
+    ImGui::SameLine();
     ImGui::TextDisabled("pid %u  thread %u", s.dbg.pid(), s.dbg.tid());
-    if (ImGui::Button("Continue"))
-        dbg_continue(s);
-    ImGui::SameLine();
-    if (ImGui::Button("Step in"))
-        dbg_step_into(s);
-    ImGui::SameLine();
-    if (ImGui::Button("Step over"))
-        dbg_step_over(s);
-    ImGui::SameLine();
-    if (ImGui::Button("Stop"))
-        dbg_stop(s);
     ImGui::Separator();
     registers(s);
     ImGui::Separator();

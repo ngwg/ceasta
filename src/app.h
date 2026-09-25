@@ -39,7 +39,7 @@ struct load_job {
 enum class center_view { listing, graph, pseudo };
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai };
+    save_changes, ai, palette };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
@@ -63,6 +63,7 @@ struct dialog_state {
     int sel = 0;
     bool refocus = false;
     bool proceed = false; // save_changes answered with save / don't save
+    int run_action = -1;  // palette: the action to run once it has closed
 };
 
 struct app_state {

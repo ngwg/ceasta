@@ -791,6 +791,13 @@ static void shortcuts(app_state& s)
         app_set_font_size(s, 15);
     if (ImGui::IsKeyPressed(ImGuiKey_F1, false))
         dialogs::open(s, dialog_kind::shortcuts, 0);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_P))
+        dialogs::open(s, dialog_kind::palette, s.cursor);
+    // the mouse's back / forward buttons
+    if (ImGui::IsMouseClicked(3))
+        app_back(s);
+    if (ImGui::IsMouseClicked(4))
+        app_forward(s);
 
     // debugger keys work everywhere
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F2))
@@ -896,20 +903,24 @@ void app_frame(app_state& s)
         ImGui::SetCursorPos(ImVec2(x, origin.y));
         widgets::splitter("##split_right", true, bar, top_h, &s.right_w, 160.0f, 900.0f, -1.0f, sc);
         x += bar;
+        // the registers / stack panel only while there is a process; otherwise the lists get it all
+        bool cpu = s.dbg.state() != dbg_state::none;
         float usable = std::max(1.0f, top_h - bar);
-        float info_h = std::min(std::max(60.0f * sc, usable * s.right_split), usable - 60.0f * sc);
+        float info_h = cpu ? std::min(std::max(60.0f * sc, usable * s.right_split), usable - 60.0f * sc) : top_h;
         ImGui::SetCursorPos(ImVec2(x, origin.y));
         ImGui::BeginChild("##info", ImVec2(right_w, info_h), ImGuiChildFlags_Borders);
         right_panel::draw(s);
         ImGui::EndChild();
-        ImGui::SetCursorPos(ImVec2(x, origin.y + info_h));
-        float split_px = info_h;
-        if (widgets::splitter("##split_cpu", false, bar, right_w, &split_px, 60.0f * sc, usable - 60.0f * sc, 1.0f, 1.0f))
-            s.right_split = split_px / usable;
-        ImGui::SetCursorPos(ImVec2(x, origin.y + info_h + bar));
-        ImGui::BeginChild("##cpu", ImVec2(right_w, top_h - info_h - bar), ImGuiChildFlags_Borders);
-        cpu_panel::draw(s);
-        ImGui::EndChild();
+        if (cpu) {
+            ImGui::SetCursorPos(ImVec2(x, origin.y + info_h));
+            float split_px = info_h;
+            if (widgets::splitter("##split_cpu", false, bar, right_w, &split_px, 60.0f * sc, usable - 60.0f * sc, 1.0f, 1.0f))
+                s.right_split = split_px / usable;
+            ImGui::SetCursorPos(ImVec2(x, origin.y + info_h + bar));
+            ImGui::BeginChild("##cpu", ImVec2(right_w, top_h - info_h - bar), ImGuiChildFlags_Borders);
+            cpu_panel::draw(s);
+            ImGui::EndChild();
+        }
     }
     if (s.show_bottom) {
         ImGui::SetCursorPos(ImVec2(origin.x, origin.y + top_h));

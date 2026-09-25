@@ -1,4 +1,5 @@
 #include "ui/dialogs.h"
+#include "ui/palette.h"
 #include "core/util.h"
 #include "imgui.h"
 #include "theme.h"
@@ -25,6 +26,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::shortcuts: return "Keyboard shortcuts###dlg";
     case dialog_kind::save_changes: return "Save changes?###dlg";
     case dialog_kind::ai: return "Connect an AI###dlg";
+    case dialog_kind::palette: return "Actions###dlg";
     default: return "###dlg";
     }
 }
@@ -563,10 +565,11 @@ static void ai(app_state& s, dialog_state&)
 static void shortcuts(app_state&, dialog_state&)
 {
     static const char* const keys[][2] = {
+        {"Ctrl+Shift+P", "every action, searchable"},
         {"Ctrl+O", "open a file"},          {"Ctrl+S", "save"},
         {"Ctrl+Shift+S", "save the project as"},
         {"G", "jump to address / name"},    {"Enter / double click", "follow the operand"},
-        {"Esc / Alt+Left", "back"},         {"Ctrl+Enter / Alt+Right", "forward"},
+        {"Esc / Alt+Left / mouse back", "back"}, {"Ctrl+Enter / Alt+Right / mouse fwd", "forward"},
         {"N", "rename"},                    {";", "comment"},
         {"X", "references to here"},        {"Space", "listing / graph"},
         {"F5", "pseudocode (decompiler)"},  {"Ctrl+F", "search names, imports, strings, ..."},
@@ -613,9 +616,12 @@ void draw(app_state& s)
             then.swap(s.pending_close);
         else if (d.kind == dialog_kind::save_changes)
             s.pending_close = nullptr;
+        int action = d.kind == dialog_kind::palette ? d.run_action : -1;
         d.kind = dialog_kind::none;
         if (then)
             then();
+        if (action >= 0)
+            palette::run(s, action); // may open another dialog
         return;
     }
     // dialogs that need a file close themselves when the file goes away
@@ -636,6 +642,7 @@ void draw(app_state& s)
         case dialog_kind::shortcuts: shortcuts(s, d); break;
         case dialog_kind::save_changes: save_changes(s, d); break;
         case dialog_kind::ai: ai(s, d); break;
+        case dialog_kind::palette: palette::draw(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

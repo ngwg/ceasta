@@ -214,6 +214,8 @@ static void help_menu(app_state& s)
 {
     if (!ImGui::BeginMenu("Help"))
         return;
+    if (ImGui::MenuItem("All actions...", "Ctrl+Shift+P"))
+        dialogs::open(s, dialog_kind::palette, s.cursor);
     if (ImGui::MenuItem("Keyboard shortcuts", "F1"))
         dialogs::open(s, dialog_kind::shortcuts, 0);
     if (ImGui::MenuItem("About ceasta"))
@@ -231,63 +233,89 @@ static bool tool(const char* label, const char* tip, bool enabled = true)
     return r;
 }
 
+// looks like a search box; clicking it opens search (which also jumps to addresses and names)
+static void search_field(app_state& s, float width)
+{
+    ImGui::BeginDisabled(!s.db);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
+    bool clicked = ImGui::Button("search or jump to...###tb_search", ImVec2(width, 0));
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(4);
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("functions, names, imports, strings, comments or an address (Ctrl+F)\nevery action: Ctrl+Shift+P");
+    if (clicked)
+        dialogs::open(s, dialog_kind::find, s.cursor);
+}
+
+// the debugger's buttons: just Run until there is a process, the rest while debugging
+static void debug_buttons(app_state& s)
+{
+    dbg_state ds = s.dbg.state();
+    if (ds == dbg_state::none) {
+        std::string why;
+        bool can = app_can_debug(s, &why);
+        if (tool("Run", can ? "start debugging (F9)" : why.c_str(), can))
+            dbg_continue(s);
+        return;
+    }
+    bool stopped = ds == dbg_state::stopped && !dbg_stepping(s);
+    if (tool("Continue", "run to the next breakpoint (F9)", stopped))
+        dbg_continue(s);
+    ImGui::SameLine();
+    std::string times = s.step_count > 1 ? util::fmt(" x%d", s.step_count) : std::string();
+    if (tool(("Step in" + times + "###step_in").c_str(), "step into (F7)", stopped))
+        dbg_step_into(s);
+    ImGui::SameLine();
+    if (tool(("Step over" + times + "###step_over").c_str(), "step over (F8)", stopped))
+        dbg_step_over(s);
+    ImGui::SameLine(0, 2);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("x");
+    ImGui::SameLine(0, 2);
+    ImGui::SetNextItemWidth(ImGui::CalcTextSize("000000").x + ImGui::GetStyle().FramePadding.x * 2);
+    if (ImGui::InputInt("##step_count", &s.step_count, 0, 0))
+        s.step_count = std::min(100000, std::max(1, s.step_count));
+    ImGui::SetItemTooltip("instructions per step: F7 / F8 run this many at once");
+    ImGui::SameLine();
+    if (tool("Pause", "break into the running program (F12)", ds == dbg_state::running || dbg_stepping(s)))
+        dbg_pause(s);
+    ImGui::SameLine();
+    if (tool("Stop", "end the debugged program (Ctrl+F2)", true))
+        dbg_stop(s);
+}
+
 static void toolbar(app_state& s)
 {
     ImGuiStyle& st = ImGui::GetStyle();
     ImGui::SetCursorPos(ImVec2(st.ItemSpacing.x, ImGui::GetCursorPosY() + st.ItemSpacing.y));
-    bool has = s.db != nullptr;
-    if (tool("Open", "open a file to analyze (Ctrl+O)", !app_loading(s)))
+    if (tool("Open", "open a file or a .ceasta database (Ctrl+O)", !app_loading(s)))
         app_open_dialog(s);
     ImGui::SameLine();
-    if (tool("<", "back (Esc)", !s.back.empty()))
+    if (tool("<", "back (Esc, mouse back)", !s.back.empty()))
         app_back(s);
     ImGui::SameLine(0, 2);
-    if (tool(">", "forward (Ctrl+Enter)", !s.forward.empty()))
+    if (tool(">", "forward (Ctrl+Enter, mouse forward)", !s.forward.empty()))
         app_forward(s);
     ImGui::SameLine();
-    if (tool("Jump", "jump to an address or name (G)", has))
-        dialogs::open(s, dialog_kind::jump, s.cursor);
-    ImGui::SameLine();
-    if (tool("Search", "search functions, names, imports, exports, strings and comments (Ctrl+F)", has))
-        dialogs::open(s, dialog_kind::find, s.cursor);
-    ImGui::SameLine();
-    const char* view_label = s.view == center_view::listing ? "Graph" : "Listing";
-    if (tool(view_label, "switch between the listing and the function graph (Space)", has))
-        s.view = s.view == center_view::listing ? center_view::graph : center_view::listing;
-
-    ImGui::SameLine(0, st.ItemSpacing.x * 4);
-    dbg_state ds = s.dbg.state();
-    std::string why;
-    bool can = app_can_debug(s, &why);
-    if (tool(ds == dbg_state::stopped ? "Continue" : "Run", can || ds != dbg_state::none ? "start debugging / continue (F9)" : why.c_str(),
-            (ds == dbg_state::none && can) || ds == dbg_state::stopped))
-        dbg_continue(s);
-    ImGui::SameLine();
-    bool can_step = ds == dbg_state::stopped && !dbg_stepping(s);
-    std::string times = s.step_count > 1 ? util::fmt(" x%d", s.step_count) : std::string();
-    if (tool(("Step in" + times + "###step_in").c_str(), "step into (F7)", can_step))
-        dbg_step_into(s);
-    ImGui::SameLine();
-    if (tool(("Step over" + times + "###step_over").c_str(), "step over (F8)", can_step))
-        dbg_step_over(s);
-    ImGui::SameLine(0, 2);
-    // how many instructions one step runs
-    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8.0f);
-    if (ImGui::InputInt("##step_count", &s.step_count, 1, 10))
-        s.step_count = std::min(100000, std::max(1, s.step_count));
-    ImGui::SetItemTooltip("instructions per step: F7 / F8 and the step buttons run this many at once");
-    ImGui::SameLine();
-    if (tool("Pause", "break into the running program (F12)", ds == dbg_state::running))
-        dbg_pause(s);
-    ImGui::SameLine();
-    if (tool("Stop", "kill the debugged process (Ctrl+F2)", ds != dbg_state::none))
-        dbg_stop(s);
-
-    ImGui::SameLine(0, st.ItemSpacing.x * 4);
+    search_field(s, ImGui::GetFontSize() * 18);
+    ImGui::SameLine(0, st.ItemSpacing.x * 3);
+    debug_buttons(s);
     if (s.db) {
+        // what's open, on the right
         const binary& b = s.db->bin;
+        std::string what = util::fmt("%s  -  %s %s", b.name.c_str(), format_name(b.format), arch_name(b.arch));
+        float w = ImGui::CalcTextSize(what.c_str()).x;
+        float right = ImGui::GetWindowWidth() - st.ItemSpacing.x * 2 - w;
+        ImGui::SameLine(0, st.ItemSpacing.x * 3);
+        if (ImGui::GetCursorPosX() < right)
+            ImGui::SetCursorPosX(right);
         ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("%s  |  %s %s  |  %s", b.name.c_str(), format_name(b.format), arch_name(b.arch), b.kind.c_str());
+        ImGui::TextDisabled("%s", what.c_str());
+        ImGui::SetItemTooltip("%s", b.kind.c_str());
     }
     ImGui::Dummy(ImVec2(0, st.ItemSpacing.y));
 }

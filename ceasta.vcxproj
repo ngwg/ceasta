@@ -60,6 +60,7 @@
     <ClCompile Include="src\ui\graph_view.cpp" />
     <ClCompile Include="src\ui\ida_view.cpp" />
     <ClCompile Include="src\ui\left_panel.cpp" />
+    <ClCompile Include="src\ui\palette.cpp" />
     <ClCompile Include="src\ui\pseudo_view.cpp" />
     <ClCompile Include="src\ui\right_panel.cpp" />
     <ClCompile Include="src\ui\status_bar.cpp" />
@@ -81,6 +82,7 @@
     <ClInclude Include="src\ui\graph_view.h" />
     <ClInclude Include="src\ui\ida_view.h" />
     <ClInclude Include="src\ui\left_panel.h" />
+    <ClInclude Include="src\ui\palette.h" />
     <ClInclude Include="src\ui\pseudo_view.h" />
     <ClInclude Include="src\ui\right_panel.h" />
     <ClInclude Include="src\ui\status_bar.h" />
