@@ -40,12 +40,37 @@ static std::string open_file_dialog(const char* title)
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_hwnd;
-    ofn.lpstrFilter = L"Programs and libraries (*.exe;*.dll;*.sys;*.ocx;*.elf;*.so;*.bin)\0*.exe;*.dll;*.sys;*.ocx;*.elf;*.so;*.bin\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"Programs, libraries and projects (*.exe;*.dll;*.sys;*.ocx;*.elf;*.so;*.bin;*.ceasta)\0*.exe;*.dll;*.sys;*.ocx;*.elf;*.so;*.bin;*.ceasta\0"
+                      L"ceasta projects (*.ceasta)\0*.ceasta\0All files (*.*)\0*.*\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = sizeof(file) / sizeof(file[0]);
     ofn.lpstrTitle = wtitle.c_str();
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn))
+        return std::string();
+    return os::narrow(file);
+}
+
+static std::string save_file_dialog(const char* title, const std::string& suggested)
+{
+    wchar_t file[32768] = L"";
+    std::wstring start = os::widen(suggested);
+    size_t n = start.size() < 32767 ? start.size() : 32767;
+    for (size_t i = 0; i < n; i++)
+        file[i] = start[i];
+    file[n] = 0;
+    std::wstring wtitle = os::widen(title);
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFilter = L"ceasta projects (*.ceasta)\0*.ceasta\0All files (*.*)\0*.*\0";
+    ofn.lpstrDefExt = L"ceasta";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = sizeof(file) / sizeof(file[0]);
+    ofn.lpstrTitle = wtitle.c_str();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn))
         return std::string();
     return os::narrow(file);
 }
@@ -104,6 +129,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int)
     state.dpi_scale = scale;
     platform_api platform;
     platform.open_file_dialog = open_file_dialog;
+    platform.save_file_dialog = save_file_dialog;
     platform.set_title = [](const std::string& t) { SetWindowTextW(g_hwnd, os::widen(t).c_str()); };
     platform.quit = []() { PostMessageW(g_hwnd, WM_CLOSE, 0, 0); };
     app_init(state, platform, args);
@@ -127,12 +153,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int)
         if (done)
             break;
 
-        // keep the debugger pumping while the window is minimized / hidden
+        // keep the debugger (and the ai server) going while the window is minimized / hidden
         if (g_occluded && g_swapchain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
-            if (state.dbg.state() == dbg_state::running)
-                state.dbg.poll(10);
-            else
-                ::Sleep(10);
+            app_background(state);
             continue;
         }
         g_occluded = false;
@@ -275,6 +298,9 @@ static LRESULT WINAPI wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam
             return 0;
         break;
     case WM_CLOSE:
+        // unsaved changes: ask first; the answer closes the window again through platform.quit
+        if (g_app && !app_request_close(*g_app))
+            return 0;
         remember_placement(hwnd);
         break;
     case WM_DESTROY:

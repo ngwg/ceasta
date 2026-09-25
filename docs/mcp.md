@@ -12,7 +12,24 @@ ceasta-cli mcp <file> --allow-debug   # also expose the tools that run the progr
 ceasta-cli mcp <file> --allow-lua     # also expose run_lua (runs arbitrary lua)
 ```
 
-## quick start
+## from the app
+
+In ceasta itself: **AI > Connect an AI...**, then **Start the server**. It serves the file you
+have open at `http://127.0.0.1:8744/mcp` (the port is yours to change there) and shows what to
+paste into your client — for Claude Code:
+
+```
+claude mcp add --transport http ceasta http://127.0.0.1:8744/mcp
+```
+
+Cursor, VS Code and other clients take the same URL as an MCP server. The AI then works on
+exactly what you see: its renames, comments and breakpoints show up in the window straight away
+(and wait for your save, like your own edits), and with *let it use the debugger* ticked its
+debug session is the window's debugger, so you can watch it step. Every call is logged in the
+output panel, and the status bar shows the server and its call count. The server stops when
+you close ceasta.
+
+## quick start (command line)
 
 **Claude Code** — one line:
 
@@ -70,9 +87,16 @@ Lua's `io` / `os`, so it has your file access.
 ## a note on trust
 
 - The read and annotate tools only touch the file and ceasta's own project data.
-- `--allow-debug` **runs the target program** on your machine. Don't point it at malware
-  outside a VM, the same as you wouldn't run that program yourself.
-- `--allow-lua` lets the model run arbitrary code. Turn it on only when you want that.
+- `--allow-debug` (*let it use the debugger* in the app) **runs the target program** on your
+  machine. Don't point it at malware outside a VM, the same as you wouldn't run that program
+  yourself.
+- `--allow-lua` (*let it run Lua*) lets the model run arbitrary code. Turn it on only when you
+  want that.
+- The http server only answers programs on this machine: it listens on 127.0.0.1, and turns
+  away requests that come from a web page of another site (`Origin`) or name another host
+  (`Host`, so a dns-rebinding page can't reach it either).
 
-Names and comments the AI writes go into `<file>.ceasta` next to the binary (via
-`save_project`) or ceasta's user folder — plain text you can read, diff, and commit.
+Names and comments the AI writes are plain text you can read, diff, and commit: in the app they
+are saved with yours (File > Save, or a `.ceasta` project via File > Save project as...);
+`ceasta-cli mcp` writes them right away, to ceasta's user folder and to `<file>.ceasta` next to
+the binary once `save_project` has created it.

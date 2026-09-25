@@ -3,7 +3,9 @@
 #include "imgui.h"
 #include "theme.h"
 #include "version.h"
+#include <algorithm>
 #include <cstring>
+#include <functional>
 
 namespace dialogs {
 
@@ -15,20 +17,27 @@ static const char* title(dialog_kind k)
     case dialog_kind::comment: return "Comment###dlg";
     case dialog_kind::xrefs: return "References###dlg";
     case dialog_kind::search: return "Search bytes###dlg";
+    case dialog_kind::find: return "Search###dlg";
     case dialog_kind::open_raw: return "Open as raw code###dlg";
     case dialog_kind::attach: return "Attach to process###dlg";
     case dialog_kind::run_args: return "Program arguments###dlg";
     case dialog_kind::about: return "About ceasta###dlg";
     case dialog_kind::shortcuts: return "Keyboard shortcuts###dlg";
+    case dialog_kind::save_changes: return "Save changes?###dlg";
+    case dialog_kind::ai: return "Connect an AI###dlg";
     default: return "###dlg";
     }
 }
 
+static bool needs_file(dialog_kind k)
+{
+    return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
+           k == dialog_kind::search || k == dialog_kind::find;
+}
+
 void open(app_state& s, dialog_kind kind, uint64_t addr)
 {
-    bool needs_file = kind == dialog_kind::jump || kind == dialog_kind::rename || kind == dialog_kind::comment ||
-                      kind == dialog_kind::xrefs || kind == dialog_kind::search;
-    if (needs_file && !s.db)
+    if (needs_file(kind) && !s.db)
         return;
     dialog_state& d = s.dialog;
     d = dialog_state();
@@ -56,6 +65,8 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
             if (f)
                 d.addr = f->start;
         }
+    } else if (kind == dialog_kind::find) {
+        snprintf(d.buf, sizeof(d.buf), "%s", s.search_text.c_str());
     } else if (kind == dialog_kind::run_args) {
         snprintf(d.buf, sizeof(d.buf), "%s", s.debug_args.c_str());
     } else if (kind == dialog_kind::attach) {
@@ -216,6 +227,134 @@ static void search(app_state& s, dialog_state& d)
         ImGui::CloseCurrentPopup();
 }
 
+// up / down in the search box move the selection instead of the keyboard focus
+static int find_keys(ImGuiInputTextCallbackData* cb)
+{
+    int* move = (int*)cb->UserData;
+    if (cb->EventFlag == ImGuiInputTextFlags_CallbackHistory)
+        *move += cb->EventKey == ImGuiKey_UpArrow ? -1 : 1;
+    return 0;
+}
+
+static ImU32 hit_color(hit_kind k)
+{
+    switch (k) {
+    case hit_kind::function: return theme::func;
+    case hit_kind::name: return theme::label;
+    case hit_kind::import: return theme::call;
+    case hit_kind::export_: return theme::label;
+    case hit_kind::string: return theme::string;
+    case hit_kind::comment: return theme::comment;
+    case hit_kind::segment: return theme::segment;
+    default: return theme::addr;
+    }
+}
+
+static void find(app_state& s, dialog_state& d)
+{
+    database& db = *s.db;
+    ImGui::TextDisabled("functions, names, imports, exports, strings, comments and segments - or a hex address");
+    if (ImGui::IsWindowAppearing() || d.refocus)
+        ImGui::SetKeyboardFocusHere();
+    d.refocus = false;
+    int move = 0;
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 44);
+    bool enter = ImGui::InputTextWithHint("##find", "type to search", d.buf, sizeof(d.buf),
+        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_CallbackHistory,
+        find_keys, &move);
+
+    static const struct {
+        const char* label;
+        unsigned bit;
+    } kinds[] = {
+        {"functions", sk_functions}, {"names", sk_names},       {"imports", sk_imports},   {"exports", sk_exports},
+        {"strings", sk_strings},     {"comments", sk_comments}, {"segments", sk_segments},
+    };
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        if (i)
+            ImGui::SameLine();
+        bool on = (s.search_kinds & kinds[i].bit) != 0;
+        if (ImGui::Checkbox(kinds[i].label, &on)) {
+            s.search_kinds = on ? (s.search_kinds | kinds[i].bit) : (s.search_kinds & ~kinds[i].bit);
+            d.refocus = true; // straight back to typing
+        }
+    }
+
+    // search again when the query, the kinds or the names changed
+    std::string q = util::trim(d.buf);
+    if (q != d.hits_query || s.search_kinds != d.hits_kinds || s.version != d.hits_version) {
+        d.hits = search_everything(db, q, s.search_kinds, 1000, &d.hits_cut);
+        d.hits_query = q;
+        d.hits_kinds = s.search_kinds;
+        d.hits_version = s.version;
+        d.sel = 0;
+        s.search_text = q;
+    }
+    int n = (int)d.hits.size();
+    bool scroll = move != 0;
+    if (n)
+        d.sel = std::max(0, std::min(n - 1, d.sel + move));
+
+    uint64_t go = 0;
+    bool picked = false;
+    ImVec2 size(ImGui::GetFontSize() * 52, ImGui::GetTextLineHeightWithSpacing() * 16);
+    ImGuiTableFlags tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+                         ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable;
+    if (ImGui::BeginTable("##hits", 4, tf, size)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        float cw = ImGui::CalcTextSize("0").x;
+        ImGui::TableSetupColumn("Kind", 0, cw * 9);
+        ImGui::TableSetupColumn("Address", 0, cw * (float)std::max<size_t>(8, util::hex(db.bin.max_addr()).size() + 1));
+        ImGui::TableSetupColumn("Match", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Where", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clip;
+        clip.Begin(n);
+        if (scroll)
+            clip.IncludeItemByIndex(d.sel);
+        while (clip.Step())
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                const search_hit& h = d.hits[(size_t)i];
+                ImGui::PushID(i);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGuiSelectableFlags sf = ImGuiSelectableFlags_SpanAllColumns | (h.addr ? 0 : ImGuiSelectableFlags_Disabled);
+                if (ImGui::Selectable(hit_kind_name(h.kind), i == d.sel, sf)) {
+                    d.sel = i;
+                    go = h.addr;
+                    picked = true;
+                }
+                if (scroll && i == d.sel)
+                    ImGui::SetScrollHereY();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", h.addr ? util::hex(h.addr).c_str() : "forward");
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hit_color(h.kind)), "%s", h.text.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", h.extra.c_str());
+                ImGui::PopID();
+            }
+        ImGui::EndTable();
+    }
+    if (enter && n && d.hits[(size_t)d.sel].addr) {
+        go = d.hits[(size_t)d.sel].addr;
+        picked = true;
+    }
+
+    if (q.empty())
+        ImGui::TextDisabled("type a name, part of a string, an import, ... ; up / down pick, enter jumps");
+    else if (!n)
+        ImGui::TextDisabled("nothing matches \"%s\"", q.c_str());
+    else
+        ImGui::TextDisabled("%d result%s%s", n, n == 1 ? "" : "s", d.hits_cut ? " (up to 1000 of each kind)" : "");
+    if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+        ImGui::CloseCurrentPopup();
+    if (picked && go) {
+        app_jump(s, db.an.item_head(go));
+        ImGui::CloseCurrentPopup();
+    }
+}
+
 static void open_raw(app_state& s, dialog_state& d)
 {
     ImGui::TextDisabled("for shellcode, firmware and memory dumps");
@@ -297,7 +436,7 @@ static void run_args(app_state& s, dialog_state& d)
 static void about(app_state&, dialog_state&)
 {
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::func), "ceasta %s", CEASTA_VERSION);
-    ImGui::Text("disassembler + debugger with lua plugins");
+    ImGui::Text("disassembler, decompiler and debugger - with lua plugins and an ai server (mcp)");
     ImGui::Spacing();
     ImGui::TextDisabled("built with:");
     ImGui::BulletText("Dear ImGui %s (MIT)", IMGUI_VERSION);
@@ -309,15 +448,129 @@ static void about(app_state&, dialog_state&)
         ImGui::CloseCurrentPopup();
 }
 
+// asked before the file goes away with unsaved work (quit, close, open another)
+static void save_changes(app_state& s, dialog_state& d)
+{
+    if (!s.db) { // nothing left to save
+        d.proceed = true;
+        ImGui::CloseCurrentPopup();
+        return;
+    }
+    ImGui::Text("Save your changes to %s?", s.db->bin.name.c_str());
+    ImGui::TextDisabled("names, comments and breakpoints you added since the last save");
+    ImGui::TextDisabled("(don't save throws them away)");
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    ImGui::Spacing();
+    float bw = ImGui::GetFontSize() * 7;
+    bool save = ImGui::Button("Save", ImVec2(bw, 0));
+    // save is the default: enter presses it, tab moves on to the other buttons
+    ImGui::SetItemDefaultFocus();
+    if (ImGui::IsWindowAppearing())
+        ImGui::SetNavCursorVisible(true);
+    if (save) {
+        app_save(s);
+        if (s.db->dirty) {
+            d.error = "couldn't save - see the output panel";
+        } else {
+            d.proceed = true;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Don't save", ImVec2(bw, 0))) {
+        d.proceed = true;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(bw, 0))) {
+        s.pending_close = nullptr;
+        ImGui::CloseCurrentPopup();
+    }
+}
+
+// a line of text the user copies: shown in a read-only box, with a copy button
+static void copy_line(const char* id, const std::string& text)
+{
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", text.c_str());
+    ImGui::PushID(id);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 36);
+    ImGui::InputText("##text", buf, sizeof(buf), ImGuiInputTextFlags_ReadOnly);
+    ImGui::SameLine();
+    if (ImGui::Button("Copy"))
+        ImGui::SetClipboardText(text.c_str());
+    ImGui::PopID();
+}
+
+// the ai server: start / stop it, what the ai may do, and how to connect a client
+static void ai(app_state& s, dialog_state&)
+{
+    float wrap = ImGui::GetFontSize() * 42;
+    ImGui::PushTextWrapPos(wrap);
+    ImGui::TextUnformatted("Let an AI client (Claude Code, Cursor, ...) work on the file you have open: it can read, "
+                           "decompile, search, rename and comment - and, if you allow it, run the program under the "
+                           "debugger. You see everything it does here.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+
+    bool running = app_mcp_running(s);
+    std::string url = app_mcp_url(s), err = app_mcp_error(s);
+    if (ImGui::Button(running ? "Stop the server" : "Start the server", ImVec2(ImGui::GetFontSize() * 9, 0))) {
+        if (running)
+            app_mcp_stop(s);
+        else
+            app_mcp_start(s);
+    }
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    if (running && !url.empty())
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "listening on %s  (%d calls)", url.c_str(), app_mcp_calls(s));
+    else if (running)
+        ImGui::TextDisabled("starting...");
+    else if (!err.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", err.c_str());
+    else
+        ImGui::TextDisabled("not running");
+
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+    if (ImGui::InputInt("port", &s.mcp_port, 0, 0))
+        s.mcp_port = std::min(65535, std::max(1024, s.mcp_port));
+    ImGui::BeginDisabled(!debugger::supported() || s.sandboxed);
+    ImGui::Checkbox("let it use the debugger (the program runs on this computer)", &s.mcp_allow_debug);
+    ImGui::EndDisabled();
+    ImGui::Checkbox("let it run Lua (any code, with file and shell access)", &s.mcp_allow_lua);
+    ImGui::EndDisabled();
+    if (running)
+        ImGui::TextDisabled("stop the server to change these");
+
+    ImGui::Separator();
+    std::string u = url.empty() ? util::fmt("http://127.0.0.1:%d/mcp", s.mcp_port) : url;
+    ImGui::TextUnformatted("Claude Code - run this once:");
+    copy_line("cc", "claude mcp add --transport http ceasta " + u);
+    ImGui::TextUnformatted("Cursor, VS Code and other clients - add an MCP server with this URL:");
+    copy_line("url", u);
+    ImGui::PushTextWrapPos(wrap);
+    ImGui::TextDisabled("Only programs on this computer can connect. Renames and comments from the AI wait for your "
+                        "save, like your own. The server stops when you close ceasta.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+        ImGui::CloseCurrentPopup();
+}
+
 static void shortcuts(app_state&, dialog_state&)
 {
     static const char* const keys[][2] = {
-        {"Ctrl+O", "open a file"},          {"Ctrl+S", "save names and comments"},
+        {"Ctrl+O", "open a file"},          {"Ctrl+S", "save"},
+        {"Ctrl+Shift+S", "save the project as"},
         {"G", "jump to address / name"},    {"Enter / double click", "follow the operand"},
         {"Esc / Alt+Left", "back"},         {"Ctrl+Enter / Alt+Right", "forward"},
         {"N", "rename"},                    {";", "comment"},
         {"X", "references to here"},        {"Space", "listing / graph"},
-        {"F5", "pseudocode (decompiler)"},  {"Alt+B", "search bytes"},
+        {"F5", "pseudocode (decompiler)"},  {"Ctrl+F", "search names, imports, strings, ..."},
+        {"Alt+B", "search bytes"},
         {"Up / Down / PgUp / PgDn", "move in the listing"},
         {"F9", "start debugging / continue"}, {"F7", "step into"},
         {"F8", "step over"},                {"F4", "run to cursor"},
@@ -353,13 +606,20 @@ void draw(app_state& s)
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.4f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     bool open = true;
     if (!ImGui::BeginPopupModal(t, &open, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-        d.kind = dialog_kind::none; // closed with esc or the x
+        // closed with esc or the x. after "save changes?", go on with what was waiting, unless
+        // the answer was cancel
+        std::function<void()> then;
+        if (d.kind == dialog_kind::save_changes && d.proceed)
+            then.swap(s.pending_close);
+        else if (d.kind == dialog_kind::save_changes)
+            s.pending_close = nullptr;
+        d.kind = dialog_kind::none;
+        if (then)
+            then();
         return;
     }
     // dialogs that need a file close themselves when the file goes away
-    bool needs_file = d.kind == dialog_kind::jump || d.kind == dialog_kind::rename || d.kind == dialog_kind::comment ||
-                      d.kind == dialog_kind::xrefs || d.kind == dialog_kind::search;
-    if (needs_file && !s.db) {
+    if (needs_file(d.kind) && !s.db) {
         ImGui::CloseCurrentPopup();
     } else {
         switch (d.kind) {
@@ -368,11 +628,14 @@ void draw(app_state& s)
         case dialog_kind::comment: comment(s, d); break;
         case dialog_kind::xrefs: xrefs(s, d); break;
         case dialog_kind::search: search(s, d); break;
+        case dialog_kind::find: find(s, d); break;
         case dialog_kind::open_raw: open_raw(s, d); break;
         case dialog_kind::attach: attach(s, d); break;
         case dialog_kind::run_args: run_args(s, d); break;
         case dialog_kind::about: about(s, d); break;
         case dialog_kind::shortcuts: shortcuts(s, d); break;
+        case dialog_kind::save_changes: save_changes(s, d); break;
+        case dialog_kind::ai: ai(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

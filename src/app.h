@@ -2,6 +2,7 @@
 #include "core/database.h"
 #include "core/debugger.h"
 #include "core/lua_host.h"
+#include "core/search.h"
 #include "theme.h"
 #include <atomic>
 #include <cstdint>
@@ -14,6 +15,8 @@
 // what the window host provides (main.cpp on windows, stubs in the ui tests)
 struct platform_api {
     std::function<std::string(const char* title)> open_file_dialog; // "" when cancelled
+    // "" when cancelled; suggested is the path to start from
+    std::function<std::string(const char* title, const std::string& suggested)> save_file_dialog;
     std::function<void(const std::string&)> set_title;
     std::function<void()> quit;
 };
@@ -35,7 +38,10 @@ struct load_job {
 
 enum class center_view { listing, graph, pseudo };
 
-enum class dialog_kind { none, jump, rename, comment, xrefs, search, open_raw, attach, run_args, about, shortcuts };
+enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
+    save_changes, ai };
+
+struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
 struct dialog_state {
     dialog_kind kind = dialog_kind::none;
@@ -48,6 +54,15 @@ struct dialog_state {
     char raw_base[32] = "0";
     std::vector<process_info> procs;
     char filter[128] = {};
+    // search everything (find): the hits for the query / kinds / version they were made for
+    std::vector<search_hit> hits;
+    std::string hits_query;
+    unsigned hits_kinds = 0;
+    uint64_t hits_version = ~0ull;
+    bool hits_cut = false;
+    int sel = 0;
+    bool refocus = false;
+    bool proceed = false; // save_changes answered with save / don't save
 };
 
 struct app_state {
@@ -81,6 +96,8 @@ struct app_state {
     int bottom_tab_request = -1;
     char func_filter[128] = {};
     char info_filter[128] = {};
+    std::string search_text;         // the last search everything query (ctrl+f)
+    unsigned search_kinds = sk_all;
     std::vector<log_line> log;
     bool log_to_bottom = true;
     char console[1024] = {};
@@ -95,6 +112,12 @@ struct app_state {
 
     // debugger
     std::string debug_args;
+    int step_count = 1;        // instructions per step: f7 / f8 and the step buttons use it
+    int steps_left = 0;        // a multi-instruction step in progress (run a batch per frame)
+    int steps_done = 0;
+    int steps_wanted = 0;
+    bool step_over_mode = false;
+    bool step_in_flight = false;
     bool dbg_mapped = false;   // runtime addresses of the main image map onto the listing
     uint64_t dbg_delta = 0;    // runtime base - static base
     uint64_t dbg_image_size = 0;
@@ -108,6 +131,17 @@ struct app_state {
     int win_h = 0;
     bool win_max = false;
 
+    // the ai server (ai menu): serves the open file over mcp to a client on this machine
+    std::shared_ptr<app_mcp> mcp;
+    int mcp_port = 8744;
+    bool mcp_allow_debug = false;
+    bool mcp_allow_lua = false;
+
+    // unsaved changes: what to do once "save changes?" is answered (close, open, quit)
+    std::function<void()> pending_close;
+    bool quit_confirmed = false; // the window may close without asking again
+    bool title_dirty = false;    // the title shows the unsaved mark
+
     std::vector<std::string> recent;
     std::string settings_path;
     bool sandboxed = false; // tests: never start / attach to processes or open the shell
@@ -116,6 +150,8 @@ struct app_state {
 void app_init(app_state& s, const platform_api& platform, const std::vector<std::string>& args);
 // before ImGui::NewFrame: applies the font size
 void app_pre_frame(app_state& s);
+// instead of a frame while the window is minimized: keeps the debugger and the ai server going
+void app_background(app_state& s);
 // between ImGui::NewFrame and ImGui::Render
 void app_frame(app_state& s);
 void app_shutdown(app_state& s);
@@ -125,7 +161,11 @@ void app_open(app_state& s, const std::string& path, const load_options& opts = 
 void app_open_dialog(app_state& s);
 void app_close_file(app_state& s);
 void app_save(app_state& s);
-void app_save_project(app_state& s);
+void app_save_as(app_state& s); // pick where the project file goes
+// the window is about to close (its close button, alt+f4): true when it may close now. with
+// unsaved changes it asks first and returns false; the answer then closes it via platform.quit
+bool app_request_close(app_state& s);
+void app_quit(app_state& s); // file > exit
 bool app_loading(const app_state& s);
 
 void app_jump(app_state& s, uint64_t addr, bool remember = true);
@@ -145,11 +185,22 @@ void dbg_attach(app_state& s, uint32_t pid);
 void dbg_continue(app_state& s);
 void dbg_step_into(app_state& s);
 void dbg_step_over(app_state& s);
+bool dbg_stepping(const app_state& s); // a multi-instruction step is still going
 void dbg_run_to_cursor(app_state& s);
 void dbg_pause(app_state& s);
 void dbg_stop(app_state& s);
 void dbg_detach(app_state& s);
 bool app_to_static(const app_state& s, uint64_t runtime, uint64_t& out);
+
+// the ai server: an mcp client (claude code, cursor, ...) on this machine works on the open file.
+// tool calls run on the ui thread, between frames
+bool app_mcp_start(app_state& s);
+void app_mcp_stop(app_state& s);
+bool app_mcp_running(const app_state& s);    // started and not failed
+std::string app_mcp_url(const app_state& s); // where it listens, "" until then
+std::string app_mcp_error(const app_state& s);
+int app_mcp_calls(const app_state& s);
+void app_mcp_pump(app_state& s);             // every frame: runs the tool calls that are waiting
 uint64_t app_to_runtime(const app_state& s, uint64_t addr);
 // static address of the debuggee's pc, when it's inside the loaded image
 bool app_pc_static(const app_state& s, uint64_t& out);

@@ -657,7 +657,9 @@ std::string database::db_path() const
 
 // a committable project file that sits next to the binary. when it exists, ceasta reads it and
 // writes to it, so a team (or an ai) can keep names and comments in version control.
-std::string database::project_path() const { return bin.path + ".ceasta"; }
+std::string database::project_path() const { return project_file.empty() ? bin.path + ".ceasta" : project_file; }
+
+std::string database::annotations_path() const { return os::exists(project_path()) ? project_path() : db_path(); }
 
 bool database::add_xref(uint64_t from, uint64_t to, xref_type type)
 {
@@ -734,7 +736,7 @@ bool database::load_annotations(std::string& err)
 {
     // the project file next to the binary wins over the private copy, so a committed file is
     // what a fresh checkout sees
-    std::string path = os::exists(project_path()) ? project_path() : db_path();
+    std::string path = annotations_path();
     if (!os::exists(path))
         return true;
     std::vector<uint8_t> bytes;
@@ -805,9 +807,44 @@ std::unique_ptr<database> open_database(const std::string& path, const load_opti
         return nullptr;
     }
     db->build();
+    db->project_file = opts.project;
     std::string e;
     if (!db->load_annotations(e))
         db->bin.notes.push_back("couldn't read saved names: " + e);
     db->rows();
     return db;
+}
+
+bool is_project_file(const std::string& path)
+{
+    std::string l = util::lower(path);
+    return l.size() > 7 && l.compare(l.size() - 7, 7, ".ceasta") == 0;
+}
+
+std::string project_binary(const std::string& project, std::string& name_out)
+{
+    name_out.clear();
+    std::vector<uint8_t> bytes;
+    std::string err;
+    if (os::read_file(project, bytes, err)) {
+        // "ceasta 1" then "file <name>"
+        std::vector<std::string> lines = util::split(std::string(bytes.begin(), bytes.end()), "\n");
+        if (lines.size() > 1 && lines[1].compare(0, 5, "file ") == 0) {
+            std::string n = util::trim(lines[1].substr(5));
+            if (n.find_first_of("/\\") == std::string::npos && n != "." && n != "..")
+                name_out = n;
+        }
+    }
+    if (is_project_file(project)) {
+        std::string next_to = project.substr(0, project.size() - 7);
+        if (os::exists(next_to))
+            return next_to;
+    }
+    if (!name_out.empty()) {
+        size_t slash = project.find_last_of("/\\");
+        std::string in_dir = slash == std::string::npos ? name_out : os::join(project.substr(0, slash), name_out);
+        if (os::exists(in_dir))
+            return in_dir;
+    }
+    return std::string();
 }

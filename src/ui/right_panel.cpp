@@ -50,13 +50,34 @@ static bool addr_cell(uint64_t a, bool enabled = true)
     return ImGui::Selectable(util::hex(a).c_str(), false, ImGuiSelectableFlags_SpanAllColumns | (enabled ? 0 : ImGuiSelectableFlags_Disabled));
 }
 
-static void imports(app_state& s, const std::string& filter)
+static const std::vector<uint32_t>& imports_matching(app_state& s, const std::string& filter)
+{
+    const std::vector<import_entry>& imp = s.db->bin.imports;
+    return f_imports.get(s.db.get(), s.version, filter, imp.size(), [&](size_t i) {
+        return util::icontains(imp[i].name, filter) || util::icontains(imp[i].lib, filter);
+    });
+}
+
+static const std::vector<uint32_t>& exports_matching(app_state& s, const std::string& filter)
+{
+    const std::vector<export_entry>& ex = s.db->bin.exports;
+    return f_exports.get(s.db.get(), s.version, filter, ex.size(), [&](size_t i) {
+        return util::icontains(ex[i].name, filter) || util::icontains(ex[i].forward, filter);
+    });
+}
+
+static const std::vector<uint32_t>& strings_matching(app_state& s, const std::string& filter)
+{
+    const std::vector<string_item>& st = s.db->an.strings;
+    return f_strings.get(s.db.get(), s.version, filter, st.size(), [&](size_t i) {
+        return util::icontains(st[i].text, filter);
+    });
+}
+
+static void imports(app_state& s, const std::vector<uint32_t>& idx)
 {
     database& db = *s.db;
     const std::vector<import_entry>& imp = db.bin.imports;
-    const std::vector<uint32_t>& idx = f_imports.get(&db, s.version, filter, imp.size(), [&](size_t i) {
-        return util::icontains(imp[i].name, filter) || util::icontains(imp[i].lib, filter);
-    });
     if (!begin_table("##imports", 3))
         return;
     ImGui::TableSetupScrollFreeze(0, 1);
@@ -88,13 +109,10 @@ static void imports(app_state& s, const std::string& filter)
     ImGui::EndTable();
 }
 
-static void exports(app_state& s, const std::string& filter)
+static void exports(app_state& s, const std::vector<uint32_t>& idx)
 {
     database& db = *s.db;
     const std::vector<export_entry>& ex = db.bin.exports;
-    const std::vector<uint32_t>& idx = f_exports.get(&db, s.version, filter, ex.size(), [&](size_t i) {
-        return util::icontains(ex[i].name, filter);
-    });
     if (!begin_table("##exports", 3))
         return;
     ImGui::TableSetupScrollFreeze(0, 1);
@@ -125,13 +143,10 @@ static void exports(app_state& s, const std::string& filter)
     ImGui::EndTable();
 }
 
-static void strings(app_state& s, const std::string& filter)
+static void strings(app_state& s, const std::vector<uint32_t>& idx)
 {
     database& db = *s.db;
     const std::vector<string_item>& st = db.an.strings;
-    const std::vector<uint32_t>& idx = f_strings.get(&db, s.version, filter, st.size(), [&](size_t i) {
-        return util::icontains(st[i].text, filter);
-    });
     if (!begin_table("##strings", 2))
         return;
     ImGui::TableSetupScrollFreeze(0, 1);
@@ -164,7 +179,7 @@ static void strings(app_state& s, const std::string& filter)
     ImGui::EndTable();
 }
 
-static void segments(app_state& s)
+static void segments(app_state& s, const std::string& filter)
 {
     database& db = *s.db;
     if (!begin_table("##segments", 4))
@@ -177,6 +192,8 @@ static void segments(app_state& s)
     ImGui::TableHeadersRow();
     int i = 0;
     for (const segment& seg : db.bin.segments) {
+        if (!util::icontains(seg.name, filter))
+            continue;
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::PushID(i++);
@@ -240,31 +257,45 @@ void draw(app_state& s)
         return;
     }
     database& db = *s.db;
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputTextWithHint("##info_filter", "filter", s.info_filter, sizeof(s.info_filter));
+    // the search box filters every list; each tab then says how many of its rows match
+    bool has_filter = s.info_filter[0] != 0;
+    float clear_w = has_filter ? ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x : 0.0f;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - clear_w);
+    ImGui::InputTextWithHint("##info_filter", "search imports, exports, strings", s.info_filter, sizeof(s.info_filter));
+    if (has_filter) {
+        ImGui::SameLine();
+        if (ImGui::Button("x", ImVec2(ImGui::GetFrameHeight(), 0)))
+            s.info_filter[0] = 0;
+        ImGui::SetItemTooltip("clear the search");
+    }
     std::string filter = util::trim(s.info_filter);
+    const std::vector<uint32_t>& imp_idx = imports_matching(s, filter);
+    const std::vector<uint32_t>& exp_idx = exports_matching(s, filter);
+    const std::vector<uint32_t>& str_idx = strings_matching(s, filter);
+    // while searching, the tabs count the matches
+    auto count = [&](size_t shown, size_t total) { return util::fmt("%zu", filter.empty() ? total : shown); };
     if (ImGui::BeginTabBar("##info_tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
         auto tab = [&](const char* label, int index) {
             ImGuiTabItemFlags fl = s.right_tab_request == index ? ImGuiTabItemFlags_SetSelected : 0;
             return ImGui::BeginTabItem(label, nullptr, fl);
         };
-        std::string imp = util::fmt("Imports (%zu)###imports", db.bin.imports.size());
-        std::string exp = util::fmt("Exports (%zu)###exports", db.bin.exports.size());
-        std::string str = util::fmt("Strings (%zu)###strings", db.an.strings.size());
+        std::string imp = "Imports (" + count(imp_idx.size(), db.bin.imports.size()) + ")###imports";
+        std::string exp = "Exports (" + count(exp_idx.size(), db.bin.exports.size()) + ")###exports";
+        std::string str = "Strings (" + count(str_idx.size(), db.an.strings.size()) + ")###strings";
         if (tab(imp.c_str(), 0)) {
-            imports(s, filter);
+            imports(s, imp_idx);
             ImGui::EndTabItem();
         }
         if (tab(exp.c_str(), 1)) {
-            exports(s, filter);
+            exports(s, exp_idx);
             ImGui::EndTabItem();
         }
         if (tab(str.c_str(), 2)) {
-            strings(s, filter);
+            strings(s, str_idx);
             ImGui::EndTabItem();
         }
         if (tab("Segments", 3)) {
-            segments(s);
+            segments(s, filter);
             ImGui::EndTabItem();
         }
         if (tab("Xrefs", 4)) {

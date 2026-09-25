@@ -58,6 +58,14 @@ static void load_settings(app_state& s)
             s.dbg.break_on_entry = v == "1";
         else if (k == "debug_args")
             s.debug_args = v;
+        else if (k == "step_count")
+            s.step_count = std::min(100000, std::max(1, atoi(v.c_str())));
+        else if (k == "mcp_port")
+            s.mcp_port = std::min(65535, std::max(1024, atoi(v.c_str())));
+        else if (k == "mcp_allow_debug")
+            s.mcp_allow_debug = v == "1";
+        else if (k == "mcp_allow_lua")
+            s.mcp_allow_lua = v == "1";
         else if (k == "win_w")
             s.win_w = atoi(v.c_str());
         else if (k == "win_h")
@@ -81,6 +89,8 @@ static void save_settings(app_state& s)
                       : s.theme == theme::ui_theme::contrast ? "contrast" : "dark";
     o += std::string("theme=") + tname + "\n";
     o += "debug_args=" + s.debug_args + "\n";
+    o += util::fmt("step_count=%d\n", s.step_count);
+    o += util::fmt("mcp_port=%d\nmcp_allow_debug=%d\nmcp_allow_lua=%d\n", s.mcp_port, s.mcp_allow_debug, s.mcp_allow_lua);
     for (const std::string& r : s.recent)
         o += "recent=" + r + "\n";
     std::string err;
@@ -102,7 +112,8 @@ static void set_title(app_state& s)
         return;
     std::string t = "ceasta";
     if (s.db)
-        t = s.db->bin.name + " - ceasta";
+        t = (s.db->dirty ? "*" : "") + s.db->bin.name + " - ceasta";
+    s.title_dirty = s.db && s.db->dirty;
     s.platform.set_title(t);
 }
 
@@ -126,6 +137,47 @@ bool app_loading(const app_state& s)
     return s.job != nullptr;
 }
 
+// with unsaved changes, asks "save changes?" and returns true: then runs `then` once the
+// answer is save or don't save (and never, on cancel)
+static bool ask_to_save(app_state& s, std::function<void()> then)
+{
+    if (!s.db || !s.db->dirty)
+        return false;
+    dialogs::open(s, dialog_kind::save_changes, 0);
+    s.pending_close = std::move(then);
+    return true;
+}
+
+static void start_open(app_state& s, const std::string& path, load_options opts)
+{
+    std::string target = path;
+    if (is_project_file(path) && !opts.force_raw) {
+        // a project: open the file it belongs to, with the project's names and comments
+        std::string name;
+        target = project_binary(path, name);
+        if (target.empty() && s.platform.open_file_dialog)
+            target = s.platform.open_file_dialog(("Where is " + (name.empty() ? std::string("the file for this project") : name) + "?").c_str());
+        if (target.empty()) {
+            app_log(s, "can't find the file " + path + " belongs to" + (name.empty() ? std::string() : " (" + name + ")") +
+                ": keep the project next to it", 2);
+            return;
+        }
+        opts.project = path;
+    }
+    if (s.dbg.state() != dbg_state::none) {
+        app_log(s, "ending the debug session to open another file", 1);
+        dbg_stop(s);
+    }
+    s.job.reset(new load_job());
+    load_job* job = s.job.get();
+    job->path = target;
+    job->worker = std::thread([job, target, opts]() {
+        job->result = open_database(target, opts, &job->progress, job->error);
+        job->done.store(true);
+    });
+    app_log(s, "loading " + target + (opts.project.empty() ? std::string() : " with " + opts.project));
+}
+
 void app_open(app_state& s, const std::string& path, const load_options& opts)
 {
     if (path.empty())
@@ -134,19 +186,9 @@ void app_open(app_state& s, const std::string& path, const load_options& opts)
         app_log(s, "still loading " + s.job->path + ", wait for it or cancel it first", 1);
         return;
     }
-    if (s.dbg.state() != dbg_state::none) {
-        app_log(s, "ending the debug session to open another file", 1);
-        dbg_stop(s);
-    }
-    app_save(s);
-    s.job.reset(new load_job());
-    load_job* job = s.job.get();
-    job->path = path;
-    job->worker = std::thread([job, path, opts]() {
-        job->result = open_database(path, opts, &job->progress, job->error);
-        job->done.store(true);
-    });
-    app_log(s, "loading " + path);
+    if (ask_to_save(s, [&s, path, opts]() { start_open(s, path, opts); }))
+        return;
+    start_open(s, path, opts);
 }
 
 void app_open_dialog(app_state& s)
@@ -184,7 +226,7 @@ static void finish_job(app_state& s)
         arch_name(b.arch), b.kind.c_str(), s.db->an.funcs.size(), b.imports.size(), s.db->an.strings.size()));
     if (!s.db->user_names.empty() || !s.db->user_comments.empty())
         app_log(s, util::fmt("restored %zu names and %zu comments from %s", s.db->user_names.size(),
-            s.db->user_comments.size(), s.db->db_path().c_str()));
+            s.db->user_comments.size(), s.db->annotations_path().c_str()));
     add_recent(s, b.path);
     set_title(s);
     s.lua.fire("load");
@@ -198,30 +240,37 @@ void app_save(app_state& s)
     std::string err;
     if (s.db->save(err)) {
         s.db->dirty = false;
-        app_log(s, "saved names and comments to " + s.db->db_path());
+        app_log(s, "saved to " + s.db->annotations_path());
     } else {
         app_log(s, "couldn't save: " + err, 2);
     }
 }
 
-void app_save_project(app_state& s)
+void app_save_as(app_state& s)
 {
-    if (!s.db)
+    if (!s.db || !s.platform.save_file_dialog)
         return;
+    std::string path = s.platform.save_file_dialog("Save the project as", s.db->project_path());
+    if (path.empty())
+        return;
+    if (!is_project_file(path))
+        path += ".ceasta";
+    std::string old = s.db->project_file;
+    s.db->project_file = path;
     std::string err;
-    if (s.db->save_project(err)) {
+    if (s.db->save_project(err) && s.db->save(err)) {
         s.db->dirty = false;
-        app_log(s, "wrote a project file you can commit: " + s.db->project_path());
+        app_log(s, "saved the project to " + path + " (open it to pick up where you left off)");
     } else {
-        app_log(s, "couldn't write the project file: " + err, 2);
+        s.db->project_file = old;
+        app_log(s, "couldn't save the project: " + err, 2);
     }
 }
 
-void app_close_file(app_state& s)
+static void close_now(app_state& s)
 {
     if (s.dbg.state() != dbg_state::none)
         dbg_stop(s);
-    app_save(s);
     s.db.reset();
     s.lua.bridge().db = nullptr;
     s.back.clear();
@@ -229,6 +278,31 @@ void app_close_file(app_state& s)
     s.cursor = 0;
     s.version++;
     set_title(s);
+}
+
+void app_close_file(app_state& s)
+{
+    if (!ask_to_save(s, [&s]() { close_now(s); }))
+        close_now(s);
+}
+
+bool app_request_close(app_state& s)
+{
+    if (s.quit_confirmed)
+        return true;
+    return !ask_to_save(s, [&s]() {
+        s.quit_confirmed = true;
+        if (s.platform.quit)
+            s.platform.quit();
+    });
+}
+
+void app_quit(app_state& s)
+{
+    if (app_request_close(s) && s.platform.quit) {
+        s.quit_confirmed = true;
+        s.platform.quit();
+    }
 }
 
 // ---- navigation ----
@@ -420,7 +494,6 @@ void dbg_start(app_state& s)
     }
     if (s.dbg.state() != dbg_state::none)
         return;
-    app_save(s);
     std::string err;
     if (!s.dbg.start(s.db->bin.path, s.debug_args, "", err))
         app_log(s, err, 2);
@@ -448,33 +521,127 @@ static void dbg_do(app_state& s, bool (debugger::*fn)(std::string&))
         app_log(s, err, 1);
 }
 
+// a debugger command ends a multi-step; the step already under way finishes on its own
+static void cancel_steps(app_state& s)
+{
+    s.steps_left = 0;
+}
+
 void dbg_continue(app_state& s)
 {
+    if (dbg_stepping(s)) {
+        cancel_steps(s);
+        return;
+    }
     if (s.dbg.state() == dbg_state::none)
         dbg_start(s);
     else if (s.dbg.state() == dbg_state::stopped)
         dbg_do(s, &debugger::cont);
 }
 
+bool dbg_stepping(const app_state& s)
+{
+    return s.steps_left > 0 || s.step_in_flight;
+}
+
+static std::string pc_where(const app_state& s)
+{
+    uint64_t st = 0;
+    return app_to_static(s, s.dbg.pc(), st) ? s.db->location(st) : util::hex(s.dbg.pc());
+}
+
+// one line for a whole multi-step, instead of one per instruction
+static void steps_finished(app_state& s)
+{
+    int done = s.steps_done, wanted = s.steps_wanted;
+    std::string why = s.dbg.stop_reason();
+    if (s.dbg.state() != dbg_state::stopped)
+        app_log(s, util::fmt("[debug] the program ended after %d of %d steps", done, wanted));
+    else if (why != "step" && why != "step over") // a breakpoint, a fault, a pause
+        app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, why.c_str(), pc_where(s).c_str()));
+    else
+        app_log(s, util::fmt("[debug] %s %d instructions, now at %s", s.step_over_mode ? "stepped over" : "stepped into", done,
+            pc_where(s).c_str()));
+}
+
+// runs the steps of a multi-step for about 10 ms per frame, so thousands of them don't freeze
+// the window. a breakpoint, a fault or the exit ends it early.
+static void run_steps(app_state& s)
+{
+    uint64_t until = os::now_ms() + 10;
+    // a step still under way from the last frame is a long one: no quick re-checks for it
+    uint64_t step_began = s.step_in_flight ? 0 : os::now_ms();
+    for (;;) {
+        if (s.dbg.state() == dbg_state::running) {
+            // a single step lands within microseconds: check again right away at first, and
+            // only wait in longer naps for a call that's being stepped over
+            bool fresh = os::now_ms() - step_began < 2;
+            s.dbg.poll(fresh ? 0 : 1);
+            if (s.dbg.state() == dbg_state::running) {
+                if (os::now_ms() >= until)
+                    return; // still in a step (a long call being stepped over): next frame
+                if (fresh)
+                    std::this_thread::yield();
+                continue;
+            }
+        }
+        if (s.step_in_flight) {
+            s.step_in_flight = false;
+            s.steps_done++;
+            std::string why = s.dbg.stop_reason();
+            if (s.dbg.state() != dbg_state::stopped || (why != "step" && why != "step over"))
+                s.steps_left = 0;
+        }
+        if (s.steps_left <= 0 || s.dbg.state() != dbg_state::stopped)
+            break;
+        if (os::now_ms() >= until)
+            return;
+        std::string err;
+        if (!(s.step_over_mode ? s.dbg.step_over(err) : s.dbg.step_into(err))) {
+            app_log(s, err, 1);
+            s.steps_left = 0;
+            break;
+        }
+        s.steps_left--;
+        s.step_in_flight = true;
+        step_began = os::now_ms();
+    }
+    s.steps_left = 0;
+    steps_finished(s);
+}
+
+static void begin_steps(app_state& s, bool over)
+{
+    if (s.dbg.state() == dbg_state::none) {
+        dbg_start(s);
+        return;
+    }
+    if (s.dbg.state() != dbg_state::stopped || dbg_stepping(s))
+        return;
+    if (s.step_count <= 1) {
+        dbg_do(s, over ? &debugger::step_over : &debugger::step_into);
+        return;
+    }
+    s.steps_left = s.steps_wanted = s.step_count;
+    s.steps_done = 0;
+    s.step_over_mode = over;
+    s.step_in_flight = false;
+    run_steps(s);
+}
+
 void dbg_step_into(app_state& s)
 {
-    if (s.dbg.state() == dbg_state::none)
-        dbg_start(s);
-    else if (s.dbg.state() == dbg_state::stopped)
-        dbg_do(s, &debugger::step_into);
+    begin_steps(s, false);
 }
 
 void dbg_step_over(app_state& s)
 {
-    if (s.dbg.state() == dbg_state::none)
-        dbg_start(s);
-    else if (s.dbg.state() == dbg_state::stopped)
-        dbg_do(s, &debugger::step_over);
+    begin_steps(s, true);
 }
 
 void dbg_run_to_cursor(app_state& s)
 {
-    if (s.dbg.state() != dbg_state::stopped || !s.dbg_mapped)
+    if (s.dbg.state() != dbg_state::stopped || !s.dbg_mapped || dbg_stepping(s))
         return;
     std::string err;
     if (!s.dbg.run_to(app_to_runtime(s, s.cursor), err))
@@ -483,12 +650,14 @@ void dbg_run_to_cursor(app_state& s)
 
 void dbg_pause(app_state& s)
 {
+    cancel_steps(s);
     if (s.dbg.state() == dbg_state::running)
         dbg_do(s, &debugger::pause);
 }
 
 void dbg_stop(app_state& s)
 {
+    cancel_steps(s);
     if (s.dbg.state() == dbg_state::none)
         return;
     s.dbg.kill();
@@ -497,6 +666,7 @@ void dbg_stop(app_state& s)
 
 void dbg_detach(app_state& s)
 {
+    cancel_steps(s);
     if (s.dbg.state() == dbg_state::none)
         return;
     s.dbg.detach();
@@ -511,7 +681,8 @@ static void setup_debugger(app_state& s)
         uint64_t pc_static = 0;
         bool mapped = app_to_static(s, s.dbg.pc(), pc_static);
         std::string where = mapped ? s.db->location(pc_static) : util::hex(s.dbg.pc());
-        app_log(s, "[debug] stopped: " + s.dbg.stop_reason() + " at " + where);
+        if (!dbg_stepping(s)) // a multi-step logs one line when it ends
+            app_log(s, "[debug] stopped: " + s.dbg.stop_reason() + " at " + where);
         if (mapped)
             app_jump(s, pc_static, false);
         s.lua.fire("stop", (int64_t)(mapped ? pc_static : s.dbg.pc()));
@@ -567,8 +738,20 @@ void app_pre_frame(app_state& s)
     ImGui::GetStyle().FontSizeBase = s.font_size;
 }
 
+void app_background(app_state& s)
+{
+    app_mcp_pump(s);
+    if (dbg_stepping(s))
+        run_steps(s);
+    if (s.dbg.state() == dbg_state::running)
+        s.dbg.poll(10);
+    else
+        os::sleep_ms(10);
+}
+
 void app_shutdown(app_state& s)
 {
+    app_mcp_stop(s);
     if (s.job) {
         s.job->progress.cancel.store(true);
         s.job->worker.join();
@@ -576,7 +759,7 @@ void app_shutdown(app_state& s)
     }
     if (s.dbg.state() != dbg_state::none)
         dbg_stop(s);
-    app_save(s);
+    // unsaved changes were offered a save when the window closed; nothing is written here
     save_settings(s);
     s.lua.shutdown();
 }
@@ -598,6 +781,8 @@ static void shortcuts(app_state& s)
         app_open_dialog(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S))
         app_save(s);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S))
+        app_save_as(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Equal) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadAdd))
         app_set_font_size(s, s.font_size + 1);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Minus) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadSubtract))
@@ -648,11 +833,18 @@ static void shortcuts(app_state& s)
         app_back(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_B))
         dialogs::open(s, dialog_kind::search, s.cursor);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
+        dialogs::open(s, dialog_kind::find, s.cursor);
 }
 
 void app_frame(app_state& s)
 {
     finish_job(s);
+    app_mcp_pump(s);
+    if ((s.db && s.db->dirty) != s.title_dirty)
+        set_title(s);
+    if (dbg_stepping(s))
+        run_steps(s);
     if (s.dbg.state() == dbg_state::running)
         s.dbg.poll(0);
 

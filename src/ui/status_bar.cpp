@@ -18,6 +18,8 @@ void draw(app_state& s)
     // state first: what the program is doing right now
     if (s.job) {
         ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.4f, 1), "analyzing %d%%", s.job->progress.percent.load());
+    } else if (dbg_stepping(s)) {
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "debugging: stepping (%d of %d)", s.steps_done, s.steps_wanted);
     } else if (s.dbg.state() == dbg_state::running) {
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "debugging: running");
     } else if (s.dbg.state() == dbg_state::stopped) {
@@ -36,6 +38,16 @@ void draw(app_state& s)
         ImGui::SameLine(0, 24);
         ImGui::TextDisabled("|  %zu functions  %s%s", db.an.funcs.size(), db.dirty ? "  unsaved changes (ctrl+s)" : "",
             db.breakpoints.empty() ? "" : util::fmt("  %zu breakpoints", db.breakpoints.size()).c_str());
+    }
+    if (s.mcp) {
+        std::string url = app_mcp_url(s), err = app_mcp_error(s);
+        ImGui::SameLine(0, 24);
+        if (!err.empty())
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "|  ai server couldn't listen on :%d", s.mcp_port);
+        else if (!url.empty())
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "|  ai server on :%d  (%d calls)", s.mcp_port, app_mcp_calls(s));
+        else
+            ImGui::TextDisabled("|  ai server starting");
     }
     // the dummy makes the status line a real item so the window accounts for it
     ImGui::SetCursorScreenPos(p);
