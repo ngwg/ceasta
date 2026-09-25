@@ -81,6 +81,7 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 - ida-style listing: names instead of addresses, labels, xref and string comments, the arguments each instruction passes to a known api
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
 - decompiler (f5, x86 / x64): c-like pseudocode — if / else, loops, switch, stack variables, calls with their arguments (~350 known api prototypes). click a name: `n` renames it, `y` sets a type or a prototype. shift+f5 shows it next to the listing
+- a second decompiler if you want one: with [kuna](https://github.com/Noelo-Lab/kuna) installed (a decompiler ported from ghidra's), the pseudocode view gets a `kuna` switch — its output for the same function, lines linked to the listing, arm64 too. [more below](#second-decompiler-kuna)
 - file info: headers, security flags (aslr, dep, cfg / pie, nx, relro, canary), md5 / sha256 / imphash, section entropy, resources, version info, and warnings when it looks packed
 - search everything (ctrl+f): functions, names, imports, exports, strings, comments and segments in one box, and the strings say where they're used
 - debugger (x86 / x64, windows and linux): start or attach, breakpoints (with conditions: `rdi == 3`), watchpoints on variables, step into / over / out, step back, run to cursor, pause, registers, stack, call stack, memory map, live memory
@@ -152,7 +153,7 @@ ceasta-cli info file.exe            headers, security flags, hashes, sections, w
 ceasta-cli funcs file.exe           functions
 ceasta-cli disasm file.exe main 40  listing from a name or address
 ceasta-cli graph file.exe start     basic blocks of a function
-ceasta-cli decompile file.exe main  pseudocode for a function
+ceasta-cli decompile file.exe main  pseudocode for a function (--kuna: kuna's)
 ceasta-cli xrefs file.exe CreateFileW
 ceasta-cli find file.exe "48 8b ?? 05"
 ceasta-cli search file.exe usage    find text in names, imports, strings, comments
@@ -167,6 +168,15 @@ ceasta-cli mcp file.exe             serve the file to an AI over MCP
 ```
 
 `--raw32` / `--raw64` / `--raw-arm64` (and `--base <hex>`) load a file as raw code.
+
+## second decompiler: kuna
+
+[kuna](https://github.com/Noelo-Lab/kuna) is a decompiler ported from ghidra's (apache-2.0). ceasta doesn't ship it — it runs kuna's command line tool when you have it:
+
+- install kuna the way its readme says and put `kuna` on your PATH, or point ceasta at it: view > second decompiler (kuna)...
+- the pseudocode view then has a `ceasta | kuna` switch. kuna's output is read-only and uses its own names (`sub_401000`, `dat_404010`), but its lines are linked to the listing like ceasta's, and a click on `sub_...` jumps there
+- it reads arm64 too, where ceasta's own decompiler stops
+- `ceasta-cli decompile file main --kuna` (or `--kuna-path /path/to/kuna`), and the AI gets a `decompile_with_kuna` tool
 
 ## connect an AI
 

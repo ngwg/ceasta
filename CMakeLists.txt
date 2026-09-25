@@ -90,12 +90,14 @@ add_library(ceasta_core STATIC
     src/core/exchange.cpp
     src/core/fileinfo.cpp
     src/core/json.cpp
+    src/core/kuna.cpp
     src/core/lua_host.cpp
     src/core/mcp.cpp
     src/core/mcp_transport.cpp
     src/core/os.cpp
-    src/core/protos.cpp
     src/core/pe.cpp
+    src/core/process.cpp
+    src/core/protos.cpp
     src/core/search.cpp
     src/core/signatures.cpp)
 target_include_directories(ceasta_core PUBLIC src)

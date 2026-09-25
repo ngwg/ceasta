@@ -1,14 +1,20 @@
 #include "ui/pseudo_view.h"
 
 #include "core/decompiler.h"
+#include "core/kuna.h"
+#include "core/os.h"
+#include "core/util.h"
 #include "ui/dialogs.h"
 #include "imgui.h"
 #include "theme.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <map>
 #include <set>
 #include <string>
+#include <thread>
 
 namespace pseudo_view {
 
@@ -100,6 +106,41 @@ static void draw_line(ImDrawList* dl, ImVec2 pos, const std::string& text)
 // the last decompiled function, so it isn't decompiled again every frame
 static cache g_cache;
 
+// kuna, the optional second decompiler: its output for the same function. it's another program,
+// so it runs in the background, and what it made is kept per function
+struct kuna_entry {
+    kuna_result r;
+    std::vector<decomp_line> lines; // r's lines the way the view draws them
+};
+
+struct kuna_state {
+    const database* db = nullptr; // what the results are for
+    std::map<uint64_t, kuna_entry> done;
+    uint64_t running = 0;         // the function kuna is working on, 0 when none
+    uint64_t started_ms = 0;
+    std::thread worker;
+    std::atomic<bool> finished{false};
+    std::atomic<bool> cancel{false};
+    kuna_result result;           // the worker's, read once finished is set
+
+    ~kuna_state() { stop(); }
+    void stop()
+    {
+        if (worker.joinable()) {
+            cancel = true;
+            worker.join();
+        }
+        running = 0;
+        cancel = false;
+        finished = false;
+    }
+};
+static kuna_state g_kuna;
+static bool g_showing_kuna = false; // the view shows kuna's this frame: renaming doesn't apply there
+static std::string g_kuna_code;
+
+void shutdown() { g_kuna.stop(); }
+
 static bool ident_char(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
 
 // the identifier at column col of text, "" when there's none (numbers don't count)
@@ -128,14 +169,26 @@ static const decomp_var* var_named(const std::string& w)
 static uint64_t address_of(app_state& s, const std::string& w)
 {
     uint64_t a = 0;
-    if (w.empty() || var_named(w) || is_keyword(w) || is_type(w) || !s.db->resolve(w, a) || !s.db->bin.is_mapped(a))
+    if (w.empty() || (!g_showing_kuna && var_named(w)) || is_keyword(w) || is_type(w))
         return 0;
-    return a;
+    if (s.db->resolve(w, a) && s.db->bin.is_mapped(a))
+        return a;
+    // kuna's own names carry the address: sub_58d0, dat_2e298, FUN_00401000 (not local_10: a variable)
+    size_t us = w.find('_');
+    if (!g_showing_kuna || us == std::string::npos || us + 1 >= w.size())
+        return 0;
+    std::string prefix = w.substr(0, us);
+    for (char& ch : prefix)
+        ch = (char)std::tolower((unsigned char)ch);
+    static const std::set<std::string> address_names = {"sub", "fun", "dat", "lab", "ptr", "off", "unk", "loc", "thunk"};
+    if (address_names.count(prefix) && util::parse_hex(w.substr(us + 1), a) && s.db->bin.is_mapped(a))
+        return a;
+    return 0;
 }
 
 bool rename_selected(app_state& s)
 {
-    if (!s.db || s.pseudo_word.empty() || g_cache.func == 0)
+    if (!s.db || s.pseudo_word.empty() || g_cache.func == 0 || g_showing_kuna)
         return false;
     if (const decomp_var* v = var_named(s.pseudo_word)) {
         std::string key = v->key, name = v->name;
@@ -153,7 +206,7 @@ bool rename_selected(app_state& s)
 
 bool retype_selected(app_state& s)
 {
-    if (!s.db || g_cache.func == 0)
+    if (!s.db || g_cache.func == 0 || g_showing_kuna)
         return false;
     if (const decomp_var* v = var_named(s.pseudo_word)) {
         std::string key = v->key, type = v->type;
@@ -184,12 +237,23 @@ bool follow_selected(app_state& s)
 
 static void word_menu(app_state& s)
 {
-    const decomp_var* v = var_named(s.pseudo_word);
     uint64_t a = address_of(s, s.pseudo_word);
-    const function* f = a ? s.db->an.func_containing(a) : nullptr;
-    bool is_func = f && f->start == a;
     if (!s.pseudo_word.empty())
         ImGui::TextDisabled("%s", s.pseudo_word.c_str());
+    if (g_showing_kuna) {
+        // kuna's names are its own: this view reads, the ceasta view is where things get named
+        if (ImGui::MenuItem("Jump to it", "Enter", false, a != 0))
+            follow_selected(s);
+        if (ImGui::MenuItem("Copy", nullptr, false, !s.pseudo_word.empty()))
+            ImGui::SetClipboardText(s.pseudo_word.c_str());
+        ImGui::Separator();
+        if (ImGui::MenuItem("Copy the function"))
+            ImGui::SetClipboardText(g_kuna_code.c_str());
+        return;
+    }
+    const decomp_var* v = var_named(s.pseudo_word);
+    const function* f = a ? s.db->an.func_containing(a) : nullptr;
+    bool is_func = f && f->start == a;
     if (ImGui::MenuItem(v ? "Rename variable..." : "Rename...", "N", false, v || a))
         rename_selected(s);
     if (ImGui::MenuItem(v ? "Set type..." : "Edit prototype...", "Y", false, v || is_func || s.pseudo_line == 0))
@@ -203,51 +267,19 @@ static void word_menu(app_state& s)
         ImGui::SetClipboardText(decompile_text(*s.db, g_cache.func).c_str());
 }
 
-void draw(app_state& s)
+// one of the two small switches in the toolbar
+static bool switch_button(const char* label, bool on)
 {
-    cache& c = g_cache;
-    database& db = *s.db;
-    const function* fn = db.an.func_containing(s.cursor);
-    uint64_t func = fn ? fn->start : 0;
-    s.pseudo_focus = false;
+    ImGui::PushStyleColor(ImGuiCol_Button, on ? ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive) : ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(on ? ImGuiCol_Text : ImGuiCol_TextDisabled));
+    bool pressed = ImGui::SmallButton(label);
+    ImGui::PopStyleColor(2);
+    return pressed;
+}
 
-    if (func == 0) {
-        ImGui::BeginChild("##pseudo", ImVec2(0, 0));
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::nop),
-                           "  put the cursor inside a function to decompile it");
-        ImGui::EndChild();
-        return;
-    }
-
-    if (c.db != &db || c.func != func || c.version != s.version) {
-        if (c.func != func)
-            s.pseudo_word.clear();
-        c.db = &db;
-        c.func = func;
-        c.version = s.version;
-        c.result = decompile(db, func);
-    }
-
-    // toolbar
-    ImGui::TextDisabled("pseudocode");
-    ImGui::SameLine();
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::func), "%s", c.result.name.c_str());
-    ImGui::SameLine();
-    ImGui::TextDisabled("  click a name: N renames, Y sets its type");
-    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize("Copy").x -
-                    ImGui::GetStyle().FramePadding.x * 2 - ImGui::GetStyle().WindowPadding.x);
-    if (ImGui::SmallButton("Copy"))
-        ImGui::SetClipboardText(decompile_text(db, func).c_str());
-
-    ImGui::BeginChild("##pseudo", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav);
-    s.pseudo_focus = ImGui::IsWindowFocused();
-    if (!c.result.ok) {
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "  %s",
-                           c.result.error.c_str());
-        ImGui::EndChild();
-        return;
-    }
-
+// the lines, with the listing's line marked, the clicked word lit up, clicks moving the listing
+static void draw_lines(app_state& s, const std::vector<decomp_line>& lines)
+{
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float lh = ImGui::GetTextLineHeightWithSpacing();
     float pitch = lh + ImGui::GetStyle().ItemSpacing.y;
@@ -258,8 +290,8 @@ void draw(app_state& s)
     // address of the instruction it starts at). when the cursor moved elsewhere, it scrolls there
     int here = -1;
     uint64_t best = 0;
-    for (size_t i = 0; i < c.result.lines.size(); i++) {
-        uint64_t a = c.result.lines[i].addr;
+    for (size_t i = 0; i < lines.size(); i++) {
+        uint64_t a = lines[i].addr;
         if (a && a <= s.cursor && a >= best && i > 0) {
             best = a;
             here = (int)i;
@@ -270,12 +302,12 @@ void draw(app_state& s)
     seen_cursor = s.cursor;
 
     ImGuiListClipper clip;
-    clip.Begin((int)c.result.lines.size(), pitch);
+    clip.Begin((int)lines.size(), pitch);
     if (scroll_here)
         clip.IncludeItemByIndex(here);
     while (clip.Step()) {
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
-            const decomp_line& l = c.result.lines[(size_t)i];
+            const decomp_line& l = lines[(size_t)i];
             ImVec2 p = ImGui::GetCursorScreenPos();
             float w = ImGui::GetContentRegionAvail().x;
             if (scroll_here && i == here) {
@@ -321,6 +353,142 @@ void draw(app_state& s)
             draw_line(dl, ImVec2(x, p.y), l.text);
         }
     }
+}
+
+// kuna's output for func: started in the background the first time, then kept
+static const kuna_entry* kuna_for(app_state& s, uint64_t func)
+{
+    kuna_state& k = g_kuna;
+    if (k.db != s.db.get()) {
+        k.stop();
+        k.done.clear();
+        k.db = s.db.get();
+    }
+    if (k.running && k.finished) {
+        k.worker.join();
+        kuna_entry& e = k.done[k.running];
+        e.r = std::move(k.result);
+        for (const kuna_line& l : e.r.lines)
+            e.lines.push_back({0, l.text, l.addr});
+        k.running = 0;
+        k.finished = false;
+    }
+    auto it = k.done.find(func);
+    if (it != k.done.end())
+        return &it->second;
+    if (k.running && k.running != func)
+        k.stop(); // moved on to another function: that one isn't wanted any more
+    if (!k.running) {
+        k.running = func;
+        k.started_ms = os::now_ms();
+        k.result = kuna_result();
+        std::string exe = s.kuna_exe, file = s.db->bin.path;
+        k.worker = std::thread([exe, file, func] {
+            g_kuna.result = kuna_decompile(exe, file, func, 120000, &g_kuna.cancel);
+            g_kuna.finished = true;
+        });
+    }
+    return nullptr;
+}
+
+void draw(app_state& s)
+{
+    cache& c = g_cache;
+    database& db = *s.db;
+    const function* fn = db.an.func_containing(s.cursor);
+    uint64_t func = fn ? fn->start : 0;
+    s.pseudo_focus = false;
+    bool have_kuna = !s.kuna_exe.empty();
+    bool use_kuna = have_kuna && s.pseudo_kuna;
+    g_showing_kuna = use_kuna;
+
+    if (func == 0) {
+        ImGui::BeginChild("##pseudo", ImVec2(0, 0));
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::nop),
+                           "  put the cursor inside a function to decompile it");
+        ImGui::EndChild();
+        return;
+    }
+
+    if (c.db != &db || c.func != func || c.version != s.version) {
+        if (c.func != func)
+            s.pseudo_word.clear();
+        c.db = &db;
+        c.func = func;
+        c.version = s.version;
+        c.result = use_kuna ? decompiled() : decompile(db, func);
+        c.result.name = db.location(func);
+        if (use_kuna)
+            c.version = ~0ull; // the built-in one runs when it's switched back
+    }
+
+    // kuna's, when that's the one shown
+    const kuna_entry* ke = nullptr;
+    std::string kuna_why = use_kuna ? kuna_unsupported(db.bin) : std::string();
+    if (use_kuna && kuna_why.empty())
+        ke = kuna_for(s, func);
+    const kuna_result* kr = ke ? &ke->r : nullptr;
+    if (kr && kr->ok)
+        g_kuna_code = kr->code;
+
+    // toolbar
+    ImGui::TextDisabled("pseudocode");
+    ImGui::SameLine();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::func), "%s", c.result.name.c_str());
+    if (have_kuna) {
+        // the second decompiler: only here when kuna is installed
+        ImGui::SameLine(0, ImGui::GetFontSize());
+        if (switch_button("ceasta", !use_kuna) && use_kuna) {
+            s.pseudo_kuna = false;
+            c.version = ~0ull;
+        }
+        ImGui::SetItemTooltip("ceasta's decompiler: your names, types and prototypes");
+        ImGui::SameLine(0, 2);
+        if (switch_button("kuna", use_kuna))
+            s.pseudo_kuna = true;
+        ImGui::SetItemTooltip("kuna, a decompiler ported from ghidra's (%s). it names things itself", s.kuna_exe.c_str());
+    }
+    ImGui::SameLine();
+    if (use_kuna && kr && kr->ok)
+        ImGui::TextDisabled("  kuna, %.1f s - reads only", kr->millis / 1000.0);
+    else if (use_kuna)
+        ImGui::TextDisabled("  kuna");
+    else
+        ImGui::TextDisabled("  click a name: N renames, Y sets its type");
+    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize("Copy").x -
+                    ImGui::GetStyle().FramePadding.x * 2 - ImGui::GetStyle().WindowPadding.x);
+    if (ImGui::SmallButton("Copy"))
+        ImGui::SetClipboardText(use_kuna ? (kr && kr->ok ? kr->code.c_str() : "") : decompile_text(db, func).c_str());
+
+    ImGui::BeginChild("##pseudo", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav);
+    s.pseudo_focus = ImGui::IsWindowFocused();
+    ImVec4 err_col = ImGui::ColorConvertU32ToFloat4(theme::log_error);
+    if (use_kuna) {
+        if (!kuna_why.empty())
+            ImGui::TextColored(err_col, "  %s", kuna_why.c_str());
+        else if (!kr)
+            ImGui::TextDisabled("  kuna is decompiling %s... %.0f s", c.result.name.c_str(),
+                (os::now_ms() - g_kuna.started_ms) / 1000.0);
+        else if (!kr->ok)
+            ImGui::TextColored(err_col, "  %s", kr->error.c_str());
+        else
+            draw_lines(s, ke->lines);
+        ImGui::EndChild();
+        return;
+    }
+    if (!c.result.ok) {
+        ImGui::TextColored(err_col, "  %s", c.result.error.c_str());
+        // ceasta's can't (arm64): kuna may
+        if (have_kuna && kuna_unsupported(db.bin).empty()) {
+            ImGui::Spacing();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetFontSize());
+            if (ImGui::SmallButton("Show kuna's"))
+                s.pseudo_kuna = true;
+        }
+        ImGui::EndChild();
+        return;
+    }
+    draw_lines(s, c.result.lines);
     ImGui::EndChild();
 }
 

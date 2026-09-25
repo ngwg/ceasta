@@ -35,6 +35,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::lvar_type: return "Variable type###dlg";
     case dialog_kind::proto: return "Function prototype###dlg";
     case dialog_kind::review: return "Suggested names###dlg";
+    case dialog_kind::kuna: return "Second decompiler: kuna###dlg";
     default: return "###dlg";
     }
 }
@@ -112,6 +113,8 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
         snprintf(d.buf, sizeof(d.buf), "%s", s.search_text.c_str());
     } else if (kind == dialog_kind::run_args) {
         snprintf(d.buf, sizeof(d.buf), "%s", s.debug_args.c_str());
+    } else if (kind == dialog_kind::kuna) {
+        snprintf(d.buf, sizeof(d.buf), "%s", s.kuna_path.c_str());
     } else if (kind == dialog_kind::attach) {
         d.procs = list_processes();
     }
@@ -474,6 +477,36 @@ static void run_args(app_state& s, dialog_state& d)
     bool enter = ImGui::InputText("##args", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue);
     if (ok_cancel() || enter) {
         s.debug_args = d.buf;
+        ImGui::CloseCurrentPopup();
+    }
+}
+
+static void kuna(app_state& s, dialog_state& d)
+{
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34);
+    ImGui::TextUnformatted("kuna is a decompiler ported from ghidra's (github.com/Noelo-Lab/kuna). when it's installed, the "
+                           "pseudocode view gets a kuna switch that shows its output for the same function. ceasta runs it "
+                           "as a separate program; nothing of it is built in.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    if (s.kuna_exe.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_warn), "not found");
+    else
+        ImGui::TextDisabled("using %s", s.kuna_exe.c_str());
+    ImGui::TextDisabled("the kuna program, or empty to look for it on PATH");
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28);
+    bool enter = ImGui::InputText("##kuna", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (s.platform.open_file_dialog) {
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) {
+            std::string p = s.platform.open_file_dialog("Where is kuna?");
+            if (!p.empty())
+                snprintf(d.buf, sizeof(d.buf), "%s", p.c_str());
+        }
+    }
+    if (ok_cancel() || enter) {
+        app_set_kuna(s, d.buf);
         ImGui::CloseCurrentPopup();
     }
 }
@@ -1000,6 +1033,7 @@ void draw(app_state& s)
         case dialog_kind::lvar_type: lvar(s, d); break;
         case dialog_kind::proto: proto(s, d); break;
         case dialog_kind::review: review(s, d); break;
+        case dialog_kind::kuna: kuna(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

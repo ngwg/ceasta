@@ -64,6 +64,7 @@ Always on (read and annotate):
 | `get_binary_info` | format, arch, entry, segments, counts, and the file info: security flags, hashes, sections with entropy, packer warnings |
 | `list_functions` / `list_strings` / `list_imports` / `list_exports` | browse, with a filter |
 | `decompile_function` | C-like pseudocode (x86 / x64), with the function's variables |
+| `decompile_with_kuna` | the same function from [kuna](https://github.com/Noelo-Lab/kuna), a second decompiler — only there when kuna is installed (on PATH, set in the app, or `--kuna-path`) |
 | `disassemble` / `disassemble_function` | the listing, with names (arm64 too) |
 | `get_xrefs_to` / `get_xrefs_from` | callers and callees |
 | `read_bytes` / `search_bytes` / `lookup` / `get_basic_blocks` | bytes, patterns, what's at an address, the CFG |

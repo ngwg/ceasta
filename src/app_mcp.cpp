@@ -143,6 +143,7 @@ bool app_mcp_start(app_state& s)
     srv.opts.allow_debug = s.mcp_allow_debug && debugger::supported() && !s.sandboxed;
     srv.opts.allow_lua = s.mcp_allow_lua;
     srv.opts.autosave = false; // the ai's edits wait for the user's save
+    srv.opts.kuna = s.kuna_exe;
     srv.get_db = [&s] { return s.db.get(); };
     if (srv.opts.allow_lua)
         srv.get_lua = [&s] { return &s.lua; };

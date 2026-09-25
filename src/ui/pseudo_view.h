@@ -9,4 +9,6 @@ void draw(app_state& state);
 bool rename_selected(app_state& s);
 bool retype_selected(app_state& s);
 bool follow_selected(app_state& s);
+// stops kuna if it's still working (at exit)
+void shutdown();
 }

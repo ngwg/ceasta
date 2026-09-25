@@ -1,5 +1,6 @@
 #include "app.h"
 #include "core/exchange.h"
+#include "core/kuna.h"
 #include "core/os.h"
 #include "core/util.h"
 #include "imgui.h"
@@ -76,6 +77,10 @@ static void load_settings(app_state& s)
             s.win_max = v == "1";
         else if (k == "recent" && s.recent.size() < 10)
             s.recent.push_back(v);
+        else if (k == "kuna_path")
+            s.kuna_path = v;
+        else if (k == "pseudo_backend")
+            s.pseudo_kuna = v == "kuna";
     }
 }
 
@@ -93,6 +98,8 @@ static void save_settings(app_state& s)
     o += "debug_args=" + s.debug_args + "\n";
     o += util::fmt("step_count=%d\n", s.step_count);
     o += util::fmt("mcp_port=%d\nmcp_allow_debug=%d\nmcp_allow_lua=%d\n", s.mcp_port, s.mcp_allow_debug, s.mcp_allow_lua);
+    o += "kuna_path=" + s.kuna_path + "\n";
+    o += std::string("pseudo_backend=") + (s.pseudo_kuna ? "kuna" : "ceasta") + "\n";
     for (const std::string& r : s.recent)
         o += "recent=" + r + "\n";
     std::string err;
@@ -421,6 +428,21 @@ bool app_follow(app_state& s, uint64_t addr)
 void app_names_changed(app_state& s)
 {
     s.version++;
+}
+
+void app_set_kuna(app_state& s, const std::string& path)
+{
+    s.kuna_path = util::trim(path);
+    s.kuna_exe = kuna_find(s.kuna_path);
+    if (!s.kuna_exe.empty())
+        app_log(s, "kuna: " + s.kuna_exe + " - the pseudocode view can show its output (the kuna tab)");
+    else if (!s.kuna_path.empty())
+        app_log(s, "there's no kuna program at " + s.kuna_path, 1);
+    else
+        app_log(s, "kuna isn't on PATH", 1);
+    if (s.kuna_exe.empty())
+        s.pseudo_kuna = false;
+    save_settings(s);
 }
 
 void app_undo(app_state& s)
@@ -1023,6 +1045,7 @@ void app_init(app_state& s, const platform_api& platform, const std::vector<std:
     s.platform = platform;
     s.settings_path = os::join(os::user_dir(), "settings.ini");
     load_settings(s);
+    s.kuna_exe = kuna_find(s.kuna_path);
     theme::apply_theme(s.theme);
     setup_debugger(s);
     app_log(s, "ceasta " CEASTA_VERSION " - open a file with ctrl+o or drop one on the window. f1 lists the shortcuts.");
@@ -1054,6 +1077,7 @@ void app_background(app_state& s)
 void app_shutdown(app_state& s)
 {
     app_mcp_stop(s);
+    pseudo_view::shutdown();
     if (s.job) {
         s.job->progress.cancel.store(true);
         s.job->worker.join();

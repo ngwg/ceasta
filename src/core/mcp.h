@@ -40,6 +40,9 @@ struct mcp_options {
     // write each rename / comment to disk right away (the cli server has no save of its own).
     // the gui turns it off: there the ai's edits wait for the user's save, like their own
     bool autosave = true;
+    // the kuna program (a second decompiler, github.com/Noelo-Lab/kuna): adds decompile_with_kuna.
+    // "" leaves it out. only the host sets it, never a tool's arguments
+    std::string kuna;
 };
 
 class mcp_server {
@@ -66,6 +69,7 @@ public:
         json::value schema;   // json schema of the arguments
         bool debug = false;   // needs allow_debug
         bool lua = false;     // needs allow_lua
+        bool kuna = false;    // needs opts.kuna
         bool writes = false;  // changes the project or the program
         bool owner = true;    // the handler runs on the owner thread as a whole
         run_t run;

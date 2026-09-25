@@ -6,6 +6,7 @@
 #include "core/dbg_trace.h"
 #include "core/decompiler.h"
 #include "core/diff.h"
+#include "core/kuna.h"
 #include "core/lua_host.h"
 #include "core/os.h"
 #include "core/util.h"
@@ -307,6 +308,54 @@ void add_read_tools(std::vector<tool>& t)
             cap(out);
             return true;
         });
+
+    add("decompile_with_kuna",
+        "The same function decompiled by kuna, a decompiler ported from Ghidra's that the user has installed. It is "
+        "often better than decompile_function on optimized code, and it also reads arm64. It names things itself "
+        "(sub_401000, dat_404010, a0 for arguments), so renames and types set in ceasta don't show up here; its "
+        "addresses are the same as ceasta's. Use it for a second opinion on a hard function.",
+        schema({{"function", prop("string", "name or address of the function, or any address inside it")}},
+               {"function"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            // what kuna needs comes from the database; kuna itself runs here, off the owner
+            // thread, so a slow run doesn't hold the app up
+            std::string file, why, name;
+            uint64_t start = 0;
+            bool ok = false;
+            s.run([&] {
+                database* db = need_db(s, out);
+                uint64_t a;
+                if (!db || !arg_addr(*db, args, "function", a, out))
+                    return;
+                const function* f = db->an.func_containing(a);
+                if (!f) {
+                    out = "no function at " + hexa(a) + " (list_functions shows them)";
+                    return;
+                }
+                why = kuna_unsupported(db->bin);
+                file = db->bin.path;
+                start = f->start;
+                name = db->location(f->start);
+                ok = true;
+            });
+            if (!ok)
+                return false;
+            if (!why.empty()) {
+                out = why;
+                return false;
+            }
+            kuna_result k = kuna_decompile(s.opts.kuna, file, start, 120000, &s.stopping);
+            if (!k.ok) {
+                out = k.error;
+                return false;
+            }
+            out = "// kuna: " + name + " at " + hexa(start) + (k.name.empty() || k.name == name ? "" : " (kuna calls it " + k.name + ")") +
+                  "\n" + k.code;
+            cap(out);
+            return true;
+        });
+    t.back().owner = false;
+    t.back().kuna = true;
 
     add("disassemble",
         "The listing from an address: instructions with names in place of addresses, labels, data and comments.",
@@ -1710,6 +1759,8 @@ std::vector<const mcp_server::tool*> mcp_server::tools() const
         if (t.debug && !opts.allow_debug)
             continue;
         if (t.lua && !opts.allow_lua)
+            continue;
+        if (t.kuna && opts.kuna.empty())
             continue;
         out.push_back(&t);
     }

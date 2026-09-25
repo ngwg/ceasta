@@ -56,6 +56,8 @@
     <ClCompile Include="..\src\core\disasm.cpp" />
     <ClCompile Include="..\src\core\elf.cpp" />
     <ClCompile Include="..\src\core\exchange.cpp" />
+    <ClCompile Include="..\src\core\kuna.cpp" />
+    <ClCompile Include="..\src\core\process.cpp" />
     <ClCompile Include="..\src\core\fileinfo.cpp" />
     <ClCompile Include="..\src\core\json.cpp" />
     <ClCompile Include="..\src\core\lua_host.cpp" />
@@ -75,6 +77,8 @@
     <ClInclude Include="..\src\core\decompiler.h" />
     <ClInclude Include="..\src\core\disasm.h" />
     <ClInclude Include="..\src\core\json.h" />
+    <ClInclude Include="..\src\core\kuna.h" />
+    <ClInclude Include="..\src\core\process.h" />
     <ClInclude Include="..\src\core\lua_host.h" />
     <ClInclude Include="..\src\core\mcp.h" />
     <ClInclude Include="..\src\core\mcp_transport.h" />

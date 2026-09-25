@@ -3,6 +3,7 @@
 #include "core/bp_cond.h"
 #include "core/database.h"
 #include "core/debugger.h"
+#include "core/kuna.h"
 #include "core/lua_host.h"
 #include "core/mcp.h"
 #include "core/mcp_transport.h"
@@ -34,7 +35,8 @@ void mcp_usage()
         "  --allow-lua          add run_lua (runs any lua, with file and shell access)\n"
         "  --raw32 / --raw64    load the file as raw x86 / x64 code\n"
         "  --raw-arm64          load the file as raw arm64 code\n"
-        "  --base <hex>         base address for raw files\n");
+        "  --base <hex>         base address for raw files\n"
+        "  --kuna-path <file>   where kuna is, for decompile_with_kuna (default: kuna on PATH)\n");
 }
 
 // the debugger, as the mcp tools reach it, for a single-threaded cli. addresses coming in are
@@ -142,7 +144,7 @@ int cmd_mcp(int argc, char** argv)
 {
     load_options opts;
     mcp_options mopts;
-    std::string file, http;
+    std::string file, http, kuna_path;
     bool use_http = false;
     for (int i = 0; i < argc; i++) {
         std::string a = argv[i];
@@ -158,6 +160,8 @@ int cmd_mcp(int argc, char** argv)
             opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
         } else if (a == "--base" && i + 1 < argc) {
             util::parse_hex(argv[++i], opts.raw_base);
+        } else if (a == "--kuna-path" && i + 1 < argc) {
+            kuna_path = argv[++i];
         } else if (a == "-h" || a == "--help") {
             mcp_usage();
             return 0;
@@ -185,6 +189,11 @@ int cmd_mcp(int argc, char** argv)
                         "the debugger tools will be off\n");
         mopts.allow_debug = false;
     }
+
+    // kuna, the second decompiler, when it's installed (decompile_with_kuna)
+    mopts.kuna = kuna_find(kuna_path);
+    if (!kuna_path.empty() && mopts.kuna.empty())
+        fprintf(stderr, "note: there's no kuna program at %s; decompile_with_kuna will be off\n", kuna_path.c_str());
 
     mcp_server server;
     server.opts = mopts;
@@ -237,7 +246,8 @@ int cmd_mcp(int argc, char** argv)
         return rc;
     }
 
-    fprintf(stderr, "ceasta %s: serving %s over stdio (%zu tools%s%s)\n", CEASTA_VERSION, db->bin.name.c_str(),
-            server.tools().size(), mopts.allow_debug ? ", debugger on" : "", mopts.allow_lua ? ", lua on" : "");
+    fprintf(stderr, "ceasta %s: serving %s over stdio (%zu tools%s%s%s)\n", CEASTA_VERSION, db->bin.name.c_str(),
+            server.tools().size(), mopts.allow_debug ? ", debugger on" : "", mopts.allow_lua ? ", lua on" : "",
+            mopts.kuna.empty() ? "" : ", kuna on");
     return mcp_serve_stdio(server);
 }

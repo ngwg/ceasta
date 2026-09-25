@@ -7,6 +7,7 @@
 #include "core/search.h"
 #include "core/signatures.h"
 #include "core/decompiler.h"
+#include "core/kuna.h"
 #include "core/lua_host.h"
 #include "core/debugger.h"
 #include "core/os.h"
@@ -32,7 +33,7 @@ static void usage()
            "  strings <file>                strings found by the analysis\n"
            "  disasm <file> [where] [n]     n listing lines starting at where (default: entry)\n"
            "  func <file> <where>           listing of one function\n"
-           "  decompile <file> <where>      pseudocode for one function\n"
+           "  decompile <file> <where>      pseudocode for one function (--kuna: kuna's, when it's installed)\n"
            "  graph <file> <where>          basic blocks and edges of a function\n"
            "  xrefs <file> <where>          references to an address\n"
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
@@ -57,6 +58,7 @@ static void usage()
            "  --raw32 / --raw64             load the file as raw x86 / x64 code\n"
            "  --raw-arm64                   load the file as raw arm64 code\n"
            "  --base <hex>                  base address for raw files\n"
+           "  --kuna / --kuna-path <file>   decompile with kuna (github.com/Noelo-Lab/kuna) instead\n"
            "\"where\" is a hex address or any name (sub_401000, start, main, ...)\n",
         CEASTA_VERSION);
 }
@@ -255,9 +257,16 @@ int main(int argc, char** argv)
     std::vector<std::string> args;
     load_options opts;
     bool debug_mode = false;
+    bool use_kuna = false;
+    std::string kuna_path;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
+        if (a == "--kuna") {
+            use_kuna = true;
+        } else if (a == "--kuna-path" && i + 1 < argc) {
+            use_kuna = true;
+            kuna_path = argv[++i];
+        } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
             opts.force_raw = true;
             opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
         } else if (a == "--base" && i + 1 < argc) {
@@ -403,6 +412,26 @@ int main(int argc, char** argv)
         if (!f) {
             fprintf(stderr, "no function at %s\n", db.fmt_addr(a).c_str());
             return 1;
+        }
+        if (use_kuna) {
+            std::string exe = kuna_find(kuna_path);
+            std::string why = kuna_unsupported(b);
+            if (exe.empty()) {
+                fprintf(stderr, "%s\n", kuna_path.empty() ? "kuna isn't on PATH (or pass --kuna-path <file>)"
+                                                         : ("no kuna program at " + kuna_path).c_str());
+                return 1;
+            }
+            if (!why.empty()) {
+                fprintf(stderr, "%s\n", why.c_str());
+                return 1;
+            }
+            kuna_result k = kuna_decompile(exe, b.path, f->start);
+            if (!k.ok) {
+                fprintf(stderr, "%s\n", k.error.c_str());
+                return 1;
+            }
+            printf("%s\n", k.code.c_str());
+            return 0;
         }
         printf("%s", decompile_text(db, f->start).c_str());
         return 0;

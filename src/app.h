@@ -41,7 +41,7 @@ struct load_job {
 enum class center_view { listing, graph, pseudo, split }; // split: listing and pseudocode side by side
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai, palette, bookmarks, bp_condition, watch, lvar_name, lvar_type, proto, review };
+    save_changes, ai, palette, bookmarks, bp_condition, watch, lvar_name, lvar_type, proto, review, kuna };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
@@ -114,6 +114,9 @@ struct app_state {
     std::string pseudo_word;  // the name clicked in the pseudocode (n / y / enter act on it)
     int pseudo_line = -1;
     bool pseudo_focus = false;
+    bool pseudo_kuna = false;   // the pseudocode view shows kuna's (when kuna_exe is set)
+    std::string kuna_path;      // where kuna is, as set; "" looks for it on PATH
+    std::string kuna_exe;       // the kuna program found, "" when there's none
     float split_w = 0.5f;     // the listing's share of the side by side view
     uint64_t hex_addr = 0;
     bool hex_follow = true;
@@ -195,6 +198,8 @@ void app_back(app_state& s);
 void app_forward(app_state& s);
 bool app_follow(app_state& s, uint64_t addr); // jump to what the line at addr points at
 void app_names_changed(app_state& s);
+// kuna, the optional second decompiler: its path ("" for PATH), found again and saved
+void app_set_kuna(app_state& s, const std::string& path);
 void app_undo(app_state& s);
 void app_redo(app_state& s);
 void app_toggle_bookmark(app_state& s, uint64_t addr);

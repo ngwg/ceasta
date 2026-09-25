@@ -45,6 +45,11 @@
   or an x64dbg database with your names, comments, prototypes and breakpoints; file > import
   names reads x64dbg databases, .map files and the json of `scripts/ida_to_ceasta.py` /
   `scripts/ghidra_to_ceasta.py`. the same as `ceasta-cli export` / `import`
+- **a second decompiler, kuna** (#12): with [kuna](https://github.com/Noelo-Lab/kuna) installed,
+  the pseudocode view gets a `ceasta | kuna` switch showing its output for the same function -
+  run in the background, kept per function, lines linked to the listing, arm64 included.
+  nothing of it is bundled: ceasta runs kuna's command line tool (on PATH, or view > second
+  decompiler). also `ceasta-cli decompile --kuna` and the ai's `decompile_with_kuna`
 - **ai**: ready-made mcp prompts (triage, explain_function, rename_pass, find_crypto,
   trace_function) and names you review before they're applied (ai > review suggested names);
   new tools for variables, prototypes, watchpoints, stepping back and out, and the memory map
