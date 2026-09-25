@@ -45,18 +45,26 @@
   <ItemGroup>
     <ClCompile Include="..\src\core\analysis.cpp" />
     <ClCompile Include="..\src\core\binary.cpp" />
+    <ClCompile Include="..\src\core\bp_cond.cpp" />
     <ClCompile Include="..\src\core\database.cpp" />
+    <ClCompile Include="..\src\core\dbg_stack.cpp" />
     <ClCompile Include="..\src\core\dbg_trace.cpp" />
     <ClCompile Include="..\src\core\debugger.cpp" />
+    <ClCompile Include="..\src\core\debugger_steps.cpp" />
     <ClCompile Include="..\src\core\decompiler.cpp" />
     <ClCompile Include="..\src\core\diff.cpp" />
     <ClCompile Include="..\src\core\disasm.cpp" />
     <ClCompile Include="..\src\core\elf.cpp" />
+    <ClCompile Include="..\src\core\exchange.cpp" />
+    <ClCompile Include="..\src\core\kuna.cpp" />
+    <ClCompile Include="..\src\core\process.cpp" />
+    <ClCompile Include="..\src\core\fileinfo.cpp" />
     <ClCompile Include="..\src\core\json.cpp" />
     <ClCompile Include="..\src\core\lua_host.cpp" />
     <ClCompile Include="..\src\core\mcp.cpp" />
     <ClCompile Include="..\src\core\mcp_transport.cpp" />
     <ClCompile Include="..\src\core\os.cpp" />
+    <ClCompile Include="..\src\core\protos.cpp" />
     <ClCompile Include="..\src\core\pe.cpp" />
     <ClCompile Include="..\src\core\search.cpp" />
     <ClCompile Include="..\src\core\signatures.cpp" />
@@ -69,6 +77,8 @@
     <ClInclude Include="..\src\core\decompiler.h" />
     <ClInclude Include="..\src\core\disasm.h" />
     <ClInclude Include="..\src\core\json.h" />
+    <ClInclude Include="..\src\core\kuna.h" />
+    <ClInclude Include="..\src\core\process.h" />
     <ClInclude Include="..\src\core\lua_host.h" />
     <ClInclude Include="..\src\core\mcp.h" />
     <ClInclude Include="..\src\core\mcp_transport.h" />

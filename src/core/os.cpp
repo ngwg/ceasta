@@ -55,6 +55,17 @@ static fs::path to_path(const std::string& s) { return fs::path(s); }
 static std::string from_path(const fs::path& p) { return p.string(); }
 #endif
 
+bool read_head(const std::string& path, size_t n, std::vector<uint8_t>& out)
+{
+    std::ifstream f(to_path(path), std::ios::binary);
+    if (!f)
+        return false;
+    out.assign(n, 0);
+    f.read((char*)out.data(), (std::streamsize)n);
+    out.resize((size_t)std::max<std::streamsize>(f.gcount(), 0));
+    return true;
+}
+
 bool read_file(const std::string& path, std::vector<uint8_t>& out, std::string& err)
 {
     std::error_code ec;
@@ -123,6 +134,17 @@ bool exists(const std::string& path)
 {
     std::error_code ec;
     return fs::exists(to_path(path), ec);
+}
+
+void make_executable(const std::string& path)
+{
+#ifndef _WIN32
+    std::error_code ec;
+    fs::permissions(to_path(path), fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+        fs::perm_options::add, ec);
+#else
+    (void)path;
+#endif
 }
 
 bool make_dirs(const std::string& path)

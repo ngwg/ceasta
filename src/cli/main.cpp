@@ -2,10 +2,12 @@
 #include "cli/mcp_cmd.h"
 #include "core/database.h"
 #include "core/diff.h"
+#include "core/exchange.h"
 #include "core/os.h"
 #include "core/search.h"
 #include "core/signatures.h"
 #include "core/decompiler.h"
+#include "core/kuna.h"
 #include "core/lua_host.h"
 #include "core/debugger.h"
 #include "core/os.h"
@@ -23,14 +25,15 @@ static void usage()
     printf("ceasta-cli %s\n\n"
            "usage: ceasta-cli <command> <file> [args] [options]\n\n"
            "commands:\n"
-           "  info <file>                   format, entry point, segments, loader notes\n"
+           "  info <file>                   what the file is: headers, security flags, hashes, sections\n"
+           "                                with entropy, resources, version info, warnings (packed, ...)\n"
            "  funcs <file>                  functions: address, size, name\n"
            "  imports <file>                imported functions\n"
            "  exports <file>                exported symbols\n"
            "  strings <file>                strings found by the analysis\n"
            "  disasm <file> [where] [n]     n listing lines starting at where (default: entry)\n"
            "  func <file> <where>           listing of one function\n"
-           "  decompile <file> <where>      pseudocode for one function\n"
+           "  decompile <file> <where>      pseudocode for one function (--kuna: kuna's, when it's installed)\n"
            "  graph <file> <where>          basic blocks and edges of a function\n"
            "  xrefs <file> <where>          references to an address\n"
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
@@ -38,6 +41,10 @@ static void usage()
            "                                comments and segments\n"
            "  diff <old> <new>              match functions between two files, show what changed\n"
            "  export <file>                 write a committable project file (<file>.ceasta)\n"
+           "    --ida out.py / --ghidra out.py / --x64dbg out.dd64\n"
+           "                                your names, comments and prototypes for those tools instead\n"
+           "  import <file> <names>         take names from an x64dbg database, a .map file, or the json\n"
+           "                                of scripts/ida_to_ceasta.py / ghidra_to_ceasta.py\n"
            "  sigmake <file> [out.sig]      make library signatures from a file that has symbols\n"
            "  sigapply <file> <in.sig>      name matching functions (--save to keep them)\n"
            "  run <file> <script.lua>       run a lua script against the file (ceasta.* api)\n"
@@ -48,8 +55,10 @@ static void usage()
            "                                protocol (stdio, or --http PORT); ceasta-cli mcp --help\n"
            "  debug <exe> [steps]           debugger smoke test: break on entry, step, run to exit\n\n"
            "options:\n"
-           "  --raw32 / --raw64             load the file as raw code\n"
+           "  --raw32 / --raw64             load the file as raw x86 / x64 code\n"
+           "  --raw-arm64                   load the file as raw arm64 code\n"
            "  --base <hex>                  base address for raw files\n"
+           "  --kuna / --kuna-path <file>   decompile with kuna (github.com/Noelo-Lab/kuna) instead\n"
            "\"where\" is a hex address or any name (sub_401000, start, main, ...)\n",
         CEASTA_VERSION);
 }
@@ -198,8 +207,8 @@ static int cmd_diff(const std::vector<std::string>& args, const load_options& op
         return 2;
     }
     std::string ea, eb;
-    std::unique_ptr<database> a = open_database(args[1], opts, nullptr, ea);
-    std::unique_ptr<database> b = open_database(args[2], opts, nullptr, eb);
+    std::unique_ptr<database> a = open_any(args[1], opts, nullptr, ea);
+    std::unique_ptr<database> b = open_any(args[2], opts, nullptr, eb);
     if (!a) {
         fprintf(stderr, "can't open %s: %s\n", args[1].c_str(), ea.c_str());
         return 1;
@@ -248,11 +257,18 @@ int main(int argc, char** argv)
     std::vector<std::string> args;
     load_options opts;
     bool debug_mode = false;
+    bool use_kuna = false;
+    std::string kuna_path;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--raw32" || a == "--raw64") {
+        if (a == "--kuna") {
+            use_kuna = true;
+        } else if (a == "--kuna-path" && i + 1 < argc) {
+            use_kuna = true;
+            kuna_path = argv[++i];
+        } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
             opts.force_raw = true;
-            opts.raw_arch = a == "--raw32" ? bin_arch::x86 : bin_arch::x64;
+            opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
         } else if (a == "--base" && i + 1 < argc) {
             if (!util::parse_hex(argv[++i], opts.raw_base)) {
                 fprintf(stderr, "bad base address\n");
@@ -281,7 +297,10 @@ int main(int argc, char** argv)
         return cmd_diff(args, opts);
 
     std::string err;
-    std::unique_ptr<database> dbp = open_database(args[1], opts, nullptr, err);
+    std::string note;
+    std::unique_ptr<database> dbp = open_any(args[1], opts, nullptr, err, &note);
+    if (!note.empty())
+        fprintf(stderr, "note: %s\n", note.c_str());
     if (!dbp) {
         fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
@@ -310,6 +329,28 @@ int main(int argc, char** argv)
                 (unsigned long long)s.file_size);
         for (const std::string& n : b.notes)
             printf("note: %s\n", n.c_str());
+        const file_info& fi = db.info;
+        printf("\n");
+        for (const file_info::row& r : fi.header)
+            if (r.label != "file" && r.label != "entry point" && r.label != "image base")
+                printf("%-14s %s\n", r.label.c_str(), r.value.c_str());
+        printf("%-14s %s\n%-14s %s\n", "md5", fi.md5.c_str(), "sha256", fi.sha256.c_str());
+        if (!fi.imphash.empty())
+            printf("%-14s %s\n", "imphash", fi.imphash.c_str());
+        for (const file_info::row& r : fi.version)
+            printf("%-14s %s\n", r.label.c_str(), r.value.c_str());
+        printf("sections (entropy: 8 is random)\n");
+        for (const file_info::section& s : fi.sections)
+            printf("  %-12s %s  %8llx  %s  %.2f\n", s.name.c_str(), db.fmt_addr(s.addr).c_str(), (unsigned long long)s.size,
+                s.perms.c_str(), s.entropy);
+        if (!fi.resources.empty()) {
+            printf("resources\n");
+            for (const file_info::resource& r : fi.resources)
+                printf("  %-12s %-16s %8llu  %.2f  %s\n", r.type.c_str(), r.name.c_str(), (unsigned long long)r.size, r.entropy,
+                    r.note.c_str());
+        }
+        for (const std::string& w : fi.warnings)
+            printf("warning: %s\n", w.c_str());
         return 0;
     }
     if (cmd == "funcs") {
@@ -371,6 +412,26 @@ int main(int argc, char** argv)
         if (!f) {
             fprintf(stderr, "no function at %s\n", db.fmt_addr(a).c_str());
             return 1;
+        }
+        if (use_kuna) {
+            std::string exe = kuna_find(kuna_path);
+            std::string why = kuna_unsupported(b);
+            if (exe.empty()) {
+                fprintf(stderr, "%s\n", kuna_path.empty() ? "kuna isn't on PATH (or pass --kuna-path <file>)"
+                                                         : ("no kuna program at " + kuna_path).c_str());
+                return 1;
+            }
+            if (!why.empty()) {
+                fprintf(stderr, "%s\n", why.c_str());
+                return 1;
+            }
+            kuna_result k = kuna_decompile(exe, b.path, f->start);
+            if (!k.ok) {
+                fprintf(stderr, "%s\n", k.error.c_str());
+                return 1;
+            }
+            printf("%s\n", k.code.c_str());
+            return 0;
         }
         printf("%s", decompile_text(db, f->start).c_str());
         return 0;
@@ -438,11 +499,46 @@ int main(int argc, char** argv)
     }
     if (cmd == "export") {
         std::string e;
+        bool other = false;
+        for (size_t i = 2; i + 1 < args.size(); i++) {
+            const std::string& o = args[i];
+            if (o != "--ida" && o != "--ghidra" && o != "--x64dbg")
+                continue;
+            other = true;
+            std::string text = o == "--ida" ? export_ida(db) : o == "--ghidra" ? export_ghidra(db) : export_x64dbg(db);
+            if (!os::write_file(args[i + 1], text, e)) {
+                fprintf(stderr, "can't write %s: %s\n", args[i + 1].c_str(), e.c_str());
+                return 1;
+            }
+            printf("wrote %s (%zu names, %zu comments, %zu prototypes)\n", args[i + 1].c_str(), db.user_names.size(),
+                db.user_comments.size(), db.protos.size());
+            i++;
+        }
+        if (other)
+            return 0;
         if (!db.save_project(e)) {
             fprintf(stderr, "can't write the project file: %s\n", e.c_str());
             return 1;
         }
         printf("wrote %s\n", db.project_path().c_str());
+        return 0;
+    }
+    if (cmd == "import") {
+        if (args.size() < 3) {
+            fprintf(stderr, "usage: ceasta-cli import <file> <x64dbg .dd64 | .map | names .json>\n");
+            return 2;
+        }
+        import_result r = import_names(db, args[2]);
+        if (!r.error.empty()) {
+            fprintf(stderr, "%s\n", r.error.c_str());
+            return 1;
+        }
+        std::string e;
+        if (!db.save_project(e)) {
+            fprintf(stderr, "can't write the project file: %s\n", e.c_str());
+            return 1;
+        }
+        printf("%s\nsaved to %s\n", r.summary().c_str(), db.project_path().c_str());
         return 0;
     }
     if (cmd == "sigmake") {

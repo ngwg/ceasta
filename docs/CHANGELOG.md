@@ -1,5 +1,64 @@
 # changelog
 
+## v0.11.0 - 2026-09-25
+
+- **arm64**: pe (windows on arm) and elf (linux) arm64 programs open next to x86 / x64 ones -
+  listing, graph, xrefs, strings, switch tables, import stubs, signatures and diff. addresses
+  built over two instructions (adrp + add / ldr) read as names (`adrp x0, aHello@page` /
+  `add x0, x0, aHello@pageoff  ; "hello"`), calls through the got name the import, and the
+  switch tables gcc, clang and msvc make are followed. raw arm64 code: file > open raw,
+  `--raw-arm64`. the decompiler and the debugger are still x86 / x64 only, and say so
+- **the linux gui is a download**: `ceasta-x.y.z-linux-x64.AppImage` - chmod +x and run
+  (ubuntu 22.04 or newer and the like). the cli tarball is built on 22.04 too now
+- **one file for your work, like ida's .i64**: ctrl+s writes `<file>.ceasta` next to the
+  program with your names, comments, breakpoints, where you were, and the program itself, so
+  it opens later - or on another machine - without the original
+- **undo / redo** (ctrl+z / ctrl+y) for names, comments, types, prototypes and bookmarks, and
+  **bookmarks** (alt+m marks the line, ctrl+m lists them)
+- **a calmer window**: a slimmer toolbar (the debug buttons only while debugging), one small
+  view switch (listing / graph / pseudocode / both), and ctrl+shift+p - every action and
+  plugin command in one searchable list
+- **debugger**
+  - step back (shift+f7): steps are recorded, back undoes registers and memory
+  - step out (ctrl+f9)
+  - conditional breakpoints (shift+f2): `rdi == 3`, `hits == 100`, `str(rcx) == 'admin'`,
+    run in a sandbox
+  - watchpoints: stop when the program writes (or reads) a variable - f2 on data, or the hex
+    view's right click; up to 4, on every thread
+  - a call stack tab that works on optimized code without unwind info, and a memory map tab;
+    the hex view can show process memory (the heap, a stack)
+  - linux: multi-threaded programs, and libraries loaded after start show up by name
+- **decompiler**
+  - stack variables (`local_1c`, `arg_4`), declared at the top; buffers become arrays
+  - calls get their real arguments, 32-bit stack arguments and win64 stores included, and
+    imports are called by name: `CreateFileA(arg_0, 0x40000000, 1, 0, 2, 0x80, 0)`
+  - ~350 known prototypes (windows api, c library, posix) give the argument count, and the
+    listing names what each instruction passes: `mov r8d, 0x30  ; dwLength`
+  - click a name and every use lights up: n renames it, y sets a variable's type or edits a
+    function's prototype, enter follows it
+  - both (shift+f5): the listing and the pseudocode side by side, following each other
+- **file info** (the file tab, `ceasta-cli info`, the ai): headers, security flags (aslr, dep,
+  cfg, signed / pie, nx, relro, canary, fortify), md5 / sha256 / imphash, sections with
+  entropy, resources, version info, and warnings - packed (upx, aspack, themida, vmprotect,
+  ...), overlay, tls callbacks, an entry point in an odd section
+- **ida, ghidra and x64dbg**: file > export for writes an idapython script, a ghidra script
+  or an x64dbg database with your names, comments, prototypes and breakpoints; file > import
+  names reads x64dbg databases, .map files and the json of `scripts/ida_to_ceasta.py` /
+  `scripts/ghidra_to_ceasta.py`. the same as `ceasta-cli export` / `import`
+- **a second decompiler, kuna** (#12): with [kuna](https://github.com/Noelo-Lab/kuna) installed,
+  the pseudocode view gets a `ceasta | kuna` switch showing its output for the same function -
+  run in the background, kept per function, lines linked to the listing, arm64 included.
+  nothing of it is bundled: ceasta runs kuna's command line tool (on PATH, or view > second
+  decompiler). also `ceasta-cli decompile --kuna` and the ai's `decompile_with_kuna`
+- **ai**: ready-made mcp prompts (triage, explain_function, rename_pass, find_crypto,
+  trace_function) and names you review before they're applied (ai > review suggested names);
+  new tools for variables, prototypes, watchpoints, stepping back and out, and the memory map
+- analysis: elf unwind tables give exact function starts (gcc's `.cold` parts stay inside
+  their function), and a tail jump to an import stub no longer grows the caller over
+  everything in between
+- fixes: long listings could never scroll their last rows into view; a listing that comes
+  back into view scrolls to the cursor
+
 ## v0.10.0 - 2026-09-25
 
 - search everything (ctrl+f, edit > search, the toolbar): functions, names, imports, exports,

@@ -4,8 +4,10 @@
 #include "app.h"
 #include "core/mcp.h"
 #include "core/mcp_transport.h"
+#include "core/os.h"
 #include "core/util.h"
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -46,6 +48,7 @@ struct app_mcp {
         if (stop)
             return;
         queue.push_back(&j);
+        cv.notify_all(); // the ui thread may be waiting for the next piece
         cv.wait(l, [&] { return j.done || (stop && !j.taken); });
         if (!j.done)
             queue.erase(std::remove(queue.begin(), queue.end(), &j), queue.end());
@@ -60,10 +63,7 @@ void fill_debug_link(app_state& s, app_mcp& m)
 {
     mcp_debug_link& d = m.server.debug;
     d.get = [&s] { return &s.dbg; };
-    d.pump = [&s] {
-        if (s.dbg.state() == dbg_state::running)
-            s.dbg.poll(0);
-    };
+    d.pump = [&s] { app_dbg_pump(s, 0); };
     d.to_runtime = [&s](uint64_t a) { return app_to_runtime(s, a); };
     d.to_static = [&s](uint64_t rt, uint64_t& out) { return app_to_static(s, rt, out); };
     d.start = [&s, &m](const std::string& args, std::string& err) {
@@ -109,11 +109,21 @@ void fill_debug_link(app_state& s, app_mcp& m)
     d.del_bp = [&s](uint64_t a) {
         if (!s.db || !s.db->breakpoints.erase(a))
             return false;
+        s.db->bp_conditions.erase(a);
         s.db->dirty = true;
         s.version++;
         if (s.dbg.state() != dbg_state::none && s.dbg_mapped)
             s.dbg.del_bp(app_to_runtime(s, a));
         return true;
+    };
+    d.set_condition = [&s](uint64_t a, const std::string& cond, std::string& err) {
+        return app_set_bp_condition(s, a, cond, err);
+    };
+    d.condition_of = [&s](uint64_t a) {
+        if (!s.db)
+            return std::string();
+        auto c = s.db->bp_conditions.find(a);
+        return c == s.db->bp_conditions.end() ? std::string() : c->second;
     };
     d.bps = [&s] {
         return s.db ? std::vector<uint64_t>(s.db->breakpoints.begin(), s.db->breakpoints.end()) : std::vector<uint64_t>();
@@ -133,6 +143,7 @@ bool app_mcp_start(app_state& s)
     srv.opts.allow_debug = s.mcp_allow_debug && debugger::supported() && !s.sandboxed;
     srv.opts.allow_lua = s.mcp_allow_lua;
     srv.opts.autosave = false; // the ai's edits wait for the user's save
+    srv.opts.kuna = s.kuna_exe;
     srv.get_db = [&s] { return s.db.get(); };
     if (srv.opts.allow_lua)
         srv.get_lua = [&s] { return &s.lua; };
@@ -214,13 +225,21 @@ void app_mcp_pump(app_state& s)
     if (!s.mcp)
         return;
     app_mcp& m = *s.mcp;
-    // the waiting tool calls, one after another; each is short (a lookup, a decompile, a step)
-    for (int i = 0; i < 64; i++) {
+    // the waiting tool calls, one after another; each is short (a lookup, a decompile, a step).
+    // a tool that works in small pieces (stepping, waiting for a stop) sends the next one within
+    // microseconds, so wait a moment for it rather than a whole frame
+    uint64_t budget_end = os::now_ms() + 8;
+    for (int i = 0; i < 4096; i++) {
         app_mcp::job* j = nullptr;
         {
-            std::lock_guard<std::mutex> l(m.m);
-            if (m.queue.empty())
-                break;
+            std::unique_lock<std::mutex> l(m.m);
+            if (m.queue.empty()) {
+                if (i == 0 || os::now_ms() >= budget_end)
+                    break;
+                m.cv.wait_for(l, std::chrono::milliseconds(1), [&] { return !m.queue.empty() || m.stop.load(); });
+                if (m.queue.empty())
+                    break;
+            }
             j = m.queue.front();
             m.queue.pop_front();
             j->taken = true;

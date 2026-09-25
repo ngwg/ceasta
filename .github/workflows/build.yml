@@ -20,7 +20,8 @@ permissions:
 jobs:
   linux:
     name: linux - build + cli package
-    runs-on: ubuntu-24.04
+    # the oldest supported ubuntu, so the binary runs on its glibc and anything newer
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -44,17 +45,52 @@ jobs:
           path: dist/*.tar.gz
 
   linux-gui:
-    name: linux - experimental gui (compile + link)
-    runs-on: ubuntu-24.04
+    name: linux - gui appimage
+    # the oldest supported ubuntu: the appimage runs on anything with this glibc or newer
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: install glfw + opengl
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libglfw3-dev libgl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libglfw3-dev libgl1-mesa-dev xvfb
       - name: build the gui
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCEASTA_LINUX_GUI=ON
           cmake --build build --target ceasta --parallel
           test -x build/ceasta && echo "the linux gui built and linked"
+
+      - name: package an appimage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1" # no fuse on the runners
+        run: |
+          version=$(sed -n 's/^#define CEASTA_VERSION "\(.*\)"/\1/p' src/version.h)
+          out=ceasta-$version-linux-x64.AppImage
+          mkdir -p AppDir/usr/bin AppDir/usr/share/doc/ceasta dist
+          cp build/ceasta AppDir/usr/bin/
+          cp -r plugins AppDir/usr/bin/plugins
+          cp README.md LICENSE docs/CHANGELOG.md docs/THIRD_PARTY_NOTICES.md AppDir/usr/share/doc/ceasta/
+          curl -fsSL -o linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+          LDAI_OUTPUT=dist/$out ./linuxdeploy --appdir AppDir -e AppDir/usr/bin/ceasta \
+            -d packaging/linux/ceasta.desktop -i packaging/linux/ceasta.png --output appimage
+          test -x dist/$out
+
+      - name: try the appimage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          app=$(ls dist/*.AppImage)
+          $app --version
+          # it has to come up and keep running (a window, opengl, the plugins): still alive after 10 s
+          set +e
+          timeout 10 xvfb-run -a -s "-screen 0 1280x800x24" $app build/ceasta
+          code=$?
+          set -e
+          test $code -eq 124 && echo "the gui ran until it was stopped"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceasta-linux-gui
+          path: dist/*.AppImage
 
   windows:
     name: windows - msvc, installer
@@ -99,7 +135,7 @@ jobs:
 
   release:
     name: publish github release
-    needs: [linux, windows]
+    needs: [linux, linux-gui, windows]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-24.04
     permissions:
@@ -129,7 +165,8 @@ jobs:
 
           - **ceasta-$version-setup.exe** - installer for windows 10/11 x64. installs for your user without admin rights, adds a start menu entry and (optionally) "open with ceasta" to the right-click menu.
           - **ceasta-$version-windows-x64.zip** - portable, unzip and run \`ceasta.exe\`.
-          - **ceasta-cli-$version-linux-x64.tar.gz** - the command line tool for linux: analysis, disassembly, the decompiler, a terminal debugger (\`ceasta-cli dbg\`), binary diff, library signatures, lua scripting, and the mcp server (\`ceasta-cli mcp\`) for connecting an ai. the linux gui is experimental and not in this download - build it yourself (see the readme).
+          - **ceasta-$version-linux-x64.AppImage** - the gui for linux (x64, ubuntu 22.04 or newer and the like): \`chmod +x\` it and run it. if your system has no fuse, run it with \`--appimage-extract-and-run\`.
+          - **ceasta-cli-$version-linux-x64.tar.gz** - the command line tool for linux: analysis, disassembly, the decompiler, a terminal debugger (\`ceasta-cli dbg\`), binary diff, library signatures, lua scripting, and the mcp server (\`ceasta-cli mcp\`) for connecting an ai.
 
           checksums are in SHA256SUMS.txt.
           EOF

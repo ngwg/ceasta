@@ -171,6 +171,71 @@ struct debugger::impl {
         return SetThreadContext(th, &c.n) != 0;
     }
 
+    // ---- debug registers: dr0-dr3 hold the watched addresses, dr7 switches them on and says
+    // what to watch, dr6 tells which one fired. every thread has its own set
+
+    bool set_dregs(HANDLE th, const std::vector<debugger::watch>& w)
+    {
+        if (!th)
+            return false;
+        uint64_t dr7 = debugger::watch_dr7(w);
+        if (wow64) {
+            WOW64_CONTEXT c;
+            memset(&c, 0, sizeof(c));
+            c.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS;
+            if (!Wow64GetThreadContext(th, &c))
+                return false;
+            DWORD* dr[4] = {&c.Dr0, &c.Dr1, &c.Dr2, &c.Dr3};
+            for (size_t i = 0; i < 4; i++)
+                *dr[i] = i < w.size() ? (DWORD)w[i].addr : 0;
+            c.Dr6 = 0;
+            c.Dr7 = (DWORD)dr7;
+            return Wow64SetThreadContext(th, &c) != 0;
+        }
+        CONTEXT c;
+        memset(&c, 0, sizeof(c));
+        c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(th, &c))
+            return false;
+        DWORD64* dr[4] = {&c.Dr0, &c.Dr1, &c.Dr2, &c.Dr3};
+        for (size_t i = 0; i < 4; i++)
+            *dr[i] = i < w.size() ? w[i].addr : 0;
+        c.Dr6 = 0;
+        c.Dr7 = dr7;
+        return SetThreadContext(th, &c) != 0;
+    }
+
+    // which watches fired on this thread (dr6 bits 0-3), cleared for the next time
+    int take_dr6(HANDLE th)
+    {
+        if (!th)
+            return 0;
+        if (wow64) {
+            WOW64_CONTEXT c;
+            memset(&c, 0, sizeof(c));
+            c.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS;
+            if (!Wow64GetThreadContext(th, &c))
+                return 0;
+            int fired = (int)(c.Dr6 & 0xF);
+            if (fired) {
+                c.Dr6 = 0;
+                Wow64SetThreadContext(th, &c);
+            }
+            return fired;
+        }
+        CONTEXT c;
+        memset(&c, 0, sizeof(c));
+        c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(th, &c))
+            return 0;
+        int fired = (int)(c.Dr6 & 0xF);
+        if (fired) {
+            c.Dr6 = 0;
+            SetThreadContext(th, &c);
+        }
+        return fired;
+    }
+
     size_t raw_read(uint64_t a, void* out, size_t n) const
     {
         if (!process || n == 0)
@@ -267,6 +332,8 @@ struct debugger::impl {
         reinsert = 0;
         stepping = step::none;
         have_event = false;
+        owner.watch_list_.clear(); // runtime addresses of this process
+        owner.watch_pid_ = 0;
         state = dbg_state::none;
         pid = cur_tid = main_tid = event_tid = 0;
         seen_loader_bp = seen_wow_bp = false;
@@ -331,6 +398,15 @@ struct debugger::impl {
                     write_cc(reinsert);
                 reinsert = 0;
             }
+            // a watch fired: the instruction just before the pc wrote (or read) the memory
+            std::vector<debugger::watch> w = owner.active_watches();
+            int fired = w.empty() ? 0 : take_dr6(th);
+            for (size_t i = 0; i < w.size(); i++)
+                if (fired & (1 << i)) {
+                    stepping = step::none;
+                    reason = debugger::watch_text(w[i]);
+                    return true;
+                }
             if (stepping == step::into) {
                 stepping = step::none;
                 reason = "step";
@@ -340,7 +416,13 @@ struct debugger::impl {
                 stepping = step::none;
                 return false; // breakpoint is armed again, keep running
             }
-            reason = "single step at " + util::hex(addr);
+            // a single step nobody asked for, with a watch set: that watch (dr6 came back empty)
+            if (w.size() == 1)
+                reason = debugger::watch_text(w[0]);
+            else if (!w.empty())
+                reason = "watchpoint at " + util::hex(addr);
+            else
+                reason = "single step at " + util::hex(addr);
             return true;
         }
 
@@ -382,9 +464,13 @@ struct debugger::impl {
                 set_temp(entry, "entry point");
             break;
         }
-        case CREATE_THREAD_DEBUG_EVENT:
+        case CREATE_THREAD_DEBUG_EVENT: {
             threads[ev.dwThreadId] = ev.u.CreateThread.hThread;
+            std::vector<debugger::watch> w = owner.active_watches(); // a new thread starts unwatched
+            if (!w.empty())
+                set_dregs(ev.u.CreateThread.hThread, w);
             break;
+        }
         case EXIT_THREAD_DEBUG_EVENT:
             threads.erase(ev.dwThreadId);
             if (cur_tid == ev.dwThreadId)
@@ -519,6 +605,11 @@ bool debugger::start(const std::string& exe, const std::string& args, const std:
         err = "a process is already being debugged";
         return false;
     }
+    bin_arch arch;
+    if (loader::peek_arch(exe, arch) && arch == bin_arch::arm64) {
+        err = "the debugger runs x86 and x64 programs; this one is arm64";
+        return false;
+    }
     std::wstring wexe = os::widen(exe);
     std::wstring cmd = L"\"" + wexe + L"\"";
     if (!args.empty())
@@ -582,6 +673,9 @@ void debugger::detach()
     if (d->temp_active && !d->bps.count(d->temp_bp))
         d->raw_write(d->temp_bp, &d->temp_orig, 1);
     d->temp_active = false;
+    if (d->have_event && !active_watches().empty())
+        for (const auto& t : d->threads)
+            d->set_dregs(t.second, {}); // no watch left behind to trip over
     if (d->have_event) {
         // clear a pending trap flag so the program doesn't trip over it
         thread_ctx c;
@@ -633,10 +727,10 @@ void debugger::poll(uint32_t timeout_ms)
 
 dbg_state debugger::state() const { return d->state; }
 
-bool debugger::cont(std::string& err) { return d->resume(impl::step::none, err); }
-bool debugger::step_into(std::string& err) { return d->resume(impl::step::into, err); }
+bool debugger::raw_cont(std::string& err) { return d->resume(impl::step::none, err); }
+bool debugger::raw_step_into(std::string& err) { return d->resume(impl::step::into, err); }
 
-bool debugger::step_over(std::string& err)
+bool debugger::raw_step_over(std::string& err)
 {
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
@@ -654,10 +748,10 @@ bool debugger::step_over(std::string& err)
         }
         return d->resume(impl::step::none, err);
     }
-    return step_into(err);
+    return raw_step_into(err);
 }
 
-bool debugger::run_to(uint64_t addr, std::string& err)
+bool debugger::raw_run_to(uint64_t addr, std::string& err)
 {
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
@@ -843,7 +937,30 @@ bool debugger::write(uint64_t addr, const void* in, size_t n, std::string& err)
     return true;
 }
 
-bool debugger::call(uint64_t, const std::vector<uint64_t>&, uint64_t&, std::string& err)
+// every thread is frozen while the program is stopped, so they all get the list now
+bool debugger::apply_watches(std::string& err)
+{
+    if (d->state != dbg_state::stopped || !d->have_event) {
+        err = "stop the program first";
+        return false;
+    }
+    std::vector<watch> w = active_watches();
+    bool any = false;
+    DWORD last = 0;
+    for (const auto& t : d->threads) {
+        if (d->set_dregs(t.second, w))
+            any = true;
+        else
+            last = GetLastError();
+    }
+    if (!any) {
+        err = "can't set the debug registers: " + win_error(last);
+        return false;
+    }
+    return true;
+}
+
+bool debugger::raw_call(uint64_t, const std::vector<uint64_t>&, uint64_t&, std::string& err)
 {
     // TODO: drive a synchronous call through the win32 debug loop, like the linux backend does
     err = "calling a function in the target isn't available on windows yet";
@@ -864,6 +981,58 @@ std::vector<dbg_thread> debugger::threads() const
     for (const auto& t : d->threads) {
         thread_ctx c;
         out.push_back({t.first, d->state == dbg_state::stopped && d->load_ctx(t.second, c) ? c.pc() : 0});
+    }
+    return out;
+}
+
+// VirtualQueryEx over the address space: committed memory, named by the module it belongs to
+// or the thread whose stack it is
+std::vector<dbg_region> debugger::regions() const
+{
+    std::vector<dbg_region> out;
+    if (!d->process)
+        return out;
+    std::vector<std::pair<uint64_t, DWORD>> stacks; // a thread's sp, its id
+    if (d->state == dbg_state::stopped)
+        for (const auto& t : d->threads) {
+            thread_ctx c;
+            if (d->load_ctx(t.second, c))
+                stacks.push_back({c.sp(), t.first});
+        }
+    uint64_t a = 0, top = d->wow64 ? 0x100000000ull : 0x800000000000ull;
+    while (a < top) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (VirtualQueryEx(d->process, (LPCVOID)(uintptr_t)a, &mi, sizeof(mi)) != sizeof(mi))
+            break;
+        uint64_t base = (uint64_t)(uintptr_t)mi.BaseAddress, size = (uint64_t)mi.RegionSize;
+        if (size == 0)
+            break;
+        if (mi.State == MEM_COMMIT) {
+            DWORD p = mi.Protect & 0xFF;
+            dbg_region r;
+            r.base = base;
+            r.size = size;
+            r.perms = p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY ? "rwx"
+                    : p == PAGE_EXECUTE_READ ? "r-x"
+                    : p == PAGE_EXECUTE ? "--x"
+                    : p == PAGE_READWRITE || p == PAGE_WRITECOPY ? "rw-"
+                    : p == PAGE_READONLY ? "r--" : "---";
+            if (mi.Type == MEM_IMAGE) {
+                for (const dbg_module& m : d->modules)
+                    if (base >= m.base && base < m.base + (m.size ? m.size : 1))
+                        r.what = m.path.empty() ? m.name : m.path;
+            } else {
+                for (const auto& st : stacks)
+                    if (st.first >= base && st.first < base + size)
+                        r.what = util::fmt("[stack, thread %lu]", (unsigned long)st.second);
+                if (r.what.empty() && mi.Type == MEM_MAPPED)
+                    r.what = "[mapped]";
+            }
+            out.push_back(r);
+        }
+        if (base + size <= a)
+            break;
+        a = base + size;
     }
     return out;
 }
@@ -920,22 +1089,22 @@ void debugger::detach() {}
 void debugger::kill() {}
 void debugger::poll(uint32_t) {}
 dbg_state debugger::state() const { return dbg_state::none; }
-bool debugger::cont(std::string& err)
+bool debugger::raw_cont(std::string& err)
 {
     err = unsupported;
     return false;
 }
-bool debugger::step_into(std::string& err)
+bool debugger::raw_step_into(std::string& err)
 {
     err = unsupported;
     return false;
 }
-bool debugger::step_over(std::string& err)
+bool debugger::raw_step_over(std::string& err)
 {
     err = unsupported;
     return false;
 }
-bool debugger::run_to(uint64_t, std::string& err)
+bool debugger::raw_run_to(uint64_t, std::string& err)
 {
     err = unsupported;
     return false;
@@ -967,7 +1136,12 @@ bool debugger::write(uint64_t, const void*, size_t, std::string& err)
     err = unsupported;
     return false;
 }
-bool debugger::call(uint64_t, const std::vector<uint64_t>&, uint64_t&, std::string& err)
+bool debugger::raw_call(uint64_t, const std::vector<uint64_t>&, uint64_t&, std::string& err)
+{
+    err = unsupported;
+    return false;
+}
+bool debugger::apply_watches(std::string& err)
 {
     err = unsupported;
     return false;
@@ -979,6 +1153,7 @@ uint32_t debugger::tid() const { return 0; }
 int debugger::exit_code() const { return 0; }
 std::string debugger::stop_reason() const { return std::string(); }
 std::vector<dbg_module> debugger::modules() const { return {}; }
+std::vector<dbg_region> debugger::regions() const { return {}; }
 std::vector<dbg_thread> debugger::threads() const { return {}; }
 bool debugger::select_thread(uint32_t) { return false; }
 std::vector<process_info> list_processes() { return {}; }

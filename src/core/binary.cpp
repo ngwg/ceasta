@@ -19,7 +19,24 @@ const char* format_name(bin_format f)
 
 const char* arch_name(bin_arch a)
 {
-    return a == bin_arch::x64 ? "x64" : "x86";
+    switch (a) {
+    case bin_arch::x86: return "x86";
+    case bin_arch::arm64: return "arm64";
+    default: return "x64";
+    }
+}
+
+bool parse_arch(const std::string& s, bin_arch& out)
+{
+    if (s == "x86" || s == "x32" || s == "i386" || s == "32")
+        out = bin_arch::x86;
+    else if (s == "x64" || s == "x86_64" || s == "amd64" || s == "64")
+        out = bin_arch::x64;
+    else if (s == "arm64" || s == "aarch64")
+        out = bin_arch::arm64;
+    else
+        return false;
+    return true;
 }
 
 const segment* binary::seg_at(uint64_t a) const
@@ -233,6 +250,33 @@ bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out
         return false;
     }
     return true;
+}
+
+bool peek_arch(const std::string& path, bin_arch& out)
+{
+    std::vector<uint8_t> head;
+    if (!os::read_head(path, 4096, head))
+        return false;
+    const uint8_t* h = head.data();
+    size_t n = head.size();
+    if (n >= 20 && memcmp(h, "\x7f" "ELF", 4) == 0) {
+        uint16_t m = (uint16_t)(h[18] | h[19] << 8);
+        if (m != 3 && m != 62 && m != 183)
+            return false;
+        out = m == 3 ? bin_arch::x86 : m == 62 ? bin_arch::x64 : bin_arch::arm64;
+        return true;
+    }
+    if (n >= 0x40 && h[0] == 'M' && h[1] == 'Z') {
+        uint32_t lfanew = util::rd32(h + 0x3c);
+        if ((uint64_t)lfanew + 6 > n || memcmp(h + lfanew, "PE\0\0", 4) != 0)
+            return false;
+        uint16_t m = (uint16_t)(h[lfanew + 4] | h[lfanew + 5] << 8);
+        if (m != 0x14c && m != 0x8664 && m != 0xaa64)
+            return false;
+        out = m == 0x14c ? bin_arch::x86 : m == 0x8664 ? bin_arch::x64 : bin_arch::arm64;
+        return true;
+    }
+    return false;
 }
 
 bool open(const std::string& path, binary& out, std::string& err)

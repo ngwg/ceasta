@@ -1,4 +1,6 @@
 #include "ui/dialogs.h"
+#include "ui/palette.h"
+#include "core/decompiler.h"
 #include "core/util.h"
 #include "imgui.h"
 #include "theme.h"
@@ -25,6 +27,15 @@ static const char* title(dialog_kind k)
     case dialog_kind::shortcuts: return "Keyboard shortcuts###dlg";
     case dialog_kind::save_changes: return "Save changes?###dlg";
     case dialog_kind::ai: return "Connect an AI###dlg";
+    case dialog_kind::palette: return "Actions###dlg";
+    case dialog_kind::bookmarks: return "Bookmarks###dlg";
+    case dialog_kind::bp_condition: return "Breakpoint condition###dlg";
+    case dialog_kind::watch: return "Watch memory###dlg";
+    case dialog_kind::lvar_name: return "Rename variable###dlg";
+    case dialog_kind::lvar_type: return "Variable type###dlg";
+    case dialog_kind::proto: return "Function prototype###dlg";
+    case dialog_kind::review: return "Suggested names###dlg";
+    case dialog_kind::kuna: return "Second decompiler: kuna###dlg";
     default: return "###dlg";
     }
 }
@@ -32,7 +43,9 @@ static const char* title(dialog_kind k)
 static bool needs_file(dialog_kind k)
 {
     return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
-           k == dialog_kind::search || k == dialog_kind::find;
+           k == dialog_kind::search || k == dialog_kind::find || k == dialog_kind::bookmarks ||
+           k == dialog_kind::bp_condition || k == dialog_kind::watch || k == dialog_kind::lvar_name ||
+           k == dialog_kind::lvar_type || k == dialog_kind::proto || k == dialog_kind::review;
 }
 
 void open(app_state& s, dialog_kind kind, uint64_t addr)
@@ -65,10 +78,43 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
             if (f)
                 d.addr = f->start;
         }
+    } else if (kind == dialog_kind::bp_condition) {
+        d.addr = db.an.item_head(addr);
+        auto c = db.bp_conditions.find(d.addr);
+        snprintf(d.buf, sizeof(d.buf), "%s", c == db.bp_conditions.end() ? "" : c->second.c_str());
+    } else if (kind == dialog_kind::watch && !db.bin.is_mapped(addr)) {
+        // process memory (the heap, a stack): the address as it is
+        snprintf(d.buf, sizeof(d.buf), "%s", util::hex(addr).c_str());
+        d.watch_size = addr % 4 ? 1 : 4;
+    } else if (kind == dialog_kind::watch) {
+        // the variable under the cursor: its name, and its size when the cpu can watch that
+        uint64_t head = db.an.item_head(addr);
+        std::string n = db.name_at(head);
+        snprintf(d.buf, sizeof(d.buf), "%s", n.empty() ? db.fmt_addr(head).c_str() : n.c_str());
+        uint32_t size = db.an.item_size(head);
+        d.watch_size = (size == 1 || size == 2 || size == 4 || size == 8) && head % size == 0 ? (int)size : head % 4 ? 1 : 4;
+    } else if (kind == dialog_kind::proto) {
+        // what the function looks like now: its prototype, else the decompiler's signature
+        const function* fn = db.an.func_containing(addr);
+        if (fn)
+            d.addr = addr = fn->start;
+        auto p = db.protos.find(addr);
+        std::string sig;
+        if (p != db.protos.end()) {
+            prototype pr = p->second;
+            pr.name = db.name_at(addr).empty() ? pr.name : db.name_at(addr);
+            sig = format_prototype(pr);
+        } else {
+            decompiled dc = decompile(db, addr);
+            sig = dc.ok && !dc.lines.empty() ? dc.lines[0].text : "int " + db.location(addr) + "(void)";
+        }
+        snprintf(d.buf, sizeof(d.buf), "%s", sig.c_str());
     } else if (kind == dialog_kind::find) {
         snprintf(d.buf, sizeof(d.buf), "%s", s.search_text.c_str());
     } else if (kind == dialog_kind::run_args) {
         snprintf(d.buf, sizeof(d.buf), "%s", s.debug_args.c_str());
+    } else if (kind == dialog_kind::kuna) {
+        snprintf(d.buf, sizeof(d.buf), "%s", s.kuna_path.c_str());
     } else if (kind == dialog_kind::attach) {
         d.procs = list_processes();
     }
@@ -358,15 +404,17 @@ static void find(app_state& s, dialog_state& d)
 static void open_raw(app_state& s, dialog_state& d)
 {
     ImGui::TextDisabled("for shellcode, firmware and memory dumps");
-    ImGui::RadioButton("32 bit (x86)", &d.raw_arch, 0);
+    ImGui::RadioButton("x86", &d.raw_arch, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("64 bit (x64)", &d.raw_arch, 1);
+    ImGui::RadioButton("x64", &d.raw_arch, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("arm64", &d.raw_arch, 2);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
     ImGui::InputText("base address (hex)", d.raw_base, sizeof(d.raw_base), ImGuiInputTextFlags_CharsHexadecimal);
     if (ok_cancel()) {
         load_options o;
         o.force_raw = true;
-        o.raw_arch = d.raw_arch ? bin_arch::x64 : bin_arch::x86;
+        o.raw_arch = d.raw_arch == 2 ? bin_arch::arm64 : d.raw_arch ? bin_arch::x64 : bin_arch::x86;
         util::parse_hex(d.raw_base, o.raw_base);
         ImGui::CloseCurrentPopup();
         if (s.platform.open_file_dialog) {
@@ -433,6 +481,36 @@ static void run_args(app_state& s, dialog_state& d)
     }
 }
 
+static void kuna(app_state& s, dialog_state& d)
+{
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34);
+    ImGui::TextUnformatted("kuna is a decompiler ported from ghidra's (github.com/Noelo-Lab/kuna). when it's installed, the "
+                           "pseudocode view gets a kuna switch that shows its output for the same function. ceasta runs it "
+                           "as a separate program; nothing of it is built in.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    if (s.kuna_exe.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_warn), "not found");
+    else
+        ImGui::TextDisabled("using %s", s.kuna_exe.c_str());
+    ImGui::TextDisabled("the kuna program, or empty to look for it on PATH");
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28);
+    bool enter = ImGui::InputText("##kuna", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (s.platform.open_file_dialog) {
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) {
+            std::string p = s.platform.open_file_dialog("Where is kuna?");
+            if (!p.empty())
+                snprintf(d.buf, sizeof(d.buf), "%s", p.c_str());
+        }
+    }
+    if (ok_cancel() || enter) {
+        app_set_kuna(s, d.buf);
+        ImGui::CloseCurrentPopup();
+    }
+}
+
 static void about(app_state&, dialog_state&)
 {
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::func), "ceasta %s", CEASTA_VERSION);
@@ -485,6 +563,308 @@ static void save_changes(app_state& s, dialog_state& d)
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(bw, 0))) {
         s.pending_close = nullptr;
+        ImGui::CloseCurrentPopup();
+    }
+}
+
+// when the breakpoint at d.addr should stop: a lua expression over registers and memory
+static void bp_condition(app_state& s, dialog_state& d)
+{
+    ImGui::Text("stop at %s only when:", s.db->location(d.addr).c_str());
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 34);
+    bool enter = ImGui::InputTextWithHint("##cond", "rax == 5", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::TextDisabled("registers (rax, ecx, ...), hits, and memory: u8 / u16 / u32 / u64(addr), str(addr)");
+    ImGui::TextDisabled("  hits == 10     rcx > 0x100 and rdx ~= 0     str(rdi) == \"admin\"     u32(rsp + 8) == 1");
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    ImGui::Spacing();
+    float bw = ImGui::GetFontSize() * 9;
+    bool ok = ImGui::Button("OK", ImVec2(bw, 0)) || enter;
+    ImGui::SameLine();
+    bool clear = ImGui::Button("Always stop", ImVec2(bw, 0));
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(bw, 0)))
+        ImGui::CloseCurrentPopup();
+    if (ok || clear) {
+        std::string err;
+        if (app_set_bp_condition(s, d.addr, clear ? std::string() : std::string(d.buf), err))
+            ImGui::CloseCurrentPopup();
+        else
+            d.error = err;
+    }
+}
+
+// a watchpoint: the program stops right after something writes (or reads) the memory
+static void watch(app_state& s, dialog_state& d)
+{
+    ImGui::TextDisabled("a variable's name or address; heap and stack addresses work too");
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28);
+    bool enter = ImGui::InputText("##what", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("bytes");
+    for (int n : {1, 2, 4, 8}) {
+        ImGui::SameLine();
+        ImGui::RadioButton(util::fmt("%d##sz", n).c_str(), &d.watch_size, n);
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("stop when it's");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("written", !d.watch_access))
+        d.watch_access = false;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("read or written", d.watch_access))
+        d.watch_access = true;
+    bool stopped = s.dbg.state() == dbg_state::stopped;
+    if (!stopped)
+        ImGui::TextDisabled(s.dbg.state() == dbg_state::none ? "watches work while debugging: start the program (F9) first"
+                                                             : "pause the program (F12) to add a watch");
+    else
+        ImGui::TextDisabled("up to 4 watches, for this run; the Breakpoints tab lists them");
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    if (ok_cancel(stopped) || (enter && stopped)) {
+        uint64_t a = 0;
+        std::string err;
+        if (!s.db->resolve(d.buf, a))
+            d.error = "no such address or name";
+        else if (!app_add_watch(s, a, d.watch_size, d.watch_access, err))
+            d.error = err;
+        else {
+            s.bottom_tab_request = 2;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+}
+
+// a variable of the pseudocode: its name, or its type (d.key is the variable, d.addr the function)
+static void lvar(app_state& s, dialog_state& d)
+{
+    bool type = d.kind == dialog_kind::lvar_type;
+    database& db = *s.db;
+    auto f = db.lvars.find(d.addr);
+    database::lvar cur;
+    if (f != db.lvars.end() && f->second.count(d.key))
+        cur = f->second.at(d.key);
+    ImGui::Text(type ? "type of %s" : "new name for %s", cur.name.empty() ? d.key.c_str() : cur.name.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("in %s", db.location(d.addr).c_str());
+    ImGui::TextDisabled(type ? "int, char*, DWORD, struct header*, char[16]. empty goes back to the automatic type"
+                             : "empty goes back to its automatic name (%s)", d.key.c_str());
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28);
+    bool enter = ImGui::InputText("##lv", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    if (ok_cancel() || enter) {
+        std::string err, v = util::trim(d.buf);
+        if (!type && v == d.key)
+            v.clear(); // its own name: nothing to keep
+        if (db.set_lvar(d.addr, d.key, type ? cur.name : v, type ? v : cur.type, err)) {
+            app_names_changed(s);
+            s.pseudo_word = type || v.empty() ? s.pseudo_word : v;
+            ImGui::CloseCurrentPopup();
+        } else {
+            d.error = err;
+        }
+    }
+}
+
+// a function's prototype: return type, name and parameters
+static void proto(app_state& s, dialog_state& d)
+{
+    ImGui::Text("prototype of %s", s.db->location(d.addr).c_str());
+    ImGui::TextDisabled("return type, name, parameters: int check(char* key, int len). a new name renames the function,");
+    ImGui::TextDisabled("and its callers show the arguments it takes");
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 40);
+    bool enter = ImGui::InputText("##proto", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    ImGui::Spacing();
+    float bw = ImGui::GetFontSize() * 7;
+    bool ok = ImGui::Button("OK", ImVec2(bw, 0)) || enter;
+    ImGui::SameLine();
+    bool reset = ImGui::Button("Automatic", ImVec2(bw, 0));
+    ImGui::SetItemTooltip("forget this prototype: the decompiler works it out again");
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(bw, 0)))
+        ImGui::CloseCurrentPopup();
+    if (ok || reset) {
+        std::string err;
+        if (s.db->set_proto(d.addr, reset ? std::string() : std::string(d.buf), err)) {
+            app_names_changed(s);
+            ImGui::CloseCurrentPopup();
+        } else {
+            d.error = err;
+        }
+    }
+}
+
+// names an ai suggested (suggest_name / suggest_variable_name): accept or reject each. up / down
+// pick one, enter accepts it, delete rejects it
+static void review(app_state& s, dialog_state& d)
+{
+    database& db = *s.db;
+    if (db.suggestions.empty()) {
+        ImGui::TextDisabled("nothing to review. an AI you connect (AI > Connect an AI) can suggest names with");
+        ImGui::TextDisabled("suggest_name; they wait here until you accept or reject them.");
+        if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+            ImGui::CloseCurrentPopup();
+        return;
+    }
+    size_t n = db.suggestions.size();
+    ImGui::Text("%zu name%s an AI suggested", n, n == 1 ? "" : "s");
+    ImGui::SameLine();
+    ImGui::TextDisabled("nothing changes until you accept one. ctrl+z takes an accept back");
+    d.sel = std::max(0, std::min(d.sel, (int)n - 1));
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+        d.sel = std::min(d.sel + 1, (int)n - 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+        d.sel = std::max(d.sel - 1, 0);
+    int accept = -1, reject = -1;
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))
+        accept = d.sel;
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+        reject = d.sel;
+    float fs = ImGui::GetFontSize();
+    if (ImGui::BeginTable("##sugg", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit |
+                                           ImGuiTableFlags_BordersInnerV, ImVec2(fs * 60, fs * std::min(22.0f, 3.0f + 1.6f * (float)n)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Now");
+        ImGui::TableSetupColumn("Suggested");
+        ImGui::TableSetupColumn("Why", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("");
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < n; i++) {
+            const database::suggestion& g = db.suggestions[i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID((int)i);
+            std::string now = g.var.empty() ? db.location(g.addr) : db.location(g.addr) + ": " + g.var;
+            if (ImGui::Selectable(now.c_str(), (int)i == d.sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                d.sel = (int)i;
+                app_jump(s, g.addr); // a look at it, behind the dialog
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::func), "%s", g.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", g.reason.empty() ? "-" : g.reason.c_str());
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Accept"))
+                accept = (int)i;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reject"))
+                reject = (int)i;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    ImGui::Spacing();
+    float bw = fs * 8;
+    bool all_yes = ImGui::Button("Accept all", ImVec2(bw, 0));
+    ImGui::SameLine();
+    bool all_no = ImGui::Button("Reject all", ImVec2(bw, 0));
+    ImGui::SameLine();
+    if (ImGui::Button("Close", ImVec2(bw, 0)))
+        ImGui::CloseCurrentPopup();
+    std::string err;
+    if (accept >= 0) {
+        if (db.accept_suggestion((size_t)accept, err)) {
+            app_names_changed(s);
+            d.error.clear();
+        } else {
+            d.error = err;
+        }
+    } else if (reject >= 0) {
+        db.reject_suggestion((size_t)reject);
+    } else if (all_yes) {
+        // one undo step for all of them (edits in one frame go together); the ones that can't be
+        // taken stay in the list
+        size_t kept = 0;
+        while (db.suggestions.size() > kept)
+            if (!db.accept_suggestion(kept, err))
+                kept++;
+        app_names_changed(s);
+        d.error = kept ? util::fmt("%zu couldn't be taken: ", kept) + err : std::string();
+    } else if (all_no) {
+        db.suggestions.clear();
+        db.dirty = true;
+    }
+}
+
+// the bookmarks: pick one to jump there; a note per bookmark; delete removes it
+static void bookmarks(app_state& s, dialog_state& d)
+{
+    database& db = *s.db;
+    if (db.bookmarks.empty()) {
+        ImGui::TextDisabled("no bookmarks yet - alt+m marks the line you're on");
+        if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+            ImGui::CloseCurrentPopup();
+        return;
+    }
+    std::vector<uint64_t> addrs;
+    for (const auto& b : db.bookmarks)
+        addrs.push_back(b.first);
+    int n = (int)addrs.size();
+    d.sel = std::max(0, std::min(n - 1, d.sel));
+    uint64_t go = 0;
+    ImVec2 size(ImGui::GetFontSize() * 46, ImGui::GetTextLineHeightWithSpacing() * 12);
+    if (ImGui::BeginTable("##bm", 3, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+            ImGuiTableFlags_BordersInnerV, size)) {
+        ImGui::TableSetupColumn("Address");
+        ImGui::TableSetupColumn("Where");
+        ImGui::TableSetupColumn("Note", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < n; i++) {
+            uint64_t a = addrs[(size_t)i];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(i);
+            if (ImGui::Selectable(util::hex(a).c_str(), i == d.sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                if (d.sel != i)
+                    d.buf[0] = 0, d.refocus = true;
+                d.sel = i;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    go = a;
+            }
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(db.location(a).c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", db.bookmarks[a].c_str());
+        }
+        ImGui::EndTable();
+    }
+    uint64_t cur = addrs[(size_t)d.sel];
+    if (ImGui::IsWindowAppearing() || d.refocus)
+        snprintf(d.buf, sizeof(d.buf), "%s", db.bookmarks[cur].c_str());
+    d.refocus = false;
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 30);
+    if (ImGui::InputTextWithHint("##note", "a note for this bookmark (enter keeps it)", d.buf, sizeof(d.buf),
+            ImGuiInputTextFlags_EnterReturnsTrue)) {
+        db.set_bookmark(cur, true, util::trim(d.buf));
+        app_names_changed(s);
+    }
+    bool typing = ImGui::GetIO().WantTextInput;
+    if (ImGui::Button("Jump", ImVec2(ImGui::GetFontSize() * 6, 0)))
+        go = cur;
+    ImGui::SameLine();
+    if (ImGui::Button("Remove", ImVec2(ImGui::GetFontSize() * 6, 0)) || (!typing && ImGui::IsKeyPressed(ImGuiKey_Delete))) {
+        db.set_bookmark(cur, false);
+        app_names_changed(s);
+        d.refocus = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+        ImGui::CloseCurrentPopup();
+    if (!typing && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))
+        go = cur;
+    if (go) {
+        app_jump(s, go);
         ImGui::CloseCurrentPopup();
     }
 }
@@ -563,18 +943,24 @@ static void ai(app_state& s, dialog_state&)
 static void shortcuts(app_state&, dialog_state&)
 {
     static const char* const keys[][2] = {
+        {"Ctrl+Shift+P", "every action, searchable"},
         {"Ctrl+O", "open a file"},          {"Ctrl+S", "save"},
         {"Ctrl+Shift+S", "save the project as"},
         {"G", "jump to address / name"},    {"Enter / double click", "follow the operand"},
-        {"Esc / Alt+Left", "back"},         {"Ctrl+Enter / Alt+Right", "forward"},
+        {"Esc / Alt+Left / mouse back", "back"}, {"Ctrl+Enter / Alt+Right / mouse fwd", "forward"},
         {"N", "rename"},                    {";", "comment"},
+        {"Ctrl+Z / Ctrl+Y", "undo / redo"},  {"Alt+M / Ctrl+M", "bookmark / bookmarks"},
         {"X", "references to here"},        {"Space", "listing / graph"},
-        {"F5", "pseudocode (decompiler)"},  {"Ctrl+F", "search names, imports, strings, ..."},
+        {"F5", "pseudocode (decompiler)"},  {"Shift+F5", "listing and pseudocode side by side"},
+        {"N (pseudocode)", "rename the name you clicked"}, {"Y (pseudocode)", "its type / the function's prototype"},
+        {"Ctrl+F", "search names, imports, strings, ..."},
         {"Alt+B", "search bytes"},
         {"Up / Down / PgUp / PgDn", "move in the listing"},
         {"F9", "start debugging / continue"}, {"F7", "step into"},
         {"F8", "step over"},                {"F4", "run to cursor"},
-        {"F2", "toggle breakpoint"},        {"F12", "pause"},
+        {"Ctrl+F9", "step out (run until return)"}, {"Shift+F7", "step back (undo a step)"},
+        {"F2", "toggle breakpoint (on a variable: watch it)"}, {"F12", "pause"},
+        {"Shift+F2", "breakpoint condition"},
         {"Ctrl+F2", "stop debugging"},      {"Ctrl+= / Ctrl+- / Ctrl+0", "text size"},
         {"Ctrl+wheel (graph)", "zoom"},     {"drag (graph)", "pan"},
     };
@@ -613,9 +999,12 @@ void draw(app_state& s)
             then.swap(s.pending_close);
         else if (d.kind == dialog_kind::save_changes)
             s.pending_close = nullptr;
+        int action = d.kind == dialog_kind::palette ? d.run_action : -1;
         d.kind = dialog_kind::none;
         if (then)
             then();
+        if (action >= 0)
+            palette::run(s, action); // may open another dialog
         return;
     }
     // dialogs that need a file close themselves when the file goes away
@@ -636,6 +1025,15 @@ void draw(app_state& s)
         case dialog_kind::shortcuts: shortcuts(s, d); break;
         case dialog_kind::save_changes: save_changes(s, d); break;
         case dialog_kind::ai: ai(s, d); break;
+        case dialog_kind::palette: palette::draw(s, d); break;
+        case dialog_kind::bookmarks: bookmarks(s, d); break;
+        case dialog_kind::bp_condition: bp_condition(s, d); break;
+        case dialog_kind::watch: watch(s, d); break;
+        case dialog_kind::lvar_name:
+        case dialog_kind::lvar_type: lvar(s, d); break;
+        case dialog_kind::proto: proto(s, d); break;
+        case dialog_kind::review: review(s, d); break;
+        case dialog_kind::kuna: kuna(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

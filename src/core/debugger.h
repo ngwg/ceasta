@@ -28,6 +28,14 @@ struct dbg_thread {
     uint64_t pc = 0;
 };
 
+// a range of the process's memory with one set of permissions
+struct dbg_region {
+    uint64_t base = 0;
+    uint64_t size = 0;
+    std::string perms; // "r-x", "rw-", "---"
+    std::string what;  // the module / file it maps, "[stack]", "[heap]", or "" for anonymous memory
+};
+
 class debugger {
 public:
     debugger();
@@ -51,6 +59,28 @@ public:
     bool step_over(std::string& err);   // runs calls to their return address
     bool run_to(uint64_t addr, std::string& err);
     bool pause(std::string& err);
+
+    // going back: every step_into / step_over first notes the registers and the memory the
+    // instruction is about to write, and step_back puts them back, one step at a time. code that
+    // runs without being stepped (continue, run to, call, a call stepped over, a system call)
+    // isn't recorded, so going back stops there. the thread's own writes only
+    bool step_back(std::string& err);
+    size_t steps_recorded() const; // how many steps step_back can undo from here
+    // the instruction at the pc returns from the function (step out stops after it)
+    bool about_to_return() const;
+
+    // watchpoints: the cpu stops the program right after an instruction writes memory in the
+    // watched range (or reads or writes it, with access). up to 4, each 1, 2, 4 or 8 bytes and
+    // aligned to its size. runtime addresses, for this process (they go when it ends); every
+    // thread is watched. the stop reason starts with "watchpoint"
+    struct watch {
+        uint64_t addr = 0;
+        int size = 0;
+        bool access = false;
+    };
+    bool add_watch(uint64_t addr, int size, bool access, std::string& err);
+    bool del_watch(uint64_t addr);
+    std::vector<watch> watches() const;
 
     bool add_bp(uint64_t addr, std::string& err);
     bool del_bp(uint64_t addr);
@@ -77,6 +107,7 @@ public:
     int exit_code() const;
     std::string stop_reason() const;
     std::vector<dbg_module> modules() const;
+    std::vector<dbg_region> regions() const; // the memory map, by address
     std::vector<dbg_thread> threads() const;
     bool select_thread(uint32_t tid);
 
@@ -89,7 +120,25 @@ public:
     struct impl;
 
 private:
+    // the backends' own run / step / call; the public ones record steps around them
+    bool raw_cont(std::string& err);
+    bool raw_step_into(std::string& err);
+    bool raw_step_over(std::string& err);
+    bool raw_run_to(uint64_t addr, std::string& err);
+    bool raw_call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err);
+    void record_step(bool over);
+    void forget_steps();
+    // watchpoints: the list for the current process, dr7 for it, and the backend's write to the
+    // threads' debug registers
+    std::vector<watch> active_watches() const;
+    static uint64_t watch_dr7(const std::vector<watch>& w);
+    static std::string watch_text(const watch& w); // the stop reason
+    bool apply_watches(std::string& err);
+    std::vector<watch> watch_list_;
+    uint32_t watch_pid_ = 0;
+
     std::unique_ptr<impl> d;
+    std::shared_ptr<struct step_history> hist_;
 };
 
 // processes for the attach dialog (windows only, empty elsewhere)

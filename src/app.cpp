@@ -1,4 +1,6 @@
 #include "app.h"
+#include "core/exchange.h"
+#include "core/kuna.h"
 #include "core/os.h"
 #include "core/util.h"
 #include "imgui.h"
@@ -8,6 +10,7 @@
 #include "ui/dialogs.h"
 #include "ui/ida_view.h"
 #include "ui/left_panel.h"
+#include "ui/pseudo_view.h"
 #include "ui/right_panel.h"
 #include "ui/status_bar.h"
 #include "ui/top_bar.h"
@@ -74,6 +77,10 @@ static void load_settings(app_state& s)
             s.win_max = v == "1";
         else if (k == "recent" && s.recent.size() < 10)
             s.recent.push_back(v);
+        else if (k == "kuna_path")
+            s.kuna_path = v;
+        else if (k == "pseudo_backend")
+            s.pseudo_kuna = v == "kuna";
     }
 }
 
@@ -91,6 +98,8 @@ static void save_settings(app_state& s)
     o += "debug_args=" + s.debug_args + "\n";
     o += util::fmt("step_count=%d\n", s.step_count);
     o += util::fmt("mcp_port=%d\nmcp_allow_debug=%d\nmcp_allow_lua=%d\n", s.mcp_port, s.mcp_allow_debug, s.mcp_allow_lua);
+    o += "kuna_path=" + s.kuna_path + "\n";
+    o += std::string("pseudo_backend=") + (s.pseudo_kuna ? "kuna" : "ceasta") + "\n";
     for (const std::string& r : s.recent)
         o += "recent=" + r + "\n";
     std::string err;
@@ -152,16 +161,25 @@ static void start_open(app_state& s, const std::string& path, load_options opts)
 {
     std::string target = path;
     if (is_project_file(path) && !opts.force_raw) {
-        // a project: open the file it belongs to, with the project's names and comments
-        std::string name;
-        target = project_binary(path, name);
-        if (target.empty() && s.platform.open_file_dialog)
-            target = s.platform.open_file_dialog(("Where is " + (name.empty() ? std::string("the file for this project") : name) + "?").c_str());
-        if (target.empty()) {
-            app_log(s, "can't find the file " + path + " belongs to" + (name.empty() ? std::string() : " (" + name + ")") +
-                ": keep the project next to it", 2);
+        // a project / database: open its program (the file next to it, or the copy inside) with
+        // the project's names, comments and the rest
+        project_info info;
+        std::string err, note;
+        if (!read_project_info(path, info, err)) {
+            app_log(s, "can't open " + path + ": " + err, 2);
             return;
         }
+        target = project_program(path, info, note);
+        std::string name = info.name.empty() ? std::string("the program for this project") : info.name;
+        if (target.empty() && s.platform.open_file_dialog)
+            target = s.platform.open_file_dialog(("Where is " + name + "?").c_str());
+        if (target.empty()) {
+            app_log(s, "can't find " + name + ", the program " + path + " belongs to - keep the project next to it", 2);
+            return;
+        }
+        if (!note.empty())
+            app_log(s, note, 1);
+        opts = info.opts;
         opts.project = path;
     }
     if (s.dbg.state() != dbg_state::none) {
@@ -218,32 +236,65 @@ static void finish_job(app_state& s)
     s.dbg_mapped = false;
     const binary& b = s.db->bin;
     s.cursor = b.has_entry ? b.entry : b.min_addr();
+    if (s.db->saved_cursor && b.is_mapped(s.db->saved_cursor)) { // where you were when it was saved
+        s.cursor = s.db->saved_cursor;
+        s.view = s.db->saved_view == 1 ? center_view::graph : s.db->saved_view == 2 ? center_view::pseudo
+               : s.db->saved_view == 3 ? center_view::split : center_view::listing;
+    }
     s.hex_addr = s.cursor;
     s.scroll_to_cursor = true;
     for (const std::string& n : b.notes)
         app_log(s, n, 1);
+    for (const std::string& w : s.db->info.warnings) // packed, an embedded program, an overlay, ...
+        app_log(s, "note: " + w, 1);
     app_log(s, util::fmt("%s: %s %s %s, %zu functions, %zu imports, %zu strings", b.name.c_str(), format_name(b.format),
         arch_name(b.arch), b.kind.c_str(), s.db->an.funcs.size(), b.imports.size(), s.db->an.strings.size()));
     if (!s.db->user_names.empty() || !s.db->user_comments.empty())
         app_log(s, util::fmt("restored %zu names and %zu comments from %s", s.db->user_names.size(),
             s.db->user_comments.size(), s.db->annotations_path().c_str()));
-    add_recent(s, b.path);
+    add_recent(s, s.db->project_file.empty() ? b.path : s.db->project_file);
     set_title(s);
     s.lua.fire("load");
+    s.db->record_edits = true; // from here on, edits can be undone
     app_names_changed(s);
+}
+
+// where you are goes into the database too, so opening it picks up there
+static void stash_view(app_state& s)
+{
+    s.db->saved_cursor = s.cursor;
+    s.db->saved_view = s.view == center_view::graph ? 1 : s.view == center_view::pseudo ? 2 : s.view == center_view::split ? 3 : 0;
 }
 
 void app_save(app_state& s)
 {
-    if (!s.db || !s.db->dirty)
+    if (!s.db)
         return;
+    bool first = s.db->project_file.empty();
+    if (!first && !s.db->dirty)
+        return;
+    stash_view(s);
+    if (first) {
+        // the first save makes a database next to the file, holding the program too (like ida's
+        // .i64): it opens later, or on another machine, without the original file
+        s.db->project_file = s.db->bin.path + ".ceasta";
+        s.db->project_has_program = true;
+    }
     std::string err;
     if (s.db->save(err)) {
         s.db->dirty = false;
-        app_log(s, "saved to " + s.db->annotations_path());
-    } else {
-        app_log(s, "couldn't save: " + err, 2);
+        app_log(s, "saved to " + s.db->project_path());
+        add_recent(s, s.db->project_file);
+        return;
     }
+    if (first) {
+        s.db->project_file.clear();
+        s.db->project_has_program = false;
+        app_log(s, "couldn't save next to the file (" + err + ") - pick where", 1);
+        app_save_as(s);
+        return;
+    }
+    app_log(s, "couldn't save: " + err, 2);
 }
 
 void app_save_as(app_state& s)
@@ -256,14 +307,19 @@ void app_save_as(app_state& s)
     if (!is_project_file(path))
         path += ".ceasta";
     std::string old = s.db->project_file;
+    bool old_program = s.db->project_has_program;
     s.db->project_file = path;
+    s.db->project_has_program = true;
+    stash_view(s);
     std::string err;
-    if (s.db->save_project(err) && s.db->save(err)) {
+    if (s.db->save(err)) {
         s.db->dirty = false;
-        app_log(s, "saved the project to " + path + " (open it to pick up where you left off)");
+        app_log(s, "saved to " + path + " - it holds the program too, so it opens anywhere");
+        add_recent(s, path);
     } else {
         s.db->project_file = old;
-        app_log(s, "couldn't save the project: " + err, 2);
+        s.db->project_has_program = old_program;
+        app_log(s, "couldn't save: " + err, 2);
     }
 }
 
@@ -374,6 +430,55 @@ void app_names_changed(app_state& s)
     s.version++;
 }
 
+void app_set_kuna(app_state& s, const std::string& path)
+{
+    s.kuna_path = util::trim(path);
+    s.kuna_exe = kuna_find(s.kuna_path);
+    if (!s.kuna_exe.empty())
+        app_log(s, "kuna: " + s.kuna_exe + " - the pseudocode view can show its output (the kuna tab)");
+    else if (!s.kuna_path.empty())
+        app_log(s, "there's no kuna program at " + s.kuna_path, 1);
+    else
+        app_log(s, "kuna isn't on PATH", 1);
+    if (s.kuna_exe.empty())
+        s.pseudo_kuna = false;
+    save_settings(s);
+}
+
+void app_undo(app_state& s)
+{
+    if (!s.db)
+        return;
+    std::string what = s.db->undo();
+    if (what.empty())
+        return;
+    app_log(s, "undid: " + what);
+    app_names_changed(s);
+}
+
+void app_redo(app_state& s)
+{
+    if (!s.db)
+        return;
+    std::string what = s.db->redo();
+    if (what.empty())
+        return;
+    app_log(s, "redid: " + what);
+    app_names_changed(s);
+}
+
+void app_toggle_bookmark(app_state& s, uint64_t addr)
+{
+    if (!s.db || !s.db->bin.is_mapped(addr))
+        return;
+    uint64_t a = s.db->an.item_head(addr);
+    bool on = !s.db->bookmarks.count(a);
+    s.db->set_bookmark(a, on);
+    app_log(s, std::string(on ? "bookmark at " : "bookmark removed at ") + s.db->location(a) +
+        (on ? " (ctrl+m lists them)" : ""));
+    app_names_changed(s);
+}
+
 void app_set_font_size(app_state& s, float size)
 {
     s.font_size = std::min(32.0f, std::max(10.0f, size));
@@ -436,6 +541,30 @@ uint64_t app_to_runtime(const app_state& s, uint64_t addr)
     return s.dbg_mapped ? addr + s.dbg_delta : addr;
 }
 
+void app_show_memory(app_state& s, uint64_t runtime)
+{
+    uint64_t st = 0;
+    if (app_to_static(s, runtime, st)) {
+        s.hex_process = false;
+        s.hex_addr = st;
+        s.hex_live = true;
+    } else {
+        s.hex_process = true;
+        s.hex_rt = runtime;
+    }
+    s.bottom_tab_request = 1;
+    s.show_bottom = true;
+}
+
+uint64_t app_func_start_runtime(const app_state& s, uint64_t runtime)
+{
+    uint64_t st = 0;
+    if (!app_to_static(s, runtime, st))
+        return 0;
+    const function* f = s.db->an.func_containing(st);
+    return f ? app_to_runtime(s, f->start) : 0;
+}
+
 bool app_pc_static(const app_state& s, uint64_t& out)
 {
     return s.dbg.state() == dbg_state::stopped && app_to_static(s, s.dbg.pc(), out);
@@ -463,6 +592,44 @@ static void map_debuggee(app_state& s)
     }
 }
 
+void app_dbg_pump(app_state& s, uint32_t timeout_ms)
+{
+    if (s.dbg.state() == dbg_state::running)
+        s.dbg.poll(timeout_ms);
+    // past breakpoints whose condition didn't hold; the next one may stop again
+    for (int i = 0; i < 256 && s.auto_continue && s.dbg.state() == dbg_state::stopped; i++) {
+        s.auto_continue = false;
+        std::string err;
+        if (!s.dbg.cont(err)) {
+            app_log(s, "[debug] " + err, 1);
+            break;
+        }
+        s.dbg.poll(0);
+    }
+    if (s.dbg.state() != dbg_state::stopped)
+        s.auto_continue = false;
+}
+
+bool app_set_bp_condition(app_state& s, uint64_t addr, const std::string& expr, std::string& err)
+{
+    if (!s.db || !s.db->bin.is_mapped(addr))
+        return false;
+    std::string e = util::trim(expr);
+    if (!e.empty() && !s.conditions.valid(e, err))
+        return false;
+    if (!s.db->breakpoints.count(addr))
+        app_toggle_bp(s, addr);
+    if (e.empty())
+        s.db->bp_conditions.erase(addr);
+    else
+        s.db->bp_conditions[addr] = e;
+    s.db->dirty = true;
+    s.version++;
+    app_log(s, e.empty() ? "breakpoint at " + s.db->location(addr) + " stops every time"
+                         : "breakpoint at " + s.db->location(addr) + " stops when " + e);
+    return true;
+}
+
 void app_toggle_bp(app_state& s, uint64_t addr)
 {
     if (!s.db || !s.db->bin.is_mapped(addr))
@@ -470,6 +637,7 @@ void app_toggle_bp(app_state& s, uint64_t addr)
     bool live = s.dbg.state() != dbg_state::none && s.dbg_mapped;
     if (s.db->breakpoints.count(addr)) {
         s.db->breakpoints.erase(addr);
+        s.db->bp_conditions.erase(addr);
         if (live)
             s.dbg.del_bp(addr + s.dbg_delta);
         app_log(s, "breakpoint removed at " + s.db->location(addr));
@@ -485,6 +653,105 @@ void app_toggle_bp(app_state& s, uint64_t addr)
     s.version++;
 }
 
+void app_export_for(app_state& s, int tool)
+{
+    if (!s.db || !s.platform.save_file_dialog)
+        return;
+    static const char* const titles[] = {"Export for IDA (an IDAPython script)", "Export for Ghidra (a script)",
+                                          "Export for x64dbg (a database)"};
+    tool = std::max(0, std::min(2, tool));
+    std::string ext = tool == 0 ? ".ida.py" : tool == 1 ? ".ghidra.py" : s.db->bin.is64() ? ".dd64" : ".dd32";
+    std::string path = s.platform.save_file_dialog(titles[tool], s.db->bin.path + ext);
+    if (path.empty())
+        return;
+    std::string text = tool == 0 ? export_ida(*s.db) : tool == 1 ? export_ghidra(*s.db) : export_x64dbg(*s.db), err;
+    if (!os::write_file(path, text, err)) {
+        app_log(s, "can't write " + path + ": " + err, 2);
+        return;
+    }
+    static const char* const how[] = {"in IDA: File > Script file", "in Ghidra: Window > Script Manager, run it",
+                                      "in x64dbg: File > Import database"};
+    app_log(s, util::fmt("wrote %s: %zu names, %zu comments, %zu prototypes (%s)", path.c_str(), s.db->user_names.size(),
+        s.db->user_comments.size(), s.db->protos.size(), how[tool]));
+}
+
+void app_import_names(app_state& s)
+{
+    if (!s.db || !s.platform.open_file_dialog)
+        return;
+    std::string path = s.platform.open_file_dialog("Import names (x64dbg .dd64 / .dd32, .map, ida / ghidra .json)");
+    if (path.empty())
+        return;
+    import_result r = import_names(*s.db, path); // one frame: one undo step
+    if (!r.error.empty()) {
+        app_log(s, r.error, 2);
+        return;
+    }
+    app_names_changed(s);
+    app_log(s, "imported " + r.summary() + " - ctrl+z takes it back");
+}
+
+void app_bp_key(app_state& s, uint64_t addr)
+{
+    if (!s.db || !s.db->bin.is_mapped(addr))
+        return;
+    uint64_t head = s.db->an.item_head(addr);
+    const segment* seg = s.db->bin.seg_at(head);
+    bool code = (s.db->an.flags_at(head) & fl_code) || (seg && seg->exec());
+    if (code || s.db->breakpoints.count(head))
+        app_toggle_bp(s, head);
+    else
+        dialogs::open(s, dialog_kind::watch, head);
+}
+
+std::string app_where_runtime(const app_state& s, uint64_t runtime)
+{
+    uint64_t st = 0;
+    if (app_to_static(s, runtime, st))
+        return s.db->location(st);
+    for (const dbg_module& m : s.dbg.modules())
+        if (runtime >= m.base && runtime - m.base < m.size)
+            return m.name + "+" + util::hex(runtime - m.base);
+    return util::hex(runtime);
+}
+
+bool app_add_watch(app_state& s, uint64_t addr, int size, bool access, std::string& err)
+{
+    if (s.dbg.state() != dbg_state::stopped) {
+        err = s.dbg.state() == dbg_state::none ? "start the program first (F9)" : "pause the program first (F12)";
+        return false;
+    }
+    uint64_t rt = s.db && s.dbg_mapped && s.db->bin.is_mapped(addr) ? app_to_runtime(s, addr) : addr;
+    if (!s.dbg.add_watch(rt, size, access, err))
+        return false;
+    app_log(s, util::fmt("[debug] watching %s (%d byte%s): the program stops after it's %s", app_where_runtime(s, rt).c_str(),
+        size, size == 1 ? "" : "s", access ? "read or written" : "written"));
+    return true;
+}
+
+bool app_del_watch(app_state& s, uint64_t runtime)
+{
+    std::string where = app_where_runtime(s, runtime);
+    if (!s.dbg.del_watch(runtime))
+        return false;
+    app_log(s, "[debug] stopped watching " + where);
+    return true;
+}
+
+std::string app_stop_text(const app_state& s)
+{
+    std::string why = s.dbg.stop_reason();
+    if (why.compare(0, 10, "watchpoint") != 0)
+        return why;
+    for (const debugger::watch& w : s.dbg.watches()) {
+        std::string hex = util::hex(w.addr);
+        size_t at = why.find(hex);
+        if (at != std::string::npos && at + hex.size() == why.size())
+            return why.substr(0, at) + app_where_runtime(s, w.addr);
+    }
+    return why;
+}
+
 void dbg_start(app_state& s)
 {
     std::string why;
@@ -495,6 +762,7 @@ void dbg_start(app_state& s)
     if (s.dbg.state() != dbg_state::none)
         return;
     std::string err;
+    s.bp_hits.clear();
     if (!s.dbg.start(s.db->bin.path, s.debug_args, "", err))
         app_log(s, err, 2);
     else
@@ -504,7 +772,7 @@ void dbg_start(app_state& s)
 void dbg_attach(app_state& s, uint32_t pid)
 {
     if (s.sandboxed || !debugger::supported()) {
-        app_log(s, "the debugger is only available in the windows x64 build", 1);
+        app_log(s, s.sandboxed ? "debugging is disabled in this session" : "this build has no debugger (the windows and linux x64 builds do)", 1);
         return;
     }
     std::string err;
@@ -557,8 +825,11 @@ static void steps_finished(app_state& s)
     std::string why = s.dbg.stop_reason();
     if (s.dbg.state() != dbg_state::stopped)
         app_log(s, util::fmt("[debug] the program ended after %d of %d steps", done, wanted));
-    else if (why != "step" && why != "step over") // a breakpoint, a fault, a pause
-        app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, why.c_str(), pc_where(s).c_str()));
+    else if (why != "step" && why != "step over") // a breakpoint, a watch, a fault, a pause
+        app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, app_stop_text(s).c_str(),
+            pc_where(s).c_str()));
+    else if (s.step_until_return)
+        app_log(s, util::fmt("[debug] returned to %s (%d steps)", pc_where(s).c_str(), done));
     else
         app_log(s, util::fmt("[debug] %s %d instructions, now at %s", s.step_over_mode ? "stepped over" : "stepped into", done,
             pc_where(s).c_str()));
@@ -576,7 +847,7 @@ static void run_steps(app_state& s)
             // a single step lands within microseconds: check again right away at first, and
             // only wait in longer naps for a call that's being stepped over
             bool fresh = os::now_ms() - step_began < 2;
-            s.dbg.poll(fresh ? 0 : 1);
+            app_dbg_pump(s, fresh ? 0 : 1);
             if (s.dbg.state() == dbg_state::running) {
                 if (os::now_ms() >= until)
                     return; // still in a step (a long call being stepped over): next frame
@@ -596,6 +867,8 @@ static void run_steps(app_state& s)
             break;
         if (os::now_ms() >= until)
             return;
+        if (s.step_until_return && s.dbg.about_to_return())
+            s.steps_left = 1; // this step leaves the function: the last one
         std::string err;
         if (!(s.step_over_mode ? s.dbg.step_over(err) : s.dbg.step_into(err))) {
             app_log(s, err, 1);
@@ -625,8 +898,44 @@ static void begin_steps(app_state& s, bool over)
     s.steps_left = s.steps_wanted = s.step_count;
     s.steps_done = 0;
     s.step_over_mode = over;
+    s.step_until_return = false;
     s.step_in_flight = false;
     run_steps(s);
+}
+
+void dbg_step_out(app_state& s)
+{
+    if (s.dbg.state() != dbg_state::stopped || dbg_stepping(s))
+        return;
+    // step over (calls run at full speed) until a return has run, a few steps per frame
+    s.steps_left = s.steps_wanted = 1000000;
+    s.steps_done = 0;
+    s.step_over_mode = true;
+    s.step_until_return = true;
+    s.step_in_flight = false;
+    run_steps(s);
+}
+
+void dbg_step_back(app_state& s)
+{
+    if (s.dbg.state() != dbg_state::stopped || dbg_stepping(s))
+        return;
+    int done = 0;
+    std::string err;
+    for (; done < s.step_count; done++)
+        if (!s.dbg.step_back(err))
+            break;
+    if (done) {
+        uint64_t st = 0;
+        if (app_to_static(s, s.dbg.pc(), st))
+            app_jump(s, st, false);
+        app_log(s, util::fmt("[debug] went back %d step%s to %s (%zu more can be undone)", done, done == 1 ? "" : "s",
+            pc_where(s).c_str(), s.dbg.steps_recorded()));
+        s.lua.fire("stop", (int64_t)(app_to_static(s, s.dbg.pc(), st) ? st : s.dbg.pc()));
+        s.stop_seq++;
+    }
+    if (done < s.step_count)
+        app_log(s, "[debug] " + err, 1);
 }
 
 void dbg_step_into(app_state& s)
@@ -678,11 +987,26 @@ static void setup_debugger(app_state& s)
     s.dbg.on_log = [&s](const std::string& m) { app_log(s, "[debug] " + m); };
     s.dbg.on_created = [&s]() { map_debuggee(s); };
     s.dbg.on_stop = [&s]() {
+        s.stop_seq++;
         uint64_t pc_static = 0;
         bool mapped = app_to_static(s, s.dbg.pc(), pc_static);
+        // a breakpoint with a condition stops only when the condition holds
+        if (mapped && s.db && s.dbg.stop_reason() == "breakpoint") {
+            auto c = s.db->bp_conditions.find(pc_static);
+            if (c != s.db->bp_conditions.end() && !c->second.empty()) {
+                std::string err;
+                bool stop = s.conditions.check(s.dbg, c->second, ++s.bp_hits[pc_static], err);
+                if (!err.empty())
+                    app_log(s, "[debug] the condition at " + s.db->location(pc_static) + " doesn't work: " + err, 1);
+                if (!stop) {
+                    s.auto_continue = true; // quietly: app_dbg_pump carries on
+                    return;
+                }
+            }
+        }
         std::string where = mapped ? s.db->location(pc_static) : util::hex(s.dbg.pc());
         if (!dbg_stepping(s)) // a multi-step logs one line when it ends
-            app_log(s, "[debug] stopped: " + s.dbg.stop_reason() + " at " + where);
+            app_log(s, "[debug] stopped: " + app_stop_text(s) + " at " + where);
         if (mapped)
             app_jump(s, pc_static, false);
         s.lua.fire("stop", (int64_t)(mapped ? pc_static : s.dbg.pc()));
@@ -721,6 +1045,7 @@ void app_init(app_state& s, const platform_api& platform, const std::vector<std:
     s.platform = platform;
     s.settings_path = os::join(os::user_dir(), "settings.ini");
     load_settings(s);
+    s.kuna_exe = kuna_find(s.kuna_path);
     theme::apply_theme(s.theme);
     setup_debugger(s);
     app_log(s, "ceasta " CEASTA_VERSION " - open a file with ctrl+o or drop one on the window. f1 lists the shortcuts.");
@@ -744,7 +1069,7 @@ void app_background(app_state& s)
     if (dbg_stepping(s))
         run_steps(s);
     if (s.dbg.state() == dbg_state::running)
-        s.dbg.poll(10);
+        app_dbg_pump(s, 10);
     else
         os::sleep_ms(10);
 }
@@ -752,6 +1077,7 @@ void app_background(app_state& s)
 void app_shutdown(app_state& s)
 {
     app_mcp_stop(s);
+    pseudo_view::shutdown();
     if (s.job) {
         s.job->progress.cancel.store(true);
         s.job->worker.join();
@@ -783,6 +1109,13 @@ static void shortcuts(app_state& s)
         app_save(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S))
         app_save_as(s);
+    // undo / redo, unless a text box is taking them
+    if (!io.WantTextInput) {
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
+            app_undo(s);
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z))
+            app_redo(s);
+    }
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Equal) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadAdd))
         app_set_font_size(s, s.font_size + 1);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Minus) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadSubtract))
@@ -791,16 +1124,29 @@ static void shortcuts(app_state& s)
         app_set_font_size(s, 15);
     if (ImGui::IsKeyPressed(ImGuiKey_F1, false))
         dialogs::open(s, dialog_kind::shortcuts, 0);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_P))
+        dialogs::open(s, dialog_kind::palette, s.cursor);
+    // the mouse's back / forward buttons
+    if (ImGui::IsMouseClicked(3))
+        app_back(s);
+    if (ImGui::IsMouseClicked(4))
+        app_forward(s);
 
     // debugger keys work everywhere
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F2))
         dbg_stop(s);
-    else if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F2, false))
-        app_toggle_bp(s, s.cursor);
-    if (ImGui::IsKeyPressed(ImGuiKey_F9, false))
+    else if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F2))
+        dialogs::open(s, dialog_kind::bp_condition, s.cursor);
+    else if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+        app_bp_key(s, s.cursor);
+    if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F9, false))
         dbg_continue(s);
-    if (ImGui::IsKeyPressed(ImGuiKey_F7, false))
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F7))
+        dbg_step_back(s);
+    else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F7, false))
         dbg_step_into(s);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F9))
+        dbg_step_out(s);
     if (ImGui::IsKeyPressed(ImGuiKey_F8, false))
         dbg_step_over(s);
     if (ImGui::IsKeyPressed(ImGuiKey_F4, false))
@@ -813,19 +1159,24 @@ static void shortcuts(app_state& s)
     // ida style keys, only when not typing
     if (plain_key(ImGuiKey_G))
         dialogs::open(s, dialog_kind::jump, s.cursor);
-    if (plain_key(ImGuiKey_N))
+    // in the pseudocode, n / y / enter work on the name you clicked
+    if (plain_key(ImGuiKey_N) && !(s.pseudo_focus && pseudo_view::rename_selected(s)))
         dialogs::open(s, dialog_kind::rename, s.cursor);
+    if (plain_key(ImGuiKey_Y) && s.pseudo_focus)
+        pseudo_view::retype_selected(s);
     if (plain_key(ImGuiKey_Semicolon))
         dialogs::open(s, dialog_kind::comment, s.cursor);
     if (plain_key(ImGuiKey_X))
         dialogs::open(s, dialog_kind::xrefs, s.cursor);
     if (plain_key(ImGuiKey_Space))
         s.view = s.view == center_view::listing ? center_view::graph : center_view::listing;
-    if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F5))
+        s.view = s.view == center_view::split ? center_view::listing : center_view::split;
+    else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F5, false))
         s.view = s.view == center_view::pseudo ? center_view::listing : center_view::pseudo;
     if (plain_key(ImGuiKey_Escape))
         app_back(s);
-    if (plain_key(ImGuiKey_Enter) || plain_key(ImGuiKey_KeypadEnter))
+    if ((plain_key(ImGuiKey_Enter) || plain_key(ImGuiKey_KeypadEnter)) && !(s.pseudo_focus && pseudo_view::follow_selected(s)))
         app_follow(s, s.cursor);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Enter) || ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_RightArrow))
         app_forward(s);
@@ -835,18 +1186,24 @@ static void shortcuts(app_state& s)
         dialogs::open(s, dialog_kind::search, s.cursor);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
         dialogs::open(s, dialog_kind::find, s.cursor);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_M))
+        app_toggle_bookmark(s, s.cursor);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_M))
+        dialogs::open(s, dialog_kind::bookmarks, s.cursor);
 }
 
 void app_frame(app_state& s)
 {
+    s.frame_no++;
+    if (s.db)
+        s.db->edit_group = s.frame_no; // what happens in one frame undoes as one step
     finish_job(s);
     app_mcp_pump(s);
     if ((s.db && s.db->dirty) != s.title_dirty)
         set_title(s);
     if (dbg_stepping(s))
         run_steps(s);
-    if (s.dbg.state() == dbg_state::running)
-        s.dbg.poll(0);
+    app_dbg_pump(s, 0);
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
@@ -896,20 +1253,24 @@ void app_frame(app_state& s)
         ImGui::SetCursorPos(ImVec2(x, origin.y));
         widgets::splitter("##split_right", true, bar, top_h, &s.right_w, 160.0f, 900.0f, -1.0f, sc);
         x += bar;
+        // the registers / stack panel only while there is a process; otherwise the lists get it all
+        bool cpu = s.dbg.state() != dbg_state::none;
         float usable = std::max(1.0f, top_h - bar);
-        float info_h = std::min(std::max(60.0f * sc, usable * s.right_split), usable - 60.0f * sc);
+        float info_h = cpu ? std::min(std::max(60.0f * sc, usable * s.right_split), usable - 60.0f * sc) : top_h;
         ImGui::SetCursorPos(ImVec2(x, origin.y));
         ImGui::BeginChild("##info", ImVec2(right_w, info_h), ImGuiChildFlags_Borders);
         right_panel::draw(s);
         ImGui::EndChild();
-        ImGui::SetCursorPos(ImVec2(x, origin.y + info_h));
-        float split_px = info_h;
-        if (widgets::splitter("##split_cpu", false, bar, right_w, &split_px, 60.0f * sc, usable - 60.0f * sc, 1.0f, 1.0f))
-            s.right_split = split_px / usable;
-        ImGui::SetCursorPos(ImVec2(x, origin.y + info_h + bar));
-        ImGui::BeginChild("##cpu", ImVec2(right_w, top_h - info_h - bar), ImGuiChildFlags_Borders);
-        cpu_panel::draw(s);
-        ImGui::EndChild();
+        if (cpu) {
+            ImGui::SetCursorPos(ImVec2(x, origin.y + info_h));
+            float split_px = info_h;
+            if (widgets::splitter("##split_cpu", false, bar, right_w, &split_px, 60.0f * sc, usable - 60.0f * sc, 1.0f, 1.0f))
+                s.right_split = split_px / usable;
+            ImGui::SetCursorPos(ImVec2(x, origin.y + info_h + bar));
+            ImGui::BeginChild("##cpu", ImVec2(right_w, top_h - info_h - bar), ImGuiChildFlags_Borders);
+            cpu_panel::draw(s);
+            ImGui::EndChild();
+        }
     }
     if (s.show_bottom) {
         ImGui::SetCursorPos(ImVec2(origin.x, origin.y + top_h));

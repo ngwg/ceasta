@@ -1,6 +1,8 @@
 #include "cli/dbg_repl.h"
 
+#include "core/bp_cond.h"
 #include "core/database.h"
+#include "core/dbg_stack.h"
 #include "core/dbg_trace.h"
 #include "core/debugger.h"
 #include "core/decompiler.h"
@@ -14,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -24,6 +27,9 @@ namespace {
 
 std::unique_ptr<database> g_db;
 debugger g_dbg;
+bp_conditions g_cond;                    // "b <addr> if <expr>"
+std::map<uint64_t, std::string> g_bpcond; // runtime address -> condition
+std::map<uint64_t, int> g_hits;
 uint64_t g_delta = 0;        // runtime - static, for the main image
 bool g_have_delta = false;
 
@@ -75,12 +81,46 @@ std::string disasm_rt(uint64_t rt, uint32_t& size)
     return "??";
 }
 
+// a breakpoint whose condition is false doesn't count as a stop: keep going
+bool skip_this_stop()
+{
+    if (g_dbg.state() != dbg_state::stopped || g_dbg.stop_reason() != "breakpoint")
+        return false;
+    auto c = g_bpcond.find(g_dbg.pc());
+    if (c == g_bpcond.end())
+        return false;
+    std::string err;
+    bool stop = g_cond.check(g_dbg, c->second, ++g_hits[g_dbg.pc()], err);
+    if (!err.empty())
+        printf("the condition doesn't work: %s\n", err.c_str());
+    if (stop)
+        return false;
+    return g_dbg.cont(err);
+}
+
 bool wait_stop(int timeout_ms = 60000)
 {
     uint64_t until = os::now_ms() + (uint64_t)timeout_ms;
-    while (g_dbg.state() == dbg_state::running && os::now_ms() < until)
-        g_dbg.poll(50);
+    while (os::now_ms() < until) {
+        while (g_dbg.state() == dbg_state::running && os::now_ms() < until)
+            g_dbg.poll(50);
+        if (!skip_this_stop())
+            break;
+    }
     return g_dbg.state() != dbg_state::running;
+}
+
+// the stop reason, a watched address by its name
+std::string stop_text()
+{
+    std::string why = g_dbg.stop_reason();
+    for (const debugger::watch& w : g_dbg.watches()) {
+        std::string hex = util::hex(w.addr);
+        if (why.compare(0, 10, "watchpoint") == 0 && why.size() > hex.size() &&
+            why.compare(why.size() - hex.size(), hex.size(), hex) == 0)
+            return why.substr(0, why.size() - hex.size()) + loc_rt(w.addr);
+    }
+    return why;
 }
 
 void show_stop()
@@ -92,7 +132,7 @@ void show_stop()
     uint64_t pc = g_dbg.pc();
     uint32_t sz = 0;
     std::string ins = disasm_rt(pc, sz);
-    std::string why = g_dbg.stop_reason();
+    std::string why = stop_text();
     printf("\n%s  %s\n    %s\n", loc_rt(pc).c_str(), why.empty() ? "" : ("(" + why + ")").c_str(), ins.c_str());
 }
 
@@ -107,6 +147,24 @@ bool resolve_rt(const std::string& tok, uint64_t& rt)
     uint64_t v = 0;
     if (util::parse_hex(tok, v)) { rt = to_rt(v); return true; } // treat as a static address
     return false;
+}
+
+// an address in live memory: a register, $pc / $sp, a name or address of the file (moved to
+// where it is in the process), or else a raw runtime address (the heap, the stack)
+bool resolve_live(const std::string& tok, uint64_t& rt)
+{
+    std::string t = util::lower(tok[0] == '$' ? tok.substr(1) : tok);
+    for (const reg_value& r : g_dbg.registers())
+        if (r.name == t) {
+            rt = r.value;
+            return true;
+        }
+    uint64_t st = 0;
+    if (g_db && g_db->resolve(tok, st)) {
+        rt = g_db->bin.is_mapped(st) ? to_rt(st) : st;
+        return true;
+    }
+    return resolve_rt(tok, rt);
 }
 
 void cmd_regs()
@@ -178,12 +236,19 @@ void help()
         "  c                 continue\n"
         "  si [n]            step into (n times)\n"
         "  ni [n]            step over\n"
+        "  back [n]          step back: undo the last steps (memory + registers)\n"
+        "  finish            run until the current function returns\n"
         "  until <addr>      run to an address\n"
         "  b <addr>          set a breakpoint     bd <addr>  delete    bl  list\n"
+        "  b <addr> if <e>   stop only when a lua expression holds: rax == 5, hits == 3,\n"
+        "                    str(rdi) == \"admin\", u32(rsp + 8) > 100\n"
+        "  watch <addr> [n]  stop after the program writes those n bytes (1, 2, 4, 8; default 4)\n"
+        "  awatch <addr> [n] stop after it reads or writes them      unwatch <addr>\n"
         "  r                 registers            set <reg> <val>\n"
         "  u [addr] [n]      disassemble          dec [addr]  decompile the function\n"
         "  x <addr> [n]      hex dump memory      k [n]  stack\n"
-        "  bt                where am i (pc + function)\n"
+        "  bt                call stack: how it got here\n"
+        "  maps [filter]     memory map (e.g. maps libc, maps rwx)\n"
         "  call <f> [args]   call a function, print its result (args: number, name, \"string\")\n"
         "  trace [n]         single-step n insns, record indirect call / jump targets as xrefs\n"
         "  mods              modules              threads / thread <tid>\n"
@@ -293,6 +358,28 @@ int cmd_dbg(int argc, char** argv)
                 wait_stop();
             }
             show_stop();
+        } else if (c == "back" || c == "sb") {
+            int n = tok.size() > 1 ? atoi(tok[1].c_str()) : 1;
+            int done = 0;
+            for (; done < n; done++)
+                if (!g_dbg.step_back(err)) {
+                    printf("%s\n", err.c_str());
+                    break;
+                }
+            if (done)
+                printf("went back %d step%s (%zu more recorded)\n", done, done == 1 ? "" : "s", g_dbg.steps_recorded());
+            show_stop();
+        } else if (c == "finish" || c == "fin") {
+            // step over until a return has run: calls in between run at full speed
+            for (int guard = 0; guard < 1000000 && g_dbg.state() == dbg_state::stopped; guard++) {
+                bool last = g_dbg.about_to_return();
+                if (!g_dbg.step_over(err)) { printf("%s\n", err.c_str()); break; }
+                wait_stop(24 * 3600 * 1000);
+                std::string why = g_dbg.stop_reason();
+                if (last || g_dbg.state() != dbg_state::stopped || (why != "step" && why != "step over"))
+                    break;
+            }
+            show_stop();
         } else if (c == "until" || c == "runto") {
             uint64_t rt;
             if (tok.size() < 2 || !resolve_rt(tok[1], rt)) { printf("need an address\n"); continue; }
@@ -302,15 +389,43 @@ int cmd_dbg(int argc, char** argv)
         } else if (c == "b" || c == "break") {
             uint64_t rt;
             if (tok.size() < 2 || !resolve_rt(tok[1], rt)) { printf("need an address\n"); continue; }
-            if (g_dbg.add_bp(rt, err)) printf("breakpoint at %s\n", loc_rt(rt).c_str());
-            else printf("%s\n", err.c_str());
+            // "b <addr> if <lua expression>"
+            std::string cond;
+            std::string rest = util::trim(line);
+            size_t at_if = rest.find(" if ");
+            if (at_if != std::string::npos)
+                cond = util::trim(rest.substr(at_if + 4));
+            if (!cond.empty() && !g_cond.valid(cond, err)) { printf("bad condition: %s\n", err.c_str()); continue; }
+            if (!g_dbg.add_bp(rt, err)) { printf("%s\n", err.c_str()); continue; }
+            if (cond.empty())
+                g_bpcond.erase(rt);
+            else
+                g_bpcond[rt] = cond;
+            printf("breakpoint at %s%s\n", loc_rt(rt).c_str(), cond.empty() ? "" : (" when " + cond).c_str());
         } else if (c == "bd" || c == "delete") {
             uint64_t rt;
             if (tok.size() < 2 || !resolve_rt(tok[1], rt)) { printf("need an address\n"); continue; }
+            g_bpcond.erase(rt);
             printf(g_dbg.del_bp(rt) ? "deleted\n" : "no breakpoint there\n");
         } else if (c == "bl") {
-            for (uint64_t a : g_dbg.bps())
-                printf("  %s\n", loc_rt(a).c_str());
+            for (uint64_t a : g_dbg.bps()) {
+                auto cond = g_bpcond.find(a);
+                printf("  %s%s\n", loc_rt(a).c_str(), cond == g_bpcond.end() ? "" : ("  when " + cond->second).c_str());
+            }
+            for (const debugger::watch& w : g_dbg.watches())
+                printf("  watch %s, %d byte%s, %s\n", loc_rt(w.addr).c_str(), w.size, w.size == 1 ? "" : "s",
+                    w.access ? "read or write" : "write");
+        } else if (c == "watch" || c == "awatch") {
+            uint64_t rt;
+            if (tok.size() < 2 || !resolve_live(tok[1], rt)) { printf("usage: %s <addr> [1|2|4|8]\n", c.c_str()); continue; }
+            int n = tok.size() > 2 ? atoi(tok[2].c_str()) : 4;
+            if (!g_dbg.add_watch(rt, n, c == "awatch", err)) { printf("%s\n", err.c_str()); continue; }
+            printf("watching %s (%d byte%s): stops after a %s\n", loc_rt(rt).c_str(), n, n == 1 ? "" : "s",
+                c == "awatch" ? "read or write" : "write");
+        } else if (c == "unwatch") {
+            uint64_t rt;
+            if (tok.size() < 2 || !resolve_live(tok[1], rt)) { printf("need an address\n"); continue; }
+            printf(g_dbg.del_watch(rt) ? "stopped watching %s\n" : "no watch at %s\n", loc_rt(rt).c_str());
         } else if (c == "r" || c == "regs") {
             cmd_regs();
         } else if (c == "set") {
@@ -383,8 +498,20 @@ int cmd_dbg(int argc, char** argv)
         } else if (c == "k" || c == "stack") {
             cmd_stack(tok.size() > 1 ? atoi(tok[1].c_str()) : 8);
         } else if (c == "bt" || c == "where") {
-            uint64_t pc = g_dbg.pc();
-            printf("pc = %s (%s)\n", util::hex(pc).c_str(), loc_rt(pc).c_str());
+            auto func_start = [](uint64_t rt) -> uint64_t {
+                uint64_t st;
+                const function* f = in_image(rt, st) ? g_db->an.func_containing(st) : nullptr;
+                return f ? to_rt(f->start) : 0;
+            };
+            std::vector<stack_frame> fr = dbg_call_stack(g_dbg, 64, func_start);
+            for (size_t i = 0; i < fr.size(); i++)
+                printf("  #%-2zu %-32s %s\n", i, loc_rt(i ? fr[i].call : fr[i].pc).c_str(),
+                    i ? ("returns to " + util::hex(fr[i].pc)).c_str() : "");
+        } else if (c == "maps" || c == "vmmap") {
+            std::string f = tok.size() > 1 ? util::lower(tok[1]) : std::string();
+            for (const dbg_region& r : g_dbg.regions())
+                if (f.empty() || util::lower(r.perms + " " + r.what).find(f) != std::string::npos)
+                    printf("  %016" PRIx64 "-%016" PRIx64 " %s %s\n", r.base, r.base + r.size, r.perms.c_str(), r.what.c_str());
         } else if (c == "mods" || c == "modules") {
             for (const dbg_module& m : g_dbg.modules())
                 printf("  %016" PRIx64 "  %s\n", m.base, m.name.c_str());

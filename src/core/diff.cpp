@@ -34,7 +34,7 @@ fingerprint fingerprint_of(database& db, const function& f)
     fingerprint fp;
     fp.addr = f.start;
     disassembler dis;
-    if (!dis.open(db.bin.is64() ? bin_arch::x64 : bin_arch::x86))
+    if (!dis.open(db.bin.arch))
         return fp;
     uint64_t a = f.start;
     int guard = 0;
@@ -42,6 +42,7 @@ fingerprint fingerprint_of(database& db, const function& f)
         insn in;
         if (!dis.decode(db.bin, a, in) || in.size == 0)
             break;
+        db.an.resolve(in); // arm64: an add after an adrp is an address, not a constant
         // opcode and register shape, not the operand values that move between builds. an
         // immediate that isn't an address is a real constant (a magic number, a struct size),
         // so fold it in - that catches a changed constant. addresses and branch targets are
@@ -49,7 +50,7 @@ fingerprint fingerprint_of(database& db, const function& f)
         fp.fold(in.id);
         fp.fold(((uint64_t)in.reg0 << 16) | in.reg1);
         fp.fold((in.has_imm ? 1u : 0u) | (in.has_mem_op ? 2u : 0u) | ((unsigned)in.kind << 4));
-        if (in.has_imm && !db.bin.is_mapped(in.imm))
+        if (in.has_imm && !db.bin.is_mapped(in.imm) && !(in.arm && in.has_mem))
             fp.fold(in.imm);
         fp.ids.push_back((uint16_t)in.id);
         fp.insns++;

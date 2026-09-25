@@ -3,12 +3,14 @@
 #include "core/analysis.h"
 #include "core/binary.h"
 #include "core/database.h"
+#include "core/util.h"
 
 #include <capstone/capstone.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -476,6 +478,7 @@ struct insn_rw {
     bool call = false, ret = false;
     bool tail = false;   // a jump out of the function (a tail call)
     uint64_t target = 0; // direct call / tail call target
+    int proto_args = -1; // a call whose prototype says how many arguments it takes
 };
 
 // ------------------------------------------------------------------ lifter
@@ -485,6 +488,14 @@ public:
     lifter(database& db, csh cs) : db_(db), cs_(cs), is64_(db.bin.is64()) {}
     bool run(uint64_t func_start, std::vector<block_ir>& out, std::vector<std::string>& params,
              bool& returns_value);
+
+    // the variables in the stack frame, by their offset from the stack pointer at the entry
+    // (0 is the return address): local_1c below it, arg_0 above
+    struct frame_slot {
+        std::string name;
+        int width = 0;
+    };
+    std::map<int64_t, frame_slot> frame;
 
 private:
     database& db_;
@@ -499,6 +510,22 @@ private:
     };
     std::unordered_map<uint64_t, callee_info> callees_;
 
+    // the stack pointer before each instruction as an offset from its value at the entry, when
+    // it's known; rbp's, when rbp is the frame pointer
+    std::unordered_map<uint64_t, int64_t> sp_at_;
+    bool rbp_frame_ = false;
+    int64_t rbp_off_ = 0;
+    bool cur_sp_known_ = false; // the instruction being lifted
+    int64_t cur_sp_ = 0;
+    std::unordered_map<uint64_t, int> pops_; // callee -> bytes of arguments it takes off the stack
+    void frame_pass(const cfg& g, int entry);
+    int callee_pops(cs_insn* call);
+    std::string frame_var(int64_t off, int width);
+    bool slot_of(const x86_op_mem& m, int64_t& off) const;
+    // what a call goes to by name, and the prototype that says what it takes (null: unknown)
+    const prototype* call_proto(cs_insn* call, std::string* name = nullptr, uint64_t* ref = nullptr);
+    int stack_args_of(cs_insn* call); // how many stack arguments a call takes, -1 unknown
+
     std::string disp(const std::string& fam) { return reg_display(fam, is64_); }
     uint32_t scratch() const;
     uint32_t access(cs_insn* in, uint32_t& wr);
@@ -507,7 +534,7 @@ private:
     int result_used(uint64_t func);
     ep reg_read(std::unordered_map<std::string, ep>& cur, const std::string& fam);
     ep sym_for(uint64_t a);
-    ep mem_address(const x86_op_mem& m, std::unordered_map<std::string, ep>& cur, uint64_t rip);
+    ep mem_address(const x86_op_mem& m, std::unordered_map<std::string, ep>& cur, uint64_t rip, int width = 0);
     ep operand_expr(cs_insn* in, const cs_x86_op& op, std::unordered_map<std::string, ep>& cur);
     ep build_cond(const flag_state& fs, unsigned cc_id, bool& ok);
 };
@@ -719,6 +746,300 @@ ep lifter::reg_read(std::unordered_map<std::string, ep>& cur, const std::string&
     return e_reg(disp(fam));
 }
 
+// ---- the stack frame
+
+bool lifter::slot_of(const x86_op_mem& m, int64_t& off) const
+{
+    if (m.index != X86_REG_INVALID || m.base == X86_REG_INVALID || m.segment != X86_REG_INVALID)
+        return false;
+    std::string fam = reg_family(cs_reg_name(cs_, m.base));
+    if (fam == "rsp" && cur_sp_known_) {
+        off = cur_sp_ + m.disp;
+        return true;
+    }
+    if (fam == "rbp" && rbp_frame_) {
+        off = rbp_off_ + m.disp;
+        return true;
+    }
+    return false;
+}
+
+// local_1c for a slot 0x1c below the return address, arg_4 for one 4 above the first argument
+std::string lifter::frame_var(int64_t off, int width)
+{
+    int64_t ptr = is64_ ? 8 : 4;
+    char buf[48];
+    if (off < 0)
+        std::snprintf(buf, sizeof(buf), "local_%llx", (unsigned long long)(-off));
+    else if (off >= ptr)
+        std::snprintf(buf, sizeof(buf), "arg_%llx", (unsigned long long)(off - ptr));
+    else
+        return std::string(); // the return address itself
+    frame_slot& s = frame[off];
+    s.name = buf;
+    s.width = std::max(s.width, width);
+    return s.name;
+}
+
+const prototype* lifter::call_proto(cs_insn* in, std::string* name, uint64_t* ref)
+{
+    const cs_x86& x = in->detail->x86;
+    if (x.op_count < 1)
+        return nullptr;
+    const cs_x86_op& op = x.operands[0];
+    if (op.type == X86_OP_IMM) {
+        uint64_t t = (uint64_t)op.imm;
+        if (ref)
+            *ref = t;
+        if (name) {
+            std::string n = db_.name_at(t);
+            *name = n.empty() ? db_.location(t) : n;
+        }
+        return db_.callee_proto(t);
+    }
+    // call [slot]: through an import's slot (the iat or the got), which has the import's name
+    if (op.type == X86_OP_MEM && op.mem.index == X86_REG_INVALID &&
+        (op.mem.base == X86_REG_RIP || op.mem.base == X86_REG_INVALID)) {
+        uint64_t slot = op.mem.base == X86_REG_RIP ? in->address + in->size + (uint64_t)op.mem.disp : (uint64_t)op.mem.disp;
+        if (!is64_)
+            slot &= 0xffffffffull;
+        std::string n = db_.name_at(slot);
+        if (!n.empty() && db_.an.slot_import.count(slot)) {
+            if (ref)
+                *ref = slot;
+            if (name)
+                *name = n;
+            return known_prototype(n);
+        }
+    }
+    return nullptr;
+}
+
+// what a 32-bit callee takes off the stack itself (stdcall: ret n)
+int lifter::callee_pops(cs_insn* call)
+{
+    if (is64_)
+        return 0;
+    uint64_t ref = 0;
+    const prototype* p = call_proto(call, nullptr, &ref);
+    if (p)
+        return p->stdcall ? 4 * (int)p->params.size() : 0;
+    if (!ref)
+        return 0;
+    auto hit = pops_.find(ref);
+    if (hit != pops_.end())
+        return hit->second;
+    int pops = 0;
+    const function* fn = local_fn(ref);
+    cs_insn* in = fn ? cs_malloc(cs_) : nullptr;
+    for (uint64_t a = fn ? fn->start : 0; in && a < fn->end;) {
+        uint32_t sz = db_.an.item_size(a);
+        if (db_.an.flags_at(a) & fl_code) {
+            uint8_t code[16];
+            size_t n = db_.bin.read(a, code, sizeof(code));
+            const uint8_t* p2 = code;
+            size_t left = n;
+            uint64_t addr = a;
+            if (cs_disasm_iter(cs_, &p2, &left, &addr, in) && in->id == X86_INS_RET && in->detail->x86.op_count == 1 &&
+                in->detail->x86.operands[0].type == X86_OP_IMM) {
+                pops = (int)in->detail->x86.operands[0].imm;
+                break;
+            }
+        }
+        a += sz ? sz : 1;
+    }
+    if (in)
+        cs_free(in, 1);
+    pops_[ref] = pops;
+    return pops;
+}
+
+// how many arguments a call takes on the stack: from its prototype, a stdcall callee's ret n,
+// or the "add esp, n" after a cdecl call. -1 when that isn't known
+int lifter::stack_args_of(cs_insn* call)
+{
+    int nregs = 0;
+    while (arg_reg_at(nregs, is64_, db_.bin.format))
+        nregs++;
+    const prototype* p = call_proto(call);
+    if (p && !p->variadic)
+        return std::max(0, (int)p->params.size() - nregs);
+    if (is64_)
+        return -1;
+    if (!p) {
+        int pops = callee_pops(call);
+        if (pops > 0)
+            return pops / 4;
+    }
+    // add esp, n right after the call: the caller clears n bytes of arguments
+    uint8_t code[16];
+    uint64_t next = call->address + call->size;
+    size_t n = db_.bin.read(next, code, sizeof(code));
+    cs_insn* in = cs_malloc(cs_);
+    int count = -1;
+    const uint8_t* q = code;
+    size_t left = n;
+    uint64_t addr = next;
+    if (in && cs_disasm_iter(cs_, &q, &left, &addr, in) && in->id == X86_INS_ADD && in->detail->x86.op_count == 2 &&
+        in->detail->x86.operands[0].type == X86_OP_REG && in->detail->x86.operands[1].type == X86_OP_IMM &&
+        reg_family(cs_reg_name(cs_, in->detail->x86.operands[0].reg)) == "rsp")
+        count = (int)(in->detail->x86.operands[1].imm / 4);
+    if (in)
+        cs_free(in, 1);
+    return count;
+}
+
+// where the stack pointer is before each instruction, and whether rbp is a frame pointer: a
+// walk over the blocks from the entry. a block reached with two different offsets, an
+// alloca or an "and rsp, -16" leave it unknown from there (rbp relative slots still work)
+void lifter::frame_pass(const cfg& g, int entry)
+{
+    const int64_t unknown = INT64_MIN;
+    const int64_t ptr = is64_ ? 8 : 4;
+    size_t nb = g.blocks.size();
+    sp_at_.clear();
+    rbp_frame_ = false;
+    bool rbp_bad = false;
+    std::vector<int64_t> in(nb, unknown);
+    std::vector<char> seen(nb, 0);
+    std::vector<int> work;
+    if (entry < 0 || (size_t)entry >= nb)
+        return;
+    in[(size_t)entry] = 0;
+    seen[(size_t)entry] = 1;
+    work.push_back(entry);
+    cs_insn* insn = cs_malloc(cs_);
+    if (!insn)
+        return;
+    auto fam_of = [&](const cs_x86_op& op) {
+        return op.type == X86_OP_REG ? reg_family(cs_reg_name(cs_, op.reg)) : std::string();
+    };
+    auto set_frame = [&](int64_t at) {
+        if (rbp_frame_ && rbp_off_ != at)
+            rbp_bad = true;
+        rbp_frame_ = true;
+        rbp_off_ = at;
+    };
+    int guard = 0;
+    while (!work.empty() && guard++ < 200000) {
+        int b = work.back();
+        work.pop_back();
+        int64_t sp = in[(size_t)b];
+        for (uint64_t a : g.blocks[(size_t)b].insns) {
+            if (sp != unknown)
+                sp_at_[a] = sp;
+            else
+                sp_at_.erase(a);
+            uint8_t code[16];
+            size_t n = db_.bin.read(a, code, sizeof(code));
+            const uint8_t* p = code;
+            size_t left = n;
+            uint64_t addr = a;
+            if (!cs_disasm_iter(cs_, &p, &left, &addr, insn)) {
+                sp = unknown;
+                continue;
+            }
+            const cs_x86& x = insn->detail->x86;
+            std::string d0 = x.op_count >= 1 ? fam_of(x.operands[0]) : std::string();
+            std::string d1 = x.op_count >= 2 ? fam_of(x.operands[1]) : std::string();
+            int64_t size = x.op_count >= 1 && x.operands[0].size == 2 ? 2 : ptr;
+            auto known = [&](int64_t v) { return sp == unknown ? unknown : v; };
+            switch (insn->id) {
+            case X86_INS_PUSH:
+                sp = known(sp - size);
+                break;
+            case X86_INS_POP:
+                sp = d0 == "rsp" ? unknown : known(sp + size);
+                break;
+            case X86_INS_PUSHFQ:
+            case X86_INS_PUSHFD:
+                sp = known(sp - ptr);
+                break;
+            case X86_INS_POPFQ:
+            case X86_INS_POPFD:
+                sp = known(sp + ptr);
+                break;
+            case X86_INS_PUSHAL:
+                sp = known(sp - 32);
+                break;
+            case X86_INS_POPAL:
+                sp = known(sp + 32);
+                break;
+            case X86_INS_SUB:
+            case X86_INS_ADD:
+                if (d0 == "rsp")
+                    sp = x.operands[1].type == X86_OP_IMM
+                        ? known(sp + (insn->id == X86_INS_ADD ? 1 : -1) * (int64_t)x.operands[1].imm) : unknown;
+                break;
+            case X86_INS_LEA: {
+                const x86_op_mem& m = x.operands[1].mem;
+                std::string base = m.base != X86_REG_INVALID ? reg_family(cs_reg_name(cs_, m.base)) : std::string();
+                bool plain = m.index == X86_REG_INVALID;
+                if (d0 == "rsp")
+                    sp = plain && base == "rsp" ? known(sp + m.disp)
+                       : plain && base == "rbp" && rbp_frame_ ? rbp_off_ + m.disp : unknown;
+                else if (d0 == "rbp") {
+                    if (plain && base == "rsp" && sp != unknown)
+                        set_frame(sp + m.disp);
+                    else
+                        rbp_bad = true;
+                }
+                break;
+            }
+            case X86_INS_MOV:
+                if (d0 == "rsp")
+                    sp = d1 == "rbp" && rbp_frame_ ? rbp_off_ : unknown;
+                else if (d0 == "rbp") {
+                    if (d1 == "rsp" && sp != unknown)
+                        set_frame(sp);
+                    else
+                        rbp_bad = true;
+                }
+                break;
+            case X86_INS_LEAVE:
+                sp = rbp_frame_ ? rbp_off_ + ptr : unknown;
+                break;
+            case X86_INS_ENTER:
+                if (sp != unknown) {
+                    sp -= ptr;
+                    set_frame(sp);
+                    sp -= (int64_t)x.operands[0].imm;
+                }
+                break;
+            case X86_INS_CALL:
+                sp = known(sp + callee_pops(insn));
+                break;
+            default: {
+                // anything else that changes rsp (and rsp, -16 / mov rsp, rax) loses track; rbp
+                // changed any other way isn't a frame pointer
+                bool wr0 = x.op_count >= 1 && x.operands[0].type == X86_OP_REG && (x.operands[0].access & CS_AC_WRITE);
+                if (wr0 && d0 == "rsp")
+                    sp = unknown;
+                if (wr0 && d0 == "rbp")
+                    rbp_bad = true;
+                if (insn->id == X86_INS_XCHG && (d0 == "rbp" || d1 == "rbp"))
+                    rbp_bad = true;
+                break;
+            }
+            }
+        }
+        for (const cfg_edge& e : g.blocks[(size_t)b].succ) {
+            size_t t = e.to;
+            if (!seen[t]) {
+                seen[t] = 1;
+                in[t] = sp;
+                work.push_back((int)t);
+            } else if (in[t] != sp && in[t] != unknown) {
+                in[t] = unknown;
+                work.push_back((int)t);
+            }
+        }
+    }
+    cs_free(insn, 1);
+    if (rbp_bad)
+        rbp_frame_ = false;
+}
+
 ep lifter::sym_for(uint64_t a)
 {
     std::string n = db_.name_at(a);
@@ -727,11 +1048,17 @@ ep lifter::sym_for(uint64_t a)
     return e_num(a);
 }
 
-ep lifter::mem_address(const x86_op_mem& m, std::unordered_map<std::string, ep>& cur, uint64_t rip)
+ep lifter::mem_address(const x86_op_mem& m, std::unordered_map<std::string, ep>& cur, uint64_t rip, int width)
 {
     if (m.base == X86_REG_RIP) {
         uint64_t ea = rip + (uint64_t)m.disp;
         return e_un("&", sym_for(ea));
+    }
+    int64_t off = 0;
+    if (slot_of(m, off)) { // a variable in the stack frame
+        std::string nm = frame_var(off, width);
+        if (!nm.empty())
+            return e_un("&", e_sym(nm));
     }
     ep e;
     if (m.base != X86_REG_INVALID) {
@@ -760,11 +1087,19 @@ ep lifter::operand_expr(cs_insn* in, const cs_x86_op& op, std::unordered_map<std
         std::string fam = reg_family(cs_reg_name(cs_, op.reg));
         return fam.empty() ? e_reg(cs_reg_name(cs_, op.reg)) : reg_read(cur, fam);
     }
-    if (op.type == X86_OP_IMM)
+    if (op.type == X86_OP_IMM) {
+        // an address of something in the file (a string, a global, a function): by name
+        uint64_t v = (uint64_t)op.imm;
+        if (!is64_)
+            v &= 0xffffffffull;
+        if (v >= 0x10000 && db_.bin.is_mapped(v) && (db_.an.flags_at(v) & (fl_str | fl_data | fl_label | fl_func)) &&
+            !db_.name_at(v).empty())
+            return e_un("&", sym_for(v));
         return e_num((uint64_t)op.imm, true);
+    }
     if (op.type == X86_OP_MEM) {
         uint64_t rip = in->address + in->size;
-        return e_mem(mem_address(op.mem, cur, rip), op.size);
+        return e_mem(mem_address(op.mem, cur, rip, op.size), op.size);
     }
     return e_sym("?");
 }
@@ -857,6 +1192,86 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                x.operands[0].reg == x.operands[1].reg;
     };
 
+    frame_pass(g, entry);
+
+    // stack arguments: pushes (32-bit) and stores to the outgoing area ([rsp + 0x20 + 8n] on
+    // win64) that a call in the same block takes: they become that call's arguments instead of
+    // statements of their own. an argument push reads its register
+    std::vector<std::vector<char>> arg_mark(nb);
+    std::vector<std::unordered_map<size_t, std::vector<int64_t>>> call_slots(nb); // call -> its argument slots
+    for (size_t bi = 0; bi < nb; bi++) {
+        const cfg_block& cb = g.blocks[bi];
+        size_t ni = cb.insns.size();
+        std::vector<char>& is_arg = arg_mark[bi];
+        std::unordered_map<size_t, std::vector<int64_t>>& call_stack = call_slots[bi];
+        is_arg.assign(ni, 0);
+        {
+            const int64_t ptr = is64_ ? 8 : 4;
+            const bool pe = db_.bin.format == bin_format::pe;
+            const int64_t base = is64_ && pe ? 0x20 : 0;
+            std::vector<std::pair<size_t, int64_t>> cand; // since the last call: instruction, slot
+            bool prologue = (int)bi == entry;
+            for (size_t k = 0; k < ni; k++) {
+                uint8_t code[16];
+                size_t n = db_.bin.read(cb.insns[k], code, sizeof(code));
+                const uint8_t* p = code;
+                size_t left = n;
+                uint64_t addr = cb.insns[k];
+                if (!cs_disasm_iter(cs_, &p, &left, &addr, insn))
+                    continue;
+                const cs_x86& x = insn->detail->x86;
+                auto spi = sp_at_.find(cb.insns[k]);
+                bool spk = spi != sp_at_.end();
+                int64_t sp = spk ? spi->second : 0;
+                std::string d0 = x.op_count >= 1 && x.operands[0].type == X86_OP_REG
+                    ? reg_family(cs_reg_name(cs_, x.operands[0].reg)) : std::string();
+                std::string d1 = x.op_count >= 2 && x.operands[1].type == X86_OP_REG
+                    ? reg_family(cs_reg_name(cs_, x.operands[1].reg)) : std::string();
+                unsigned id = insn->id;
+                bool setup = id == X86_INS_PUSH || id == X86_INS_ENDBR32 || id == X86_INS_ENDBR64 ||
+                             (id == X86_INS_MOV && d0 == "rbp" && d1 == "rsp") ||
+                             ((id == X86_INS_SUB || id == X86_INS_AND) && d0 == "rsp") || (id == X86_INS_LEA && d0 == "rbp");
+                if (id == X86_INS_PUSH) {
+                    // the registers a prologue saves aren't arguments
+                    static const std::set<std::string> saved = {"rbp", "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15"};
+                    bool save = prologue && saved.count(d0);
+                    if (!save && !is64_ && spk)
+                        cand.push_back({k, sp - ptr});
+                } else if (id == X86_INS_MOV && x.op_count == 2 && x.operands[0].type == X86_OP_MEM && spk &&
+                           x.operands[0].mem.index == X86_REG_INVALID && x.operands[0].mem.base != X86_REG_INVALID &&
+                           reg_family(cs_reg_name(cs_, x.operands[0].mem.base)) == "rsp") {
+                    cand.push_back({k, sp + x.operands[0].mem.disp});
+                } else if (id == X86_INS_CALL) {
+                    int nargs = stack_args_of(insn);
+                    if (spk && nargs < 0 && (!is64_ || pe)) {
+                        // not known: the ones that line up from the call's stack pointer
+                        nargs = 0;
+                        for (bool more = true; more; nargs += more ? 1 : 0) {
+                            more = false;
+                            for (const auto& c : cand)
+                                more = more || c.second == sp + base + ptr * nargs;
+                        }
+                    }
+                    std::vector<int64_t> slots;
+                    for (int i = 0; spk && i < nargs; i++) {
+                        int64_t want = sp + base + ptr * i;
+                        slots.push_back(want);
+                        for (size_t c = cand.size(); c-- > 0;)
+                            if (cand[c].second == want) {
+                                is_arg[cand[c].first] = 1;
+                                break;
+                            }
+                    }
+                    if (!slots.empty())
+                        call_stack[k] = slots;
+                    cand.clear();
+                }
+                if (!setup)
+                    prologue = false;
+            }
+        }
+    }
+
     // pass 1: what each instruction reads and writes
     std::vector<std::vector<insn_rw>> rws(nb);
     for (size_t bi = 0; bi < nb; bi++) {
@@ -873,6 +1288,11 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             if (cs_disasm_iter(cs_, &p, &left, &addr, insn)) {
                 r.rd = access(insn, r.wr);
                 const cs_x86& x = insn->detail->x86;
+                if (insn->id == X86_INS_PUSH && arg_mark[bi][rws[bi].size()] && x.op_count >= 1 && x.operands[0].type == X86_OP_REG) {
+                    int b = reg_bit(reg_family(cs_reg_name(cs_, x.operands[0].reg)));
+                    if (b >= 0)
+                        r.rd |= 1u << b; // an argument: its value is used
+                }
                 if (insn->id == X86_INS_CALL) {
                     r.call = true;
                     r.flags_wr = true;
@@ -882,6 +1302,13 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                         r.wr = (r.wr & ~scratch) | ci.clobbers;
                         for (int i = 0; i < ci.arity && i < (int)arg_bits.size(); i++)
                             r.rd |= arg_bits[i]; // it reads its arguments
+                    }
+                    // a prototype says which argument registers it reads
+                    const prototype* pr = call_proto(insn);
+                    if (pr && !pr->variadic) {
+                        r.proto_args = (int)pr->params.size();
+                        for (int i = 0; i < r.proto_args && i < (int)arg_bits.size(); i++)
+                            r.rd |= arg_bits[i];
                     }
                     if (r.wr & 1u)
                         call_sets_rax = true;
@@ -983,7 +1410,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             for (insn_rw& r : rws[bi]) {
                 if (r.call || r.tail) {
                     // a known callee's arguments are already counted
-                    bool known = r.target && callee_of(r.target).arity >= 0;
+                    bool known = (r.target && callee_of(r.target).arity >= 0) || r.proto_args >= 0;
                     for (size_t i = 0; apply && !known && i < arg_bits.size() && (s & arg_bits[i]); i++)
                         r.rd |= arg_bits[i];
                     if (r.call)
@@ -1033,6 +1460,11 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             cur[pr] = e_reg(disp(pr));
         flag_state fs;
         uint32_t argset = set_in[bi];
+
+        // this block's stack arguments (see the pass before pass 1)
+        std::vector<char>& is_arg = arg_mark[bi];
+        std::unordered_map<size_t, std::vector<int64_t>>& call_stack = call_slots[bi];
+        std::map<int64_t, std::pair<ep, uint64_t>> out_args; // frame offset -> value, where it was set
 
         // liveness after each instruction, and whether the flags are still to be tested
         std::vector<uint32_t> live_after(ni, 0);
@@ -1182,6 +1614,8 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 for (ep* f : {&fs.a, &fs.b, &fs.res})
                     if (*f)
                         readers.push_back(f);
+            for (auto& oa : out_args)
+                readers.push_back(&oa.second.first);
             for (auto& kv : cur) {
                 if (!pending(kv.first))
                     continue;
@@ -1244,7 +1678,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 if (v.fam.empty() || !v.val)
                     continue;
                 // the stack pointer, and rbp as a frame pointer, are always shown by name
-                bool frame = v.fam == "rbp" && v.val->kind == expr::k::reg && v.val->text == disp("rsp");
+                bool frame = v.fam == "rbp" && ((v.val->kind == expr::k::reg && v.val->text == disp("rsp")) || rbp_frame_);
                 if (v.fam == "rsp" || frame) {
                     cur.erase(v.fam);
                     continue;
@@ -1259,8 +1693,18 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         };
         auto assign = [&](size_t k, const std::string& fam, ep v) { assign_all(k, {{fam, std::move(v)}}); };
 
+        // stack arguments no call took: stores to their slots after all
+        auto flush_args = [&]() {
+            std::map<int64_t, std::pair<ep, uint64_t>> left;
+            left.swap(out_args);
+            for (auto& kv : left) {
+                std::string nm = frame_var(kv.first, is64_ ? 8 : 4);
+                line(kv.second.second, (nm.empty() ? std::string("?") : nm) + " = " + print(kv.second.first) + ";");
+            }
+        };
         // a store or a call may change memory: pending values that read it go out first
         auto barrier = [&](size_t k, std::vector<ep*> extra) {
+            flush_args();
             std::vector<std::string> fams;
             for (auto& kv : cur)
                 if (pending(kv.first) && (live_after[k] & bit(kv.first)) && has_mem(kv.second))
@@ -1281,6 +1725,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         // an instruction the lifter doesn't model: printed as is, after the registers it
         // reads hold their values and nothing pending reads a register it changes
         auto opaque = [&](size_t k, cs_insn* in) {
+            flush_args();
             const insn_rw& r = rw[k];
             std::vector<std::string> reads, writes;
             for (int b = 0; b < 16; b++) {
@@ -1333,6 +1778,9 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             cs_x86& x = insn->detail->x86;
             unsigned id = insn->id;
             bool last = k + 1 == ni;
+            auto spi = sp_at_.find(a);
+            cur_sp_known_ = spi != sp_at_.end();
+            cur_sp_ = cur_sp_known_ ? spi->second : 0;
             // flags this instruction replaces without reading are dead from here on
             if (rw[k].flags_wr && !rw[k].flags_rd)
                 fs = {};
@@ -1371,10 +1819,13 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             };
 
             switch (id) {
+            case X86_INS_PUSH:
+                if (is_arg[k] && x.op_count >= 1 && cur_sp_known_)
+                    out_args[cur_sp_ - (is64_ ? 8 : 4)] = {val(x.operands[0]), a};
+                break;
             case X86_INS_NOP:
             case X86_INS_ENDBR32:
             case X86_INS_ENDBR64:
-            case X86_INS_PUSH:
             case X86_INS_POP:
             case X86_INS_LEAVE:
             case X86_INS_CDQE:
@@ -1388,8 +1839,11 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             case X86_INS_MOVABS:
                 if (x.op_count >= 2) {
                     ep s = val(x.operands[1]);
+                    int64_t off = 0;
                     if (x.operands[0].type == X86_OP_REG)
                         assign(k, reg_of(x.operands[0]), s);
+                    else if (x.operands[0].type == X86_OP_MEM && is_arg[k] && slot_of(x.operands[0].mem, off))
+                        out_args[off] = {s, a}; // a stack argument of the next call
                     else if (x.operands[0].type == X86_OP_MEM)
                         store(k, val(x.operands[0]), "=", s);
                 }
@@ -1523,24 +1977,45 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             case X86_INS_CALL: {
                 auto ce = std::make_shared<expr>();
                 ce->kind = expr::k::call;
+                std::string pname;
+                uint64_t pref = 0;
+                const prototype* pr = call_proto(insn, &pname, &pref);
                 if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
                     uint64_t target = (uint64_t)x.operands[0].imm;
                     std::string nm = db_.name_at(target);
                     ce->text = nm.empty() ? db_.location(target) : nm;
                     ce->ref = target;
+                } else if (!pname.empty()) {
+                    ce->text = pname; // call [CreateFileW]: the import, by name
+                    ce->ref = pref;
                 } else if (x.op_count >= 1) {
                     ce->indirect = true;
                     ce->kids.push_back(val(x.operands[0]));
                 } else {
                     ce->text = "(*indirect)";
                 }
-                // arguments: what a known callee reads, else what was set since the last call
-                int known = rw[k].target ? callee_of(rw[k].target).arity : -1;
+                // arguments: what the prototype or a known callee reads, else what was set since
+                // the last call; then the ones on the stack
+                int known = pr && !pr->variadic ? (int)pr->params.size() : rw[k].target ? callee_of(rw[k].target).arity : -1;
+                size_t in_regs = 0;
                 for (size_t i = 0; i < arg_bits.size(); i++) {
                     if (known >= 0 ? (int)i >= known : !(argset & arg_bits[i]))
                         break;
                     ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
+                    in_regs++;
                 }
+                auto stk = call_stack.find(k);
+                if (stk != call_stack.end() && (!is64_ || in_regs == arg_bits.size()))
+                    for (int64_t off : stk->second) {
+                        auto oa = out_args.find(off);
+                        if (oa != out_args.end()) {
+                            ce->kids.push_back(oa->second.first);
+                            out_args.erase(oa);
+                        } else {
+                            std::string nm = frame_var(off, is64_ ? 8 : 4);
+                            ce->kids.push_back(nm.empty() ? e_sym("?") : e_mem(e_un("&", e_sym(nm)), is64_ ? 8 : 4));
+                        }
+                    }
                 ep call = ce;
                 barrier(k, {&call});
                 uint32_t clob = rw[k].wr & scratch;
@@ -1646,12 +2121,25 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                             ir.term = term_kind::indirect;
                             if (x.op_count >= 1 && x.operands[0].type == X86_OP_MEM) {
                                 // jmp [ptr] leaving the function: a tail call through a pointer
+                                // (an import's slot: that import, by name)
                                 auto ce = std::make_shared<expr>();
                                 ce->kind = expr::k::call;
-                                ce->indirect = true;
-                                ce->kids.push_back(val(x.operands[0]));
-                                for (size_t i = 0; i < arg_bits.size() && (argset & arg_bits[i]); i++)
+                                std::string pname;
+                                uint64_t pref = 0;
+                                const prototype* pr = call_proto(insn, &pname, &pref);
+                                if (!pname.empty()) {
+                                    ce->text = pname;
+                                    ce->ref = pref;
+                                } else {
+                                    ce->indirect = true;
+                                    ce->kids.push_back(val(x.operands[0]));
+                                }
+                                int known = pr && !pr->variadic ? (int)pr->params.size() : -1;
+                                for (size_t i = 0; i < arg_bits.size(); i++) {
+                                    if (known >= 0 ? (int)i >= known : !(argset & arg_bits[i]))
+                                        break;
                                     ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
+                                }
                                 ir.cond = ce;
                             } else if (x.op_count >= 1) {
                                 ir.cond = val(x.operands[0]); // the jump target
@@ -1672,6 +2160,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         }
         if (ir.term == term_kind::fallthrough)
             ir.fall = ir.end;
+        flush_args();
 
         // values a later block reads become statements at the end of this one
         {
@@ -2397,6 +2886,47 @@ std::vector<decomp_line> cleanup(const std::vector<decomp_line>& in)
     return v;
 }
 
+// identifiers in a printed line renamed, except inside __asm { } and comments
+std::string rename_tokens(const std::string& text, const std::map<std::string, std::string>& names)
+{
+    if (names.empty())
+        return text;
+    std::string out;
+    size_t i = 0, n = text.size();
+    auto ident = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+    while (i < n) {
+        if (text.compare(i, 2, "//") == 0) {
+            out += text.substr(i);
+            break;
+        }
+        if (text.compare(i, 7, "__asm {") == 0) {
+            size_t e = text.find('}', i);
+            e = e == std::string::npos ? n : e + 1;
+            out += text.substr(i, e - i);
+            i = e;
+            continue;
+        }
+        if (ident(text[i])) {
+            size_t j = i;
+            while (j < n && ident(text[j]))
+                j++;
+            std::string w = text.substr(i, j - i);
+            auto it = std::isdigit((unsigned char)w[0]) ? names.end() : names.find(w);
+            out += it == names.end() ? w : it->second;
+            i = j;
+            continue;
+        }
+        out += text[i++];
+    }
+    return out;
+}
+
+bool is_reg_name(const std::string& w)
+{
+    return !reg_family(w.c_str()).empty() || (w.size() > 3 && w.compare(0, 3, "tmp") == 0 &&
+           std::isdigit((unsigned char)w[3]));
+}
+
 } // namespace
 
 // ------------------------------------------------------------------ public api
@@ -2419,6 +2949,11 @@ decompiled decompile(database& db, uint64_t func_start)
         return r;
     }
 
+    if (!db.bin.is_x86()) {
+        r.error = util::fmt("the decompiler reads x86 and x64 code; this is %s (the listing and graph work)",
+            arch_name(db.bin.arch));
+        return r;
+    }
     csh cs = 0;
     if (cs_open(CS_ARCH_X86, db.bin.is64() ? CS_MODE_64 : CS_MODE_32, &cs) != CS_ERR_OK) {
         r.error = "capstone failed to open";
@@ -2443,21 +2978,169 @@ decompiled decompile(database& db, uint64_t func_start)
         entry = 0;
     st.run(entry < 0 ? 0 : entry);
 
-    // signature
-    std::string sig = (returns_value ? "int " : "void ") + r.name + "(";
-    for (size_t i = 0; i < params.size(); i++) {
-        if (i)
-            sig += ", ";
-        sig += "int " + params[i];
+    // ---- the variables: parameters, the stack frame, registers used as variables. your names
+    // and types (db.lvars) and your prototype (db.protos) go over the decompiler's own
+    const bool is64 = db.bin.is64();
+    const int64_t ptr = is64 ? 8 : 4;
+    const std::map<std::string, database::lvar>* user = nullptr;
+    auto uit = db.lvars.find(start);
+    if (uit != db.lvars.end())
+        user = &uit->second;
+    auto pit = db.protos.find(start);
+    const prototype* proto = pit == db.protos.end() ? nullptr : &pit->second;
+    auto user_of = [&](const std::string& key) -> const database::lvar* {
+        if (!user)
+            return nullptr;
+        auto it = user->find(key);
+        return it == user->end() ? nullptr : &it->second;
+    };
+    // parameters: the argument registers, then stack slots above the return address (all of
+    // them on 32-bit; on 64-bit the ones after the registers, past win64's home area)
+    int nregs = 0;
+    while (arg_reg_at(nregs, is64, db.bin.format))
+        nregs++;
+    std::vector<std::string> pkeys = params; // register display names
+    int64_t stack_from = !is64 ? ptr : ptr + (db.bin.format == bin_format::pe ? 0x20 : 0);
+    int64_t max_arg = -1;
+    for (const auto& f : lf.frame)
+        if (f.first >= stack_from && f.first < stack_from + 64 * ptr)
+            max_arg = std::max(max_arg, f.first);
+    bool stack_params = !is64 || (int)params.size() == nregs;
+    int want = proto ? (int)proto->params.size() : -1;
+    if (stack_params && max_arg >= 0 && want < 0)
+        for (int64_t off = stack_from; off <= max_arg; off += ptr)
+            pkeys.push_back(lf.frame.count(off) ? lf.frame[off].name : util::fmt("arg_%llx", (unsigned long long)(off - ptr)));
+    if (want >= 0) { // the prototype says how many
+        pkeys.resize(std::min<size_t>(pkeys.size(), (size_t)want));
+        for (int i = (int)pkeys.size(); i < want; i++) {
+            if (i < nregs)
+                pkeys.push_back(reg_display(arg_reg_at(i, is64, db.bin.format), is64));
+            else
+                pkeys.push_back(util::fmt("arg_%llx", (unsigned long long)(stack_from - ptr + (i - (is64 ? nregs : 0)) * ptr)));
+        }
     }
-    if (params.empty() && db.bin.is64())
+    std::set<std::string> is_param(pkeys.begin(), pkeys.end());
+    std::map<std::string, std::string> names; // key -> the name shown, where they differ
+    std::set<std::string> taken;
+    auto add_var = [&](const std::string& key, bool param, bool stack, const std::string& def_type, int pindex) {
+        decomp_var v;
+        v.key = key;
+        v.param = param;
+        v.stack = stack;
+        v.name = key;
+        v.type = def_type;
+        if (proto && pindex >= 0 && pindex < (int)proto->params.size()) {
+            v.name = proto->params[(size_t)pindex].name;
+            v.type = proto->params[(size_t)pindex].type;
+        }
+        if (const database::lvar* u = user_of(key)) {
+            if (!u->name.empty())
+                v.name = u->name;
+            if (!u->type.empty())
+                v.type = u->type;
+        }
+        if (v.name != key && taken.count(v.name))
+            v.name = key; // a clash: keep the decompiler's name
+        taken.insert(v.name);
+        if (v.name != key)
+            names[key] = v.name;
+        r.vars.push_back(v);
+    };
+    for (size_t i = 0; i < pkeys.size(); i++) {
+        bool stk = pkeys[i].compare(0, 4, "arg_") == 0;
+        int64_t off = 0;
+        for (const auto& f : lf.frame)
+            if (f.second.name == pkeys[i])
+                off = f.first;
+        add_var(pkeys[i], true, stk, stk && off && lf.frame[off].width ? mem_type(lf.frame[off].width) : "int", (int)i);
+    }
+    // the frame's other slots: width tells the type; a slot only ever used by address (a
+    // buffer) is an array up to the next slot
+    std::vector<std::pair<int64_t, std::string>> decls; // offset, declaration key
+    for (auto it = lf.frame.begin(); it != lf.frame.end(); ++it) {
+        if (is_param.count(it->second.name))
+            continue;
+        std::string ty;
+        if (it->second.width > 0) {
+            ty = mem_type(it->second.width);
+        } else {
+            auto next = std::next(it);
+            int64_t limit = next == lf.frame.end() || (it->first < 0 && next->first > 0) ? (it->first < 0 ? 0 : it->first)
+                                                                                       : next->first;
+            int64_t gap = limit - it->first;
+            ty = gap > 0 && gap <= 0x10000 ? util::fmt("char[0x%llx]", (unsigned long long)gap) : "char[]";
+        }
+        add_var(it->second.name, false, true, ty, -1);
+        decls.push_back({it->first, it->second.name});
+    }
+    // registers the body keeps values in
+    std::vector<decomp_line> body = cleanup(st.out);
+    std::set<std::string> regs, used;
+    for (const decomp_line& l : body) {
+        const std::string& t = l.text;
+        size_t asm_at = t.find("__asm {");
+        std::string scan = asm_at == std::string::npos ? t : t.substr(0, asm_at);
+        for (size_t i = 0; i < scan.size();) {
+            if (std::isalpha((unsigned char)scan[i]) || scan[i] == '_') {
+                size_t j = i;
+                while (j < scan.size() && (std::isalnum((unsigned char)scan[j]) || scan[j] == '_'))
+                    j++;
+                std::string w = scan.substr(i, j - i);
+                used.insert(w);
+                if (!is_param.count(w) && is_reg_name(w))
+                    regs.insert(w);
+                i = j;
+            } else if (std::isdigit((unsigned char)scan[i])) {
+                while (i < scan.size() && std::isalnum((unsigned char)scan[i]))
+                    i++;
+            } else {
+                i++;
+            }
+        }
+    }
+    for (const std::string& rg : regs)
+        add_var(rg, false, false, std::string(), -1);
+    r.vars.erase(std::remove_if(r.vars.begin(), r.vars.end(),
+                                [&](const decomp_var& v) { return !v.param && v.stack && !used.count(v.key); }),
+                 r.vars.end());
+
+    // signature: your prototype's return type, else what the lifter saw
+    std::string ret = proto ? proto->ret : returns_value ? "int" : "void";
+    std::string sig = ret + " " + r.name + "(";
+    size_t np = 0;
+    for (const decomp_var& v : r.vars) {
+        if (!v.param)
+            continue;
+        if (np++)
+            sig += ", ";
+        size_t fp = v.type.find("(*)");
+        sig += fp != std::string::npos ? v.type.substr(0, fp + 2) + v.name + v.type.substr(fp + 2) : v.type + " " + v.name;
+    }
+    if (proto && proto->variadic)
+        sig += np ? ", ..." : "...";
+    else if (!np)
         sig += "void";
     sig += ")";
     r.lines.push_back({0, sig, start});
     r.lines.push_back({0, "{", 0});
-    for (auto& l : cleanup(st.out)) {
+    // declarations: the stack variables, and registers you gave a type
+    for (const auto& d : decls)
+        for (const decomp_var& v : r.vars)
+            if (v.key == d.second && !v.param && used.count(v.key)) {
+                size_t br = v.type.find('[');
+                std::string decl = br == std::string::npos ? v.type + " " + v.name + ";"
+                                                           : v.type.substr(0, br) + " " + v.name + v.type.substr(br) + ";";
+                r.lines.push_back({1, decl, 0});
+            }
+    for (const decomp_var& v : r.vars)
+        if (!v.stack && !v.param && !v.type.empty())
+            r.lines.push_back({1, v.type + " " + v.name + ";", 0});
+    if (r.lines.size() > 2)
+        r.lines.push_back({1, "", 0});
+    for (auto& l : body) {
         decomp_line dl = l;
         dl.indent += 1;
+        dl.text = rename_tokens(dl.text, names);
         r.lines.push_back(dl);
     }
     r.lines.push_back({0, "}", 0});

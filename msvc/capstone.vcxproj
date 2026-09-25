@@ -40,7 +40,7 @@
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <SDLCheck>false</SDLCheck>
       <ConformanceMode>false</ConformanceMode>
-      <PreprocessorDefinitions>CAPSTONE_HAS_X86;CAPSTONE_USE_SYS_DYN_MEM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CAPSTONE_HAS_X86;CAPSTONE_HAS_ARM64;CAPSTONE_USE_SYS_DYN_MEM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\third_party\capstone\include;..\third_party\capstone;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
@@ -52,6 +52,11 @@
     <ClCompile Include="..\third_party\capstone\SStream.c" />
     <ClCompile Include="..\third_party\capstone\cs.c" />
     <ClCompile Include="..\third_party\capstone\utils.c" />
+    <ClCompile Include="..\third_party\capstone\arch\AArch64\AArch64BaseInfo.c" />
+    <ClCompile Include="..\third_party\capstone\arch\AArch64\AArch64Disassembler.c" />
+    <ClCompile Include="..\third_party\capstone\arch\AArch64\AArch64InstPrinter.c" />
+    <ClCompile Include="..\third_party\capstone\arch\AArch64\AArch64Mapping.c" />
+    <ClCompile Include="..\third_party\capstone\arch\AArch64\AArch64Module.c" />
     <ClCompile Include="..\third_party\capstone\arch\X86\X86ATTInstPrinter.c" />
     <ClCompile Include="..\third_party\capstone\arch\X86\X86Disassembler.c" />
     <ClCompile Include="..\third_party\capstone\arch\X86\X86DisassemblerDecoder.c" />

@@ -61,28 +61,54 @@ Always on (read and annotate):
 
 | tool | what it does |
 |------|--------------|
-| `get_binary_info` | format, arch, entry, segments, counts |
+| `get_binary_info` | format, arch, entry, segments, counts, and the file info: security flags, hashes, sections with entropy, packer warnings |
 | `list_functions` / `list_strings` / `list_imports` / `list_exports` | browse, with a filter |
-| `decompile_function` | C-like pseudocode |
-| `disassemble` / `disassemble_function` | the listing, with names |
+| `decompile_function` | C-like pseudocode (x86 / x64), with the function's variables |
+| `decompile_with_kuna` | the same function from [kuna](https://github.com/Noelo-Lab/kuna), a second decompiler — only there when kuna is installed (on PATH, set in the app, or `--kuna-path`) |
+| `disassemble` / `disassemble_function` | the listing, with names (arm64 too) |
 | `get_xrefs_to` / `get_xrefs_from` | callers and callees |
 | `read_bytes` / `search_bytes` / `lookup` / `get_basic_blocks` | bytes, patterns, what's at an address, the CFG |
 | `diff_binary` | compare with another file, function by function |
 | `rename` / `set_comment` | record what it learns (saved with the project) |
+| `rename_variable` / `set_variable_type` / `set_function_prototype` | name and type a function's variables, give it a prototype (`int check_key(const char* key)`) — the pseudocode and the callers use them |
+| `suggest_name` / `suggest_variable_name` | propose a name with a reason instead of applying it: it waits for you in **AI > Review suggested names** |
 | `save_project` | write a committable `<file>.ceasta` |
 
 With `--allow-debug` (these run the program on your machine):
 
-`debug_start` / `debug_continue` / `debug_step_into` / `debug_step_over` / `debug_run_to` /
-`debug_pause` / `debug_kill`, `debug_set_breakpoint` / `debug_remove_breakpoint` /
-`debug_list_breakpoints`, `debug_get_registers` / `debug_set_register`, `debug_read_memory` /
-`debug_write_memory`, `debug_backtrace`, `debug_trace` (record indirect call targets),
-`debug_call` (call a function and get its result), and `debug_decompile_here` (the pseudocode
-of the function you're stopped in, with the current line marked and the argument registers'
-live values).
+`debug_start` / `debug_continue` / `debug_step_into` / `debug_step_over` / `debug_step_out` /
+`debug_step_back` / `debug_run_to` / `debug_pause` / `debug_kill` / `debug_status`,
+`debug_set_breakpoint` (with an optional condition like `rdi == 3`) / `debug_remove_breakpoint` /
+`debug_list_breakpoints`, `debug_watch` (stop when memory is written or read),
+`debug_get_registers` / `debug_set_register`, `debug_read_memory` / `debug_write_memory`,
+`debug_backtrace` (the call stack), `debug_memory_map`, `debug_trace` (record indirect call
+targets), `debug_call` (call a function and get its result), and `debug_decompile_here` (the
+pseudocode of the function you're stopped in, with the current line marked and the argument
+registers' live values).
 
 With `--allow-lua`: `run_lua`, which runs any Lua with ceasta's [scripting API](lua.md) — and
 Lua's `io` / `os`, so it has your file access.
+
+## ready-made prompts
+
+The server also offers prompts — in Claude Code they're commands like
+`/mcp__ceasta__triage`:
+
+| prompt | what it asks for |
+|--------|------------------|
+| `triage` | a first look: what the binary is, what stands out, where to read next |
+| `explain_function` | what one function does, its parameters and result, with suggested names |
+| `rename_pass` | names for the unnamed functions (`sub_...`), bottom-up, as suggestions you review |
+| `find_crypto` | crypto api calls, well-known constants, xor loops |
+| `trace_function` | run to a function under the debugger and watch what it gets and returns (with `--allow-debug`) |
+
+## reviewing what the AI names
+
+`rename` applies a name right away. `suggest_name` / `suggest_variable_name` (what
+`rename_pass` uses) don't: each suggestion is checked (a taken or malformed name is refused),
+saved with the project, and listed in **AI > Review suggested names** — the status bar says
+how many are waiting. Accept or reject each one (Enter / Delete), or all at once; accepting is
+one undo step.
 
 ## a note on trust
 

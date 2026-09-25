@@ -1,4 +1,5 @@
 #pragma once
+#include "core/bp_cond.h"
 #include "core/database.h"
 #include "core/debugger.h"
 #include "core/lua_host.h"
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -36,10 +38,10 @@ struct load_job {
     std::string path;
 };
 
-enum class center_view { listing, graph, pseudo };
+enum class center_view { listing, graph, pseudo, split }; // split: listing and pseudocode side by side
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai };
+    save_changes, ai, palette, bookmarks, bp_condition, watch, lvar_name, lvar_type, proto, review, kuna };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
@@ -50,7 +52,7 @@ struct dialog_state {
     char buf[512] = {};
     std::string error;
     std::vector<uint64_t> results;
-    int raw_arch = 1; // 0 x86, 1 x64
+    int raw_arch = 1; // 0 x86, 1 x64, 2 arm64
     char raw_base[32] = "0";
     std::vector<process_info> procs;
     char filter[128] = {};
@@ -63,6 +65,10 @@ struct dialog_state {
     int sel = 0;
     bool refocus = false;
     bool proceed = false; // save_changes answered with save / don't save
+    int run_action = -1;  // palette: the action to run once it has closed
+    int watch_size = 4;   // watch: bytes, and whether reads stop too
+    bool watch_access = false;
+    std::string key;      // lvar_name / lvar_type: the variable (its decompiler name), addr the function
 };
 
 struct app_state {
@@ -72,6 +78,7 @@ struct app_state {
     lua_host lua;
     debugger dbg;
     uint64_t version = 0; // bumps whenever names / comments / analysis change
+    uint64_t frame_no = 0;
 
     // navigation
     uint64_t cursor = 0;
@@ -104,9 +111,18 @@ struct app_state {
     std::vector<std::string> console_history;
     int history_pos = -1;
     bool focus_console = false;
+    std::string pseudo_word;  // the name clicked in the pseudocode (n / y / enter act on it)
+    int pseudo_line = -1;
+    bool pseudo_focus = false;
+    bool pseudo_kuna = false;   // the pseudocode view shows kuna's (when kuna_exe is set)
+    std::string kuna_path;      // where kuna is, as set; "" looks for it on PATH
+    std::string kuna_exe;       // the kuna program found, "" when there's none
+    float split_w = 0.5f;     // the listing's share of the side by side view
     uint64_t hex_addr = 0;
     bool hex_follow = true;
     bool hex_live = false;
+    bool hex_process = false; // the hex view shows the process's memory at hex_rt (heap, stack, ...)
+    uint64_t hex_rt = 0;
 
     dialog_state dialog;
 
@@ -118,6 +134,11 @@ struct app_state {
     int steps_wanted = 0;
     bool step_over_mode = false;
     bool step_in_flight = false;
+    bool step_until_return = false; // the multi-step is a step out
+    bp_conditions conditions;         // evaluates breakpoint conditions
+    std::map<uint64_t, int> bp_hits;  // per breakpoint (static address), this run
+    bool auto_continue = false;       // a breakpoint whose condition was false: keep running
+    uint64_t stop_seq = 0;            // bumps at every stop: views keep what they read until then
     bool dbg_mapped = false;   // runtime addresses of the main image map onto the listing
     uint64_t dbg_delta = 0;    // runtime base - static base
     uint64_t dbg_image_size = 0;
@@ -162,6 +183,10 @@ void app_open_dialog(app_state& s);
 void app_close_file(app_state& s);
 void app_save(app_state& s);
 void app_save_as(app_state& s); // pick where the project file goes
+// your names, comments, prototypes and breakpoints for another tool: 0 ida, 1 ghidra, 2 x64dbg
+void app_export_for(app_state& s, int tool);
+// names from an x64dbg database, a .map file, or the json of scripts/*_to_ceasta.py
+void app_import_names(app_state& s);
 // the window is about to close (its close button, alt+f4): true when it may close now. with
 // unsaved changes it asks first and returns false; the answer then closes it via platform.quit
 bool app_request_close(app_state& s);
@@ -173,6 +198,11 @@ void app_back(app_state& s);
 void app_forward(app_state& s);
 bool app_follow(app_state& s, uint64_t addr); // jump to what the line at addr points at
 void app_names_changed(app_state& s);
+// kuna, the optional second decompiler: its path ("" for PATH), found again and saved
+void app_set_kuna(app_state& s, const std::string& path);
+void app_undo(app_state& s);
+void app_redo(app_state& s);
+void app_toggle_bookmark(app_state& s, uint64_t addr);
 void app_set_font_size(app_state& s, float size);
 void app_set_theme(app_state& s, theme::ui_theme t);
 void app_open_dialog_kind(app_state& s, dialog_kind kind, uint64_t addr = 0);
@@ -180,17 +210,37 @@ void app_open_dialog_kind(app_state& s, dialog_kind kind, uint64_t addr = 0);
 // debugger, addresses are static (listing) unless said otherwise
 bool app_can_debug(const app_state& s, std::string* why = nullptr);
 void app_toggle_bp(app_state& s, uint64_t addr);
+// f2: a breakpoint on code; on data (a variable) it offers a watch instead, since an int3 there
+// would change the data
+void app_bp_key(app_state& s, uint64_t addr);
+// watchpoints, for this run. addr is static when it's part of the file, else a runtime address
+// (the heap, the stack); del_watch takes the runtime address the debugger lists
+bool app_add_watch(app_state& s, uint64_t addr, int size, bool access, std::string& err);
+bool app_del_watch(app_state& s, uint64_t runtime);
+std::string app_where_runtime(const app_state& s, uint64_t runtime); // a name in the listing, module+offset, or hex
+std::string app_stop_text(const app_state& s); // the stop reason, a watched address by its name
+// a condition for the breakpoint at addr (adds the breakpoint); "" makes it unconditional
+bool app_set_bp_condition(app_state& s, uint64_t addr, const std::string& expr, std::string& err);
+// poll the debugger, and keep going past breakpoints whose condition is false
+void app_dbg_pump(app_state& s, uint32_t timeout_ms = 0);
 void dbg_start(app_state& s);
 void dbg_attach(app_state& s, uint32_t pid);
 void dbg_continue(app_state& s);
 void dbg_step_into(app_state& s);
 void dbg_step_over(app_state& s);
 bool dbg_stepping(const app_state& s); // a multi-instruction step is still going
+void dbg_step_out(app_state& s);       // run until the current function returns
+void dbg_step_back(app_state& s);      // undo the last steps (as many as a step does)
 void dbg_run_to_cursor(app_state& s);
 void dbg_pause(app_state& s);
 void dbg_stop(app_state& s);
 void dbg_detach(app_state& s);
 bool app_to_static(const app_state& s, uint64_t runtime, uint64_t& out);
+// the hex view on a runtime address: the file's bytes (live) when it's in the image, else the
+// process's memory there
+void app_show_memory(app_state& s, uint64_t runtime);
+// the function start (runtime) an address is in, 0 when it isn't in the image: for the call stack
+uint64_t app_func_start_runtime(const app_state& s, uint64_t runtime);
 
 // the ai server: an mcp client (claude code, cursor, ...) on this machine works on the open file.
 // tool calls run on the ui thread, between frames

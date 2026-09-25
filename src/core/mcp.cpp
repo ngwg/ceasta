@@ -2,9 +2,11 @@
 
 #include "core/database.h"
 #include "core/debugger.h"
+#include "core/dbg_stack.h"
 #include "core/dbg_trace.h"
 #include "core/decompiler.h"
 #include "core/diff.h"
+#include "core/kuna.h"
 #include "core/lua_host.h"
 #include "core/os.h"
 #include "core/util.h"
@@ -210,8 +212,10 @@ void add_read_tools(std::vector<tool>& t)
     };
 
     add("get_binary_info",
-        "Overview of the loaded file: format, architecture, entry point, base address, segments, imported "
-        "libraries, and how many functions, imports, exports and strings the analysis found. A good first call.",
+        "Overview of the loaded file: format, architecture, entry point, base address, segments with their entropy, "
+        "imported libraries, security flags, hashes (md5, sha256, imphash), version info, resources, warnings "
+        "(packed, an embedded program, an overlay, .net), and how many functions, imports, exports and strings the "
+        "analysis found. A good first call.",
         schema({}), [](mcp_server& s, const json::value&, std::string& out) {
             database* db = need_db(s, out);
             if (!db)
@@ -236,6 +240,25 @@ void add_read_tools(std::vector<tool>& t)
                                  (sg.perms & perm_x) ? 'x' : '-');
             for (const std::string& n : b.notes)
                 out += "note: " + n + "\n";
+            const file_info& fi = db->info;
+            for (const file_info::row& r : fi.header)
+                if (r.label != "file" && r.label != "entry point" && r.label != "image base" && r.label != "format")
+                    out += util::fmt("%-9s %s\n", r.label.c_str(), r.value.c_str());
+            out += "md5       " + fi.md5 + "\nsha256    " + fi.sha256 + "\n";
+            if (!fi.imphash.empty())
+                out += "imphash   " + fi.imphash + "\n";
+            for (const file_info::row& r : fi.version)
+                out += "version   " + r.label + ": " + r.value + "\n";
+            out += "sections (entropy, 8 = random)\n";
+            for (const file_info::section& sc : fi.sections)
+                out += util::fmt("  %-12s %s  %s  %.2f\n", sc.name.c_str(), hexa(sc.addr).c_str(), sc.perms.c_str(), sc.entropy);
+            size_t shown = 0;
+            for (const file_info::resource& r : fi.resources)
+                if (shown++ < 40)
+                    out += util::fmt("resource  %s/%s %llu bytes, entropy %.2f%s\n", r.type.c_str(), r.name.c_str(),
+                        (unsigned long long)r.size, r.entropy, r.note.empty() ? "" : (", " + r.note).c_str());
+            for (const std::string& w : fi.warnings)
+                out += "warning: " + w + "\n";
             return true;
         });
 
@@ -264,9 +287,11 @@ void add_read_tools(std::vector<tool>& t)
         });
 
     add("decompile_function",
-        "C-like pseudocode for the function at or containing an address or name. Registers stand in for "
-        "variables (rdi, rsi, ... are the arguments on system v; rcx, rdx, r8, r9 on windows), there are no types "
-        "yet, and memory reads look like *(int*)(rdi + 8). Check the disassembly when something looks off.",
+        "C-like pseudocode for the function at or containing an address or name. Stack variables are local_1c "
+        "(0x1c below the return address) and arg_0, arg_4 (stack arguments); registers stand in for the other "
+        "values (rdi, rsi, ... are the arguments on system v; rcx, rdx, r8, r9 on windows). Calls to well-known "
+        "functions (windows api, libc) get their real arguments. rename_variable, set_variable_type and "
+        "set_function_prototype make it read better. Check the disassembly when something looks off.",
         schema({{"function", prop("string", "name or address of the function, or any address inside it")}},
                {"function"}),
         [](mcp_server& s, const json::value& args, std::string& out) {
@@ -283,6 +308,54 @@ void add_read_tools(std::vector<tool>& t)
             cap(out);
             return true;
         });
+
+    add("decompile_with_kuna",
+        "The same function decompiled by kuna, a decompiler ported from Ghidra's that the user has installed. It is "
+        "often better than decompile_function on optimized code, and it also reads arm64. It names things itself "
+        "(sub_401000, dat_404010, a0 for arguments), so renames and types set in ceasta don't show up here; its "
+        "addresses are the same as ceasta's. Use it for a second opinion on a hard function.",
+        schema({{"function", prop("string", "name or address of the function, or any address inside it")}},
+               {"function"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            // what kuna needs comes from the database; kuna itself runs here, off the owner
+            // thread, so a slow run doesn't hold the app up
+            std::string file, why, name;
+            uint64_t start = 0;
+            bool ok = false;
+            s.run([&] {
+                database* db = need_db(s, out);
+                uint64_t a;
+                if (!db || !arg_addr(*db, args, "function", a, out))
+                    return;
+                const function* f = db->an.func_containing(a);
+                if (!f) {
+                    out = "no function at " + hexa(a) + " (list_functions shows them)";
+                    return;
+                }
+                why = kuna_unsupported(db->bin);
+                file = db->bin.path;
+                start = f->start;
+                name = db->location(f->start);
+                ok = true;
+            });
+            if (!ok)
+                return false;
+            if (!why.empty()) {
+                out = why;
+                return false;
+            }
+            kuna_result k = kuna_decompile(s.opts.kuna, file, start, 120000, &s.stopping);
+            if (!k.ok) {
+                out = k.error;
+                return false;
+            }
+            out = "// kuna: " + name + " at " + hexa(start) + (k.name.empty() || k.name == name ? "" : " (kuna calls it " + k.name + ")") +
+                  "\n" + k.code;
+            cap(out);
+            return true;
+        });
+    t.back().owner = false;
+    t.back().kuna = true;
 
     add("disassemble",
         "The listing from an address: instructions with names in place of addresses, labels, data and comments.",
@@ -675,12 +748,197 @@ void add_edit_tools(std::vector<tool>& t)
     };
     t.push_back(std::move(cm));
 
+    // the pseudocode's variables and prototypes
+    auto func_of = [](database& db, const json::value& args, uint64_t& f, std::string& out) {
+        uint64_t a = 0;
+        if (!arg_addr(db, args, "function", a, out))
+            return false;
+        const function* fn = db.an.func_containing(a);
+        if (!fn) {
+            out = "no function at " + hexa(a);
+            return false;
+        }
+        f = fn->start;
+        return true;
+    };
+    // a variable by the name the pseudocode shows now (or its automatic name)
+    auto var_key = [](database& db, uint64_t f, const std::string& name, std::string& key, std::string& out) {
+        decompiled d = decompile(db, f);
+        for (const decomp_var& v : d.vars)
+            if (v.name == name || v.key == name) {
+                key = v.key;
+                return true;
+            }
+        std::string all;
+        for (const decomp_var& v : d.vars)
+            all += (all.empty() ? "" : ", ") + v.name;
+        out = "no variable " + name + " in " + db.location(f) + (all.empty() ? std::string() : " (it has: " + all + ")");
+        return false;
+    };
+
+    tool rv;
+    rv.name = "rename_variable";
+    rv.description =
+        "Rename a variable in a function's pseudocode: a parameter (rdi, arg_0), a stack variable (local_1c) or a "
+        "register the code keeps a value in (rax). Use the name decompile_function shows. Saved with the project; "
+        "an empty name goes back to the automatic one.";
+    rv.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"variable", prop("string", "the variable as the pseudocode shows it")},
+                        {"name", prop("string", "the new name")}},
+                       {"function", "variable", "name"});
+    rv.writes = true;
+    rv.run = [func_of, var_key](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        std::string key, err;
+        if (!db || !func_of(*db, args, f, out) || !var_key(*db, f, util::trim(arg_str(args, "variable")), key, out))
+            return false;
+        std::string type;
+        auto it = db->lvars.find(f);
+        if (it != db->lvars.end() && it->second.count(key))
+            type = it->second.at(key).type;
+        std::string name = util::trim(arg_str(args, "name"));
+        if (!db->set_lvar(f, key, name == key ? std::string() : name, type, err)) {
+            out = "can't rename it: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = "renamed " + arg_str(args, "variable") + " to " + (name.empty() ? key : name) + " in " + db->location(f);
+        return true;
+    };
+    t.push_back(std::move(rv));
+
+    tool vt;
+    vt.name = "set_variable_type";
+    vt.description =
+        "Give a variable of a function's pseudocode a type (int, char*, DWORD, struct header*, char[16]). The "
+        "declaration and the signature show it. Empty goes back to the automatic type.";
+    vt.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"variable", prop("string", "the variable as the pseudocode shows it")},
+                        {"type", prop("string", "the c type")}},
+                       {"function", "variable", "type"});
+    vt.writes = true;
+    vt.run = [func_of, var_key](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        std::string key, err;
+        if (!db || !func_of(*db, args, f, out) || !var_key(*db, f, util::trim(arg_str(args, "variable")), key, out))
+            return false;
+        std::string name;
+        auto it = db->lvars.find(f);
+        if (it != db->lvars.end() && it->second.count(key))
+            name = it->second.at(key).name;
+        if (!db->set_lvar(f, key, name, util::trim(arg_str(args, "type")), err)) {
+            out = "can't set the type: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = "set the type of " + arg_str(args, "variable") + " in " + db->location(f);
+        return true;
+    };
+    t.push_back(std::move(vt));
+
+    tool fp;
+    fp.name = "set_function_prototype";
+    fp.description =
+        "Set a function's prototype in c: \"int check_key(const char* key, int len)\". Its parameters take those "
+        "names and types in its pseudocode, a new name renames the function, and calls to it get that many "
+        "arguments. An empty prototype goes back to what the decompiler works out.";
+    fp.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"prototype", prop("string", "return type, name, parameters")}},
+                       {"function", "prototype"});
+    fp.writes = true;
+    fp.run = [func_of](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        std::string err;
+        if (!db || !func_of(*db, args, f, out))
+            return false;
+        if (!db->set_proto(f, arg_str(args, "prototype"), err)) {
+            out = "can't set it: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        auto p = db->protos.find(f);
+        out = p == db->protos.end() ? "removed the prototype of " + db->location(f)
+                                    : "prototype of " + db->location(f) + ": " + format_prototype(p->second);
+        return true;
+    };
+    t.push_back(std::move(fp));
+
+    // names for the user to review, instead of renaming right away
+    tool sg;
+    sg.name = "suggest_name";
+    sg.description =
+        "Propose a name for a function or global without renaming it: the user reviews your suggestions in "
+        "ceasta (AI > Review suggested names) and accepts or rejects each. Prefer this over rename when you're "
+        "naming many things or aren't sure. Give a one-line reason (what it does, the evidence).";
+    sg.schema = schema({{"address", prop("string", "hex address or current name")},
+                        {"name", prop("string", "the proposed name, like parse_config")},
+                        {"reason", prop("string", "why, in one line")}},
+                       {"address", "name"});
+    sg.writes = true;
+    sg.run = [](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t a;
+        std::string err;
+        if (!db || !arg_addr(*db, args, "address", a, out))
+            return false;
+        if (!db->suggest(a, std::string(), arg_str(args, "name"), arg_str(args, "reason"), err)) {
+            out = "can't suggest that: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = util::fmt("suggested %s for %s (%zu waiting for review)", util::trim(arg_str(args, "name")).c_str(),
+                        db->location(a).c_str(), db->suggestions.size());
+        return true;
+    };
+    t.push_back(std::move(sg));
+
+    tool sv;
+    sv.name = "suggest_variable_name";
+    sv.description =
+        "Propose a name for a variable of a function's pseudocode (as decompile_function shows it) for the user "
+        "to review, like suggest_name.";
+    sv.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"variable", prop("string", "the variable as the pseudocode shows it")},
+                        {"name", prop("string", "the proposed name")},
+                        {"reason", prop("string", "why, in one line")}},
+                       {"function", "variable", "name"});
+    sv.writes = true;
+    sv.run = [func_of, var_key](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        std::string key, err;
+        if (!db || !func_of(*db, args, f, out) || !var_key(*db, f, util::trim(arg_str(args, "variable")), key, out))
+            return false;
+        if (!db->suggest(f, key, arg_str(args, "name"), arg_str(args, "reason"), err)) {
+            out = "can't suggest that: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = util::fmt("suggested %s for %s in %s (%zu waiting for review)", util::trim(arg_str(args, "name")).c_str(),
+                        arg_str(args, "variable").c_str(), db->location(f).c_str(), db->suggestions.size());
+        return true;
+    };
+    t.push_back(std::move(sv));
+
     tool sp;
     sp.name = "save_project";
     sp.description =
-        "Write a project file next to the binary (\"<file>.ceasta\") holding every name, comment and "
-        "breakpoint. It's plain sorted text meant to be committed to version control, so a team - or the "
-        "next session - picks up the work. Once it exists, later renames update it automatically.";
+        "Save every name, comment and breakpoint to the project file: the database the user has open, or "
+        "\"<file>.ceasta\" next to the binary (plain sorted text, meant for version control), so the user - or "
+        "the next session - picks up the work.";
     sp.schema = schema({});
     sp.writes = true;
     sp.run = [](mcp_server& s, const json::value&, std::string& out) {
@@ -765,6 +1023,13 @@ std::string symbolize(mcp_server& s, database& db, debugger& d, uint64_t v)
     return std::string();
 }
 
+// a watched runtime address, by name when it's in the file
+std::string watch_where(mcp_server& s, database& db, debugger& d, uint64_t a)
+{
+    std::string sym = symbolize(s, db, d, a);
+    return sym.empty() || sym[0] == '"' ? hexa(a) : sym + " (" + hexa(a) + ")";
+}
+
 std::string where_text(mcp_server& s, database& db, debugger& d, uint64_t pc)
 {
     uint64_t st = 0;
@@ -789,7 +1054,14 @@ std::string state_text(mcp_server& s, database& db)
     }
     if (d->state() == dbg_state::running)
         return "running (debug_pause stops it)";
-    return "stopped: " + d->stop_reason() + "\nat " + where_text(s, db, *d, d->pc()) + "\n";
+    std::string why = d->stop_reason();
+    for (const debugger::watch& w : d->watches()) { // "watchpoint: write to counter (0x...)"
+        std::string hex = util::hex(w.addr);
+        if (why.size() > hex.size() && why.compare(why.size() - hex.size(), hex.size(), hex) == 0 &&
+            why.compare(0, 10, "watchpoint") == 0)
+            why = why.substr(0, why.size() - hex.size()) + watch_where(s, db, *d, w.addr);
+    }
+    return "stopped: " + why + "\nat " + where_text(s, db, *d, d->pc()) + "\n";
 }
 
 debugger* stopped_dbg(mcp_server& s, std::string& out)
@@ -804,6 +1076,23 @@ debugger* stopped_dbg(mcp_server& s, std::string& out)
         return nullptr;
     }
     return d;
+}
+
+// "address" of a live-memory tool: a register name, a name or address of the file (moved to
+// where it is in the process), or a raw runtime address
+bool live_addr(mcp_server& s, database& db, debugger& d, const json::value& args, uint64_t& a, std::string& out)
+{
+    std::string t = util::lower(util::trim(arg_str(args, "address")));
+    for (const reg_value& r : d.registers())
+        if (!t.empty() && util::lower(r.name) == t) {
+            a = r.value;
+            return true;
+        }
+    if (!arg_addr(db, args, "address", a, out))
+        return false;
+    if (db.bin.is_mapped(a) && s.debug.to_runtime)
+        a = s.debug.to_runtime(a);
+    return true;
 }
 
 // after a run command: wait for the stop, then describe where it is
@@ -929,6 +1218,62 @@ void add_debug_tools(std::vector<tool>& t)
         },
         true);
 
+    add("debug_step_out", "Run until the current function returns (calls in between run at full speed), then stop in "
+        "the caller.",
+        schema({{"timeout_ms", prop("integer", "how long to keep stepping (default 15000)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            uint64_t until = os::now_ms() + (uint64_t)arg_int(args, "timeout_ms", 15000, 100, 120000);
+            for (int guard = 0; guard < 1000000; guard++) {
+                bool ok = false, last = false;
+                std::string err;
+                s.run([&] {
+                    debugger* d = stopped_dbg(s, out);
+                    if (!d)
+                        return;
+                    last = d->about_to_return();
+                    ok = s.debug.step_over && s.debug.step_over(err);
+                });
+                if (!ok) {
+                    if (out.empty())
+                        out = "can't step: " + err;
+                    return false;
+                }
+                out.clear();
+                if (!s.wait_stop((int)std::max<int64_t>(100, (int64_t)(until - std::min(until, os::now_ms())))))
+                    break;
+                std::string why;
+                s.run([&] {
+                    debugger* d = dbg_of(s);
+                    why = d ? d->stop_reason() : std::string();
+                });
+                if (last || (why != "step" && why != "step over") || os::now_ms() >= until)
+                    break;
+            }
+            return finish_run(s, 1000, out);
+        },
+        true);
+
+    add("debug_step_back", "Undo the last steps: puts back the memory and registers they changed. Only steps "
+        "(debug_step_into / debug_step_over) are recorded; continuing or stepping over a call starts over.",
+        schema({{"count", prop("integer", "how many steps (default 1)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            int n = arg_int(args, "count", 1, 1, 100000), done = 0;
+            std::string err;
+            s.run([&] {
+                debugger* d = stopped_dbg(s, out);
+                if (!d)
+                    return;
+                for (; done < n; done++)
+                    if (!d->step_back(err))
+                        break;
+                database* db = s.get_db ? s.get_db() : nullptr;
+                out = util::fmt("went back %d step%s", done, done == 1 ? "" : "s") + (done < n ? " (" + err + ")" : "") +
+                      util::fmt(", %zu more can be undone\n", d->steps_recorded()) + (db ? state_text(s, *db) : std::string());
+            });
+            return done > 0;
+        },
+        true);
+
     add("debug_run_to", "Run until an address or name is reached (or a breakpoint, or the timeout).",
         schema({{"address", prop("string", "hex address or name in the file")},
                 {"timeout_ms", prop("integer", "how long to wait (default 15000)")}},
@@ -1013,21 +1358,31 @@ void add_debug_inspect_tools(std::vector<tool>& t)
 
     add("debug_set_breakpoint",
         "Break when execution reaches an address or name of the file. Works before debug_start too; addresses "
-        "follow the program when it loads somewhere else (aslr / pie).",
-        schema({{"address", prop("string", "hex address or name")}}, {"address"}),
+        "follow the program when it loads somewhere else (aslr / pie). With a condition it only stops when the "
+        "condition holds: a Lua expression over the registers (rax, ecx, ...), hits (how often it was reached), "
+        "and memory readers u8/u16/u32/u64(addr), str(addr), wstr(addr) - e.g. \"rdi == 3\", \"hits == 100\", "
+        "\"str(rcx) == 'admin'\".",
+        schema({{"address", prop("string", "hex address or name")},
+                {"condition", prop("string", "optional: stop only when this Lua expression is true")}},
+               {"address"}),
         [](mcp_server& s, const json::value& args, std::string& out) {
             database* db = need_db(s, out);
             uint64_t a;
             std::string err;
             if (!db || !arg_addr(*db, args, "address", a, out))
                 return false;
+            std::string cond = util::trim(arg_str(args, "condition"));
             if (!s.debug.add_bp || !s.debug.add_bp(a, err)) {
                 out = "can't set it: " + err;
                 return false;
             }
+            if (s.debug.set_condition && !s.debug.set_condition(a, cond, err)) {
+                out = "the breakpoint is set, but the condition isn't valid: " + err;
+                return false;
+            }
             if (s.on_changed)
                 s.on_changed();
-            out = "breakpoint at " + db->location(a) + " (" + hexa(a) + ")";
+            out = "breakpoint at " + db->location(a) + " (" + hexa(a) + ")" + (cond.empty() ? "" : " when " + cond);
             return true;
         });
 
@@ -1045,16 +1400,110 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             return ok;
         });
 
-    add("debug_list_breakpoints", "The breakpoints (static addresses of the file).", schema({}),
+    add("debug_list_breakpoints", "The breakpoints (static addresses of the file) and the watches (runtime addresses).",
+        schema({}),
         [](mcp_server& s, const json::value&, std::string& out) {
             database* db = need_db(s, out);
             if (!db)
                 return false;
             std::vector<uint64_t> b = s.debug.bps ? s.debug.bps() : std::vector<uint64_t>();
-            for (uint64_t a : b)
-                out += hexa(a) + "  " + db->location(a) + "\n";
+            for (uint64_t a : b) {
+                std::string c = s.debug.condition_of ? s.debug.condition_of(a) : std::string();
+                out += hexa(a) + "  " + db->location(a) + (c.empty() ? std::string() : "  when " + c) + "\n";
+            }
             if (b.empty())
                 out = "no breakpoints\n";
+            debugger* d = dbg_of(s);
+            if (d)
+                for (const debugger::watch& w : d->watches())
+                    out += util::fmt("watch %s, %d byte%s, stops after a %s\n", watch_where(s, *db, *d, w.addr).c_str(), w.size,
+                        w.size == 1 ? "" : "s", w.access ? "read or write" : "write");
+            return true;
+        });
+
+    add("debug_watch",
+        "A watchpoint: the program stops right after an instruction writes the memory (with access: reads or "
+        "writes it) - find who changes a variable, a flag, a buffer. Address as for debug_read_memory: a register, "
+        "a name or address of the file, or a runtime address (heap, stack). 1, 2, 4 or 8 bytes, aligned to the "
+        "size; up to 4 at once; they last for this run. The stop reason reads \"watchpoint: write to ...\". "
+        "remove=true takes it away. The program has to be stopped.",
+        schema({{"address", prop("string", "register name, file name/address, or runtime address")},
+                {"size", prop("integer", "bytes: 1, 2, 4 or 8 (default 4)")},
+                {"access", prop("boolean", "stop on reads too, not only writes (default false)")},
+                {"remove", prop("boolean", "remove the watch at this address instead")}},
+               {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            uint64_t a = 0;
+            if (!d || !live_addr(s, *db, *d, args, a, out))
+                return false;
+            if (arg_bool(args, "remove", false)) {
+                bool ok = d->del_watch(a);
+                out = ok ? "stopped watching " + watch_where(s, *db, *d, a) : "no watch at " + watch_where(s, *db, *d, a);
+                return ok;
+            }
+            int size = arg_int(args, "size", 4, 1, 8);
+            bool access = arg_bool(args, "access", false);
+            std::string err;
+            if (!d->add_watch(a, size, access, err)) {
+                out = "can't watch it: " + err;
+                return false;
+            }
+            out = util::fmt("watching %s, %d byte%s: the program stops after a %s. debug_continue runs to it.",
+                watch_where(s, *db, *d, a).c_str(), size, size == 1 ? "" : "s", access ? "read or write" : "write");
+            return true;
+        });
+
+    add("debug_backtrace",
+        "The call stack: how the stopped thread got here. The function it's in, then each caller (the call that "
+        "made the frame and where it returns to). Read from the stack without unwind tables, so treat deep frames "
+        "as a good guess.",
+        schema({{"limit", prop("integer", "how many frames (default 32)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            if (!d)
+                return false;
+            auto func_start = [&s, db](uint64_t rt) -> uint64_t {
+                uint64_t st = 0;
+                if (!s.debug.to_static || !s.debug.to_static(rt, st))
+                    return 0;
+                const function* f = db->an.func_containing(st);
+                return f && s.debug.to_runtime ? s.debug.to_runtime(f->start) : 0;
+            };
+            std::vector<stack_frame> fr = dbg_call_stack(*d, arg_int(args, "limit", 32, 1, 256), func_start);
+            for (size_t i = 0; i < fr.size(); i++) {
+                std::string sym = symbolize(s, *db, *d, i ? fr[i].call : fr[i].pc);
+                out += util::fmt("#%zu  %s", i, (sym.empty() ? hexa(i ? fr[i].call : fr[i].pc) : sym).c_str());
+                out += i ? "  (call at " + hexa(fr[i].call) + ", returns to " + hexa(fr[i].pc) + ")\n" : "  (here, " + hexa(fr[i].pc) + ")\n";
+            }
+            return true;
+        });
+
+    add("debug_memory_map",
+        "The running program's memory map: each region's range, access (r/w/x) and what it is (a module or file, "
+        "[heap], [stack]). filter keeps the lines that contain it (e.g. \"libc\", \"rwx\", \"stack\").",
+        schema({{"filter", prop("string", "optional: only lines containing this")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            debugger* d = stopped_dbg(s, out);
+            if (!d)
+                return false;
+            std::string f = util::lower(util::trim(arg_str(args, "filter")));
+            int n = 0;
+            for (const dbg_region& r : d->regions()) {
+                std::string line = util::fmt("%s-%s %s %s", hexa(r.base).c_str(), hexa(r.base + r.size).c_str(), r.perms.c_str(),
+                    r.what.c_str());
+                if (!f.empty() && util::lower(line).find(f) == std::string::npos)
+                    continue;
+                out += line + "\n";
+                if (++n >= 2000) {
+                    out += "(more left out)\n";
+                    break;
+                }
+            }
+            if (out.empty())
+                out = f.empty() ? "no memory map\n" : "nothing matches " + f + "\n";
             return true;
         });
 
@@ -1111,20 +1560,8 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             if (!d)
                 return false;
             uint64_t a = 0;
-            std::string t = util::lower(util::trim(arg_str(args, "address")));
-            bool got = false;
-            for (const reg_value& r : d->registers())
-                if (!t.empty() && util::lower(r.name) == t) {
-                    a = r.value;
-                    got = true;
-                    break;
-                }
-            if (!got) {
-                if (!arg_addr(*db, args, "address", a, out))
-                    return false;
-                if (db->bin.is_mapped(a) && s.debug.to_runtime)
-                    a = s.debug.to_runtime(a);
-            }
+            if (!live_addr(s, *db, *d, args, a, out))
+                return false;
             std::vector<uint8_t> buf((size_t)arg_int(args, "length", 128, 1, 4096));
             size_t n = d->read(a, buf.data(), buf.size());
             if (!n) {
@@ -1145,20 +1582,8 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             if (!d)
                 return false;
             uint64_t a = 0;
-            std::string t = util::lower(util::trim(arg_str(args, "address")));
-            bool got = false;
-            for (const reg_value& r : d->registers())
-                if (!t.empty() && util::lower(r.name) == t) {
-                    a = r.value;
-                    got = true;
-                    break;
-                }
-            if (!got) {
-                if (!arg_addr(*db, args, "address", a, out))
-                    return false;
-                if (db->bin.is_mapped(a) && s.debug.to_runtime)
-                    a = s.debug.to_runtime(a);
-            }
+            if (!live_addr(s, *db, *d, args, a, out))
+                return false;
             std::vector<uint8_t> bytes;
             for (const std::string& tok : util::split(arg_str(args, "bytes"), " ,")) {
                 uint64_t v;
@@ -1307,40 +1732,6 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             return true;
         });
 
-    add("debug_backtrace", "The call stack of the stopped thread, best-effort from the frame pointers.",
-        schema({{"limit", prop("integer", "how many frames (default 32)")}}),
-        [](mcp_server& s, const json::value& args, std::string& out) {
-            database* db = need_db(s, out);
-            debugger* d = db ? stopped_dbg(s, out) : nullptr;
-            if (!d)
-                return false;
-            int limit = arg_int(args, "limit", 32, 1, 256);
-            out = "#0  " + where_text(s, *db, *d, d->pc()) + "\n";
-            uint64_t bp = 0;
-            for (const reg_value& r : d->registers())
-                if (r.name == "rbp" || r.name == "ebp")
-                    bp = r.value;
-            int frame = 1;
-            for (int i = 0; i < limit && bp; i++) {
-                // a frame is [bp] = caller's bp, [bp + ptr] = return address
-                uint64_t next_bp = 0, ret = 0;
-                if (d->is64()) {
-                    if (d->read(bp, &next_bp, 8) < 8 || d->read(bp + 8, &ret, 8) < 8)
-                        break;
-                } else {
-                    uint32_t a = 0, b = 0;
-                    if (d->read(bp, &a, 4) < 4 || d->read(bp + 4, &b, 4) < 4)
-                        break;
-                    next_bp = a;
-                    ret = b;
-                }
-                if (!ret || next_bp <= bp)
-                    break;
-                out += util::fmt("#%d  ", frame++) + where_text(s, *db, *d, ret) + "\n";
-                bp = next_bp;
-            }
-            return true;
-        });
 }
 
 } // namespace
@@ -1368,6 +1759,8 @@ std::vector<const mcp_server::tool*> mcp_server::tools() const
         if (t.debug && !opts.allow_debug)
             continue;
         if (t.lua && !opts.allow_lua)
+            continue;
+        if (t.kuna && opts.kuna.empty())
             continue;
         out.push_back(&t);
     }
@@ -1427,6 +1820,76 @@ json::value rpc_result(const json::value& id, json::value result)
     r["id"] = id;
     r["result"] = std::move(result);
     return r;
+}
+
+// ---- prompts: ready-made requests the client offers the user (claude code lists them as
+// /mcp__ceasta__<name>). {function} and {limit} in the text are the arguments
+
+struct prompt_arg {
+    const char* name;
+    const char* description;
+    bool required;
+};
+
+struct prompt_def {
+    const char* name;
+    const char* description;
+    std::vector<prompt_arg> args;
+    const char* text;
+    bool debug; // uses the debugger tools
+};
+
+const std::vector<prompt_def>& prompt_list()
+{
+    static const std::vector<prompt_def> p = {
+        {"triage", "A first look at the binary: what it is, what stands out, and where to read next.", {},
+         "Take a first look at the binary open in ceasta. Call get_binary_info (format, architecture, entry point, "
+         "sections), then list_imports and pick out what stands out: networking, crypto, process and memory "
+         "manipulation (VirtualAlloc, WriteProcessMemory, CreateRemoteThread), anti-debugging, registry and service "
+         "changes. Then list_strings for urls, ip addresses, file paths, registry keys, commands and error messages, "
+         "and decompile_function on the entry point and main. Finish with a short summary: what the program probably "
+         "is and does, anything suspicious, and the 3 to 5 functions most worth reading next, with their addresses "
+         "and why.",
+         false},
+        {"explain_function", "What a function does, its parameters and result, with names for it and its variables.",
+         {{"function", "the function: name or address", true}},
+         "Explain what {function} does in the binary open in ceasta. Read it with decompile_function (and "
+         "disassemble_function where the pseudocode looks off), see who calls it with get_xrefs_to, and look at the "
+         "functions it calls and the strings it uses. Say in a few sentences what it does, what its parameters and "
+         "return value mean, and anything unusual (error paths, loops over buffers, constants). Then propose names "
+         "for review: suggest_name for the function and suggest_variable_name for its parameters and important "
+         "locals. If the user asked you to go ahead, use rename, rename_variable and set_function_prototype "
+         "directly instead.",
+         false},
+        {"rename_pass", "Name the unnamed functions (sub_...), bottom-up. The names wait for your review in ceasta.",
+         {{"limit", "at most this many functions (default 30)", false}},
+         "Name the unnamed functions of the binary open in ceasta (the sub_... ones). Get them with list_functions. "
+         "Work bottom-up: functions that call nothing unnamed first, since their names help with their callers. For "
+         "each one: decompile_function, get_xrefs_from for what it calls, and a look at its strings. When you can "
+         "tell what it does, call suggest_name with a short verb_noun name (parse_header, decrypt_config, "
+         "send_beacon) and a one-line reason. Skip what you can't tell rather than guessing, and skip library code. "
+         "Stop after {limit} functions, then list what you named and what you skipped. The user reviews your "
+         "suggestions in ceasta under AI > Review suggested names.",
+         false},
+        {"find_crypto", "Find cryptography: crypto api calls, well-known constants, xor loops.", {},
+         "Find cryptography in the binary open in ceasta. Check list_imports for crypto apis (CryptEncrypt, "
+         "CryptDecrypt, BCrypt*, EVP_*). Search for well-known constants with search_bytes: the aes s-box "
+         "(63 7c 77 7b f2 6b 6f c5), sha-256 (98 2f 8a 42 91 44 37 71), the md5 / sha-1 initial values "
+         "(01 23 45 67 89 ab cd ef), crc32 (20 83 b8 ed); and look with decompile_function for loops that run 256 "
+         "times (rc4 key scheduling) or xor a buffer with a key. For each find, say which algorithm it is and where "
+         "(function and address), what key or data it works on if you can tell, and suggest a name for the "
+         "function with suggest_name.",
+         false},
+        {"trace_function", "Run the program to a function under the debugger and watch what it gets and returns.",
+         {{"function", "the function: name or address", true}},
+         "Use ceasta's debugger to watch {function} run. debug_set_breakpoint on it, debug_start, then "
+         "debug_continue until it stops there. Show its arguments: debug_get_registers, and debug_read_memory on the "
+         "ones that point at memory (strings, buffers, structures). Then debug_step_out to let it return, and read "
+         "the result (rax / eax) and anything it wrote. debug_backtrace shows who called it. Summarize what it was "
+         "given and what it did with it, then end the program with debug_kill.",
+         true},
+    };
+    return p;
 }
 
 // a tools/call result: text content, with isError set when the tool failed
@@ -1501,13 +1964,16 @@ json::value mcp_server::dispatch(const json::value& msg)
         caps = json::value::make_object();
         json::value& tcap = caps["tools"];
         tcap = json::value::make_object();
+        json::value& pcap = caps["prompts"];
+        pcap = json::value::make_object();
         json::value& info = r["serverInfo"];
         info["name"] = "ceasta";
         info["version"] = CEASTA_VERSION;
         r["instructions"] =
             "ceasta is a reverse engineering tool. These tools inspect the binary the user has open: "
             "decompile_function and disassemble to read code, list_functions / list_strings / get_xrefs_to to "
-            "navigate, and rename / set_comment to record what you learn. Start with get_binary_info.";
+            "navigate, and rename / set_comment / rename_variable / set_function_prototype to record what you learn. "
+            "Start with get_binary_info.";
         return rpc_result(id, std::move(r));
     }
     if (method == "notifications/initialized" || method == "notifications/cancelled")
@@ -1538,9 +2004,64 @@ json::value mcp_server::dispatch(const json::value& msg)
             on_activity(activity);
         return rpc_result(id, std::move(result));
     }
-    if (method == "resources/list" || method == "prompts/list") {
+    if (method == "prompts/list") {
         json::value r = json::value::make_object();
-        r[method == "resources/list" ? "resources" : "prompts"] = json::value::make_array();
+        json::value& list = r["prompts"];
+        list = json::value::make_array();
+        for (const prompt_def& pd : prompt_list()) {
+            if (pd.debug && !opts.allow_debug)
+                continue;
+            json::value item = json::value::make_object();
+            item["name"] = pd.name;
+            item["description"] = pd.description;
+            json::value& args = item["arguments"];
+            args = json::value::make_array();
+            for (const prompt_arg& a : pd.args) {
+                json::value arg = json::value::make_object();
+                arg["name"] = a.name;
+                arg["description"] = a.description;
+                arg["required"] = a.required;
+                args.push(std::move(arg));
+            }
+            list.push(std::move(item));
+        }
+        return rpc_result(id, std::move(r));
+    }
+    if (method == "prompts/get") {
+        std::string name = p.get("name") ? p.get("name")->str() : std::string();
+        const json::value* given = p.get("arguments");
+        for (const prompt_def& pd : prompt_list()) {
+            if (name != pd.name || (pd.debug && !opts.allow_debug))
+                continue;
+            std::string text = pd.text;
+            for (const prompt_arg& a : pd.args) {
+                const json::value* v = given && given->is_object() ? given->get(a.name) : nullptr;
+                std::string val = v ? util::trim(v->str()) : std::string();
+                if (val.empty() && a.required)
+                    return rpc_error(id, -32602, std::string("the prompt needs ") + a.name);
+                if (val.empty())
+                    val = std::string(a.name) == "limit" ? "30" : "";
+                std::string key = std::string("{") + a.name + "}";
+                for (size_t at = text.find(key); at != std::string::npos; at = text.find(key, at + val.size()))
+                    text.replace(at, key.size(), val);
+            }
+            json::value r = json::value::make_object();
+            r["description"] = pd.description;
+            json::value& msgs = r["messages"];
+            msgs = json::value::make_array();
+            json::value m = json::value::make_object();
+            m["role"] = "user";
+            json::value& c = m["content"];
+            c["type"] = "text";
+            c["text"] = text;
+            msgs.push(std::move(m));
+            return rpc_result(id, std::move(r));
+        }
+        return rpc_error(id, -32602, "no prompt called " + name);
+    }
+    if (method == "resources/list") {
+        json::value r = json::value::make_object();
+        r["resources"] = json::value::make_array();
         return rpc_result(id, std::move(r));
     }
     if (is_notification)

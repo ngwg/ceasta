@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ceasta
+GenericName=Disassembler and debugger
+Comment=Disassembler, decompiler and debugger for x86, x64 and arm64 programs
+Exec=ceasta %f
+Icon=ceasta
+Terminal=false
+Categories=Development;Debugger;
+Keywords=reverse;engineering;disassembler;decompiler;debugger;elf;pe;
+StartupWMClass=ceasta

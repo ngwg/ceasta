@@ -6,6 +6,7 @@
 #include "ui/graph_view.h"
 #include "ui/pseudo_view.h"
 #include "widgets/nav_band.h"
+#include "widgets/splitter.h"
 #include <algorithm>
 
 namespace ida_view {
@@ -26,7 +27,7 @@ static void welcome(app_state& s)
     ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 2.2f);
     centered_text("ceasta", theme::func);
     ImGui::PopFont();
-    centered_text("disassembler + debugger for windows and linux binaries", theme::addr);
+    centered_text("disassembler, decompiler and debugger for windows and linux binaries", theme::addr);
     ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));
 
     float bw = ImGui::CalcTextSize("Open as raw code...").x + ImGui::GetStyle().FramePadding.x * 2;
@@ -37,7 +38,7 @@ static void welcome(app_state& s)
     if (ImGui::Button("Open as raw code...", ImVec2(bw, 0)))
         dialogs::open(s, dialog_kind::open_raw, 0);
     ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight() * 0.5f));
-    centered_text("or drop a file on the window  -  .exe .dll .sys, elf binaries, raw shellcode", theme::nop);
+    centered_text("or drop a file on the window  -  .exe .dll .sys, elf binaries, raw shellcode, .ceasta databases", theme::nop);
 
     if (!s.recent.empty()) {
         ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));
@@ -86,9 +87,19 @@ static void row_menu(app_state& s, uint64_t a)
         dialogs::open(s, dialog_kind::comment, a);
     if (ImGui::MenuItem("References...", "X"))
         dialogs::open(s, dialog_kind::xrefs, a);
+    if (ImGui::MenuItem(db.bookmarks.count(db.an.item_head(a)) ? "Remove bookmark" : "Bookmark", "Alt+M"))
+        app_toggle_bookmark(s, a);
     ImGui::Separator();
-    if (ImGui::MenuItem("Toggle breakpoint", "F2"))
-        app_toggle_bp(s, a);
+    const segment* seg = db.bin.seg_at(a);
+    bool code = (db.an.flags_at(a) & fl_code) || (seg && seg->exec()) || db.breakpoints.count(a);
+    if (code) {
+        if (ImGui::MenuItem("Toggle breakpoint", "F2"))
+            app_toggle_bp(s, a);
+        if (ImGui::MenuItem("Breakpoint condition...", "Shift+F2"))
+            dialogs::open(s, dialog_kind::bp_condition, a);
+    } else if (ImGui::MenuItem("Watch (stop when it's written)...", "F2")) {
+        dialogs::open(s, dialog_kind::watch, a);
+    }
     if (ImGui::MenuItem("Run to here", "F4", false, s.dbg.state() == dbg_state::stopped && s.dbg_mapped)) {
         s.cursor = a;
         dbg_run_to_cursor(s);
@@ -109,6 +120,7 @@ static void row_menu(app_state& s, uint64_t a)
     }
     if (ImGui::MenuItem("Show in hex")) {
         s.hex_addr = a;
+        s.hex_process = false;
         s.bottom_tab_request = 1;
         s.show_bottom = true;
     }
@@ -153,7 +165,9 @@ static void listing(app_state& s)
     float x_gutter = ImGui::GetStyle().WindowPadding.x;
     float x_addr = x_gutter + cw * 2.5f;
     float x_bytes = x_addr + cw * (float)(seg_len + 1 + db.fmt_addr(0).size() + 2);
-    float x_text = x_bytes + (s.show_bytes ? cw * 26 : 0.0f);
+    // opcode bytes only when there's room for them (not in a narrow side by side listing)
+    bool bytes = s.show_bytes && ImGui::GetContentRegionAvail().x > cw * 100;
+    float x_text = x_bytes + (bytes ? cw * 26 : 0.0f);
 
     uint64_t pc = 0;
     bool has_pc = app_pc_static(s, pc);
@@ -161,17 +175,20 @@ static void listing(app_state& s)
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float visible_h = ImGui::GetWindowHeight();
     float scroll_y = ImGui::GetScrollY();
+    // a row takes its height plus the item spacing: the clipper has to know, or the last rows
+    // of the file sit below the end of the scroll range
+    float pitch = lh + ImGui::GetStyle().ItemSpacing.y;
     line_text t;
 
     ImGuiListClipper clip;
-    clip.Begin((int)rows.size(), lh);
+    clip.Begin((int)rows.size(), pitch);
     if (s.scroll_to_cursor)
         clip.IncludeItemByIndex((int)cur_row);
     while (clip.Step()) {
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
             const row& r = rows[(size_t)i];
             if (s.scroll_to_cursor && (size_t)i == cur_row) {
-                float y = i * lh;
+                float y = i * pitch;
                 if (y < scroll_y || y + lh > scroll_y + visible_h)
                     ImGui::SetScrollHereY(0.3f);
             }
@@ -196,8 +213,14 @@ static void listing(app_state& s)
 
             float mid = p.y + lh * 0.5f;
             float gx = p.x + x_gutter - ImGui::GetStyle().WindowPadding.x + cw * 0.9f;
-            if (item_row && db.breakpoints.count(r.addr))
+            if (item_row && db.breakpoints.count(r.addr)) {
                 dl->AddCircleFilled(ImVec2(gx, mid), lh * 0.28f, theme::bp);
+                if (db.bp_conditions.count(r.addr)) // a condition: a ring
+                    dl->AddCircleFilled(ImVec2(gx, mid), lh * 0.13f, theme::band_bg);
+            }
+            if (item_row && db.bookmarks.count(r.addr)) // a bookmark: a bar at the left edge
+                dl->AddRectFilled(ImVec2(p.x - ImGui::GetStyle().WindowPadding.x + 1, p.y + 2),
+                    ImVec2(p.x - ImGui::GetStyle().WindowPadding.x + 4, p.y + lh - 2), theme::label);
             if (has_pc && item_row && r.addr == pc) {
                 float ax = gx + cw * 0.9f;
                 dl->AddTriangleFilled(ImVec2(ax - cw * 0.5f, mid - lh * 0.3f), ImVec2(ax - cw * 0.5f, mid + lh * 0.3f),
@@ -208,7 +231,7 @@ static void listing(app_state& s)
             float base_x = p.x - ImGui::GetStyle().WindowPadding.x;
             if (!t.addr.empty())
                 dl->AddText(ImVec2(base_x + x_addr, p.y), theme::addr, t.addr.c_str());
-            if (s.show_bytes && !t.bytes.empty())
+            if (bytes && !t.bytes.empty())
                 dl->AddText(ImVec2(base_x + x_bytes, p.y), theme::bytes, t.bytes.c_str());
             float tx = base_x + x_text + ((r.kind == row_kind::func || r.kind == row_kind::label || r.kind == row_kind::seg) ? 0.0f : cw * 2);
             if (!t.text.empty())
@@ -243,7 +266,7 @@ static void listing(app_state& s)
 
     // arrow keys move the cursor while the listing has focus
     if (focused && !ImGui::GetIO().WantTextInput) {
-        int page = std::max(1, (int)(visible_h / lh) - 2);
+        int page = std::max(1, (int)(visible_h / pitch) - 2);
         int delta = 0;
         if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
             delta = -1;
@@ -275,18 +298,28 @@ static void header(app_state& s)
     } else {
         ImGui::TextDisabled("%s", db.location(s.cursor).c_str());
     }
-    float right = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
-    float bw = ImGui::CalcTextSize("Listing").x + ImGui::CalcTextSize("Graph").x + ImGui::CalcTextSize("Pseudocode").x +
-               ImGui::GetStyle().FramePadding.x * 6 + ImGui::GetStyle().ItemSpacing.x * 2 + ImGui::GetFrameHeight() * 3;
+    // the view switch: small tabs on the right
+    static const char* const names[] = {"Listing", "Graph", "Pseudocode", "Both"};
+    static const char* const keys[] = {"Space switches listing / graph", "Space switches listing / graph", "F5",
+                                       "listing and pseudocode side by side (Shift+F5)"};
+    static const center_view views[] = {center_view::listing, center_view::graph, center_view::pseudo, center_view::split};
+    ImGuiStyle& st = ImGui::GetStyle();
+    float bw = st.ItemSpacing.x * 2;
+    for (const char* n : names)
+        bw += ImGui::CalcTextSize(n).x + st.FramePadding.x * 2 + 2;
+    float right = ImGui::GetWindowWidth() - st.WindowPadding.x;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX(), right - bw));
-    if (ImGui::RadioButton("Listing", s.view == center_view::listing))
-        s.view = center_view::listing;
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Graph", s.view == center_view::graph))
-        s.view = center_view::graph;
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Pseudocode", s.view == center_view::pseudo))
-        s.view = center_view::pseudo;
+    for (int i = 0; i < 4; i++) {
+        bool on = s.view == views[i];
+        ImGui::PushStyleColor(ImGuiCol_Button, on ? ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive) : ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(on ? ImGuiCol_Text : ImGuiCol_TextDisabled));
+        if (ImGui::Button(names[i]))
+            s.view = views[i];
+        ImGui::PopStyleColor(2);
+        ImGui::SetItemTooltip("%s", keys[i]);
+        if (i < 3)
+            ImGui::SameLine(0, 2);
+    }
 }
 
 void draw(app_state& s)
@@ -301,12 +334,36 @@ void draw(app_state& s)
         return;
     }
     header(s);
-    if (s.view == center_view::graph)
+    // a listing that just came up (from the menu, a key, the palette or the tabs above) starts at
+    // the cursor, not wherever its window was scrolled last time
+    static center_view last = center_view::listing;
+    if (s.view != last) {
+        if (s.view == center_view::listing || s.view == center_view::split)
+            s.scroll_to_cursor = true;
+        last = s.view;
+    }
+    if (s.view == center_view::graph) {
         graph_view::draw(s);
-    else if (s.view == center_view::pseudo)
+    } else if (s.view == center_view::pseudo) {
         pseudo_view::draw(s);
-    else
+    } else if (s.view == center_view::split) {
+        // the listing on the left, the pseudocode on the right: a click in one moves the other
+        float total = ImGui::GetContentRegionAvail().x;
+        float w = std::max(120.0f, std::min(total - 120.0f, total * s.split_w));
+        ImGui::BeginChild("##split_l", ImVec2(w, 0));
         listing(s);
+        ImGui::EndChild();
+        ImGui::SameLine(0, 0);
+        float px = w;
+        if (widgets::splitter("##split", true, 6.0f, ImGui::GetContentRegionAvail().y, &px, 120.0f, total - 120.0f, 1.0f, 1.0f))
+            s.split_w = px / std::max(1.0f, total);
+        ImGui::SameLine(0, 0);
+        ImGui::BeginChild("##split_r", ImVec2(0, 0));
+        pseudo_view::draw(s);
+        ImGui::EndChild();
+    } else {
+        listing(s);
+    }
 }
 
 }

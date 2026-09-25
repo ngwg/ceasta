@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -31,8 +33,9 @@
 //
 // scope: 64-bit and 32-bit x86 tracees, breakpoints, single step, step over,
 // run to, pause, registers, memory (int3 bytes hidden), modules from
-// /proc/<pid>/maps. threads are tracked so control isn't lost; breakpoints and
-// stepping act on the thread that reported the stop.
+// /proc/<pid>/maps, watchpoints in the debug registers. threads are tracked so
+// control isn't lost; breakpoints and stepping act on the thread that reported
+// the stop.
 
 namespace {
 
@@ -121,9 +124,15 @@ struct debugger::impl {
     std::string temp_reason;
     uint64_t reinsert = 0;
     step stepping = step::none;
+    pid_t step_tid = 0;           // the thread being stepped
+    pid_t orphan_step = 0;        // a thread whose step we stopped waiting for (another stopped first)
+    std::set<pid_t> swallow;      // threads with a SIGSTOP of ours (or their first one) to drop
+    uint64_t watch_gen = 0;       // bumps with every change to the watch list
+    std::map<pid_t, uint64_t> dr_gen; // the watch list each thread's debug registers hold
     int exit_code = 0;
     std::string reason;
     std::vector<dbg_module> modules;
+    uint64_t stop_seq = 0, maps_seq = 0; // libraries load after exec: reread the maps after a stop
 
     void log(const std::string& s) const
     {
@@ -241,6 +250,77 @@ struct debugger::impl {
         return ptrace(PTRACE_SETREGSET, tid, (void*)NT_PRSTATUS, &iov) == 0;
     }
 
+    // ---- debug registers: dr0-dr3 hold the watched addresses, dr7 switches them on and says
+    // what to watch, dr6 tells which one fired. the kernel keeps a set per thread and only
+    // changes it while the thread is stopped
+
+    static void* dr_offset(int i)
+    {
+        return (void*)(offsetof(struct user, u_debugreg) + (size_t)i * sizeof(((struct user*)nullptr)->u_debugreg[0]));
+    }
+
+    bool poke_dr(pid_t tid, int i, uint64_t v)
+    {
+        return ptrace(PTRACE_POKEUSER, tid, dr_offset(i), (void*)(uintptr_t)v) == 0;
+    }
+
+    // off first, then the addresses, then on: the kernel checks each address against the
+    // length dr7 gives it
+    bool write_dregs(pid_t tid, const std::vector<debugger::watch>& w, std::string& err)
+    {
+        if (!poke_dr(tid, 7, 0)) {
+            err = "can't write the debug registers: " + errno_str(errno);
+            return false;
+        }
+        for (size_t i = 0; i < w.size() && i < 4; i++)
+            if (!poke_dr(tid, (int)i, w[i].addr)) {
+                err = "the cpu won't watch " + util::hex(w[i].addr) + ": " + errno_str(errno);
+                return false;
+            }
+        if (!w.empty() && !poke_dr(tid, 7, debugger::watch_dr7(w))) {
+            err = "can't switch the watch on: " + errno_str(errno);
+            return false;
+        }
+        return true;
+    }
+
+    // a thread's debug registers catch up with the watch list before it runs again
+    void sync_dregs(pid_t tid)
+    {
+        if (!watch_gen)
+            return;
+        auto it = dr_gen.find(tid);
+        if (it != dr_gen.end() && it->second == watch_gen)
+            return;
+        std::string err;
+        if (write_dregs(tid, owner.active_watches(), err))
+            dr_gen[tid] = watch_gen;
+    }
+
+    // which watches fired on this thread (dr6 bits 0-3); cleared, so an int3 later isn't
+    // taken for one
+    int take_dr6(pid_t tid)
+    {
+        errno = 0;
+        long v = ptrace(PTRACE_PEEKUSER, tid, dr_offset(6), nullptr);
+        if (v == -1 && errno)
+            return 0;
+        int fired = (int)(v & 0xF);
+        if (fired)
+            poke_dr(tid, 6, 0);
+        return fired;
+    }
+
+    // resumes a thread that stopped for our own bookkeeping (its first stop, a clone, a
+    // signal handed on), keeping a step on it going and the rest of the state as it is
+    bool run_on(pid_t tid, int sig)
+    {
+        sync_dregs(tid);
+        threads[tid] = true;
+        bool stepping_it = stepping != step::none && tid == step_tid;
+        return ptrace(stepping_it ? PTRACE_SINGLESTEP : PTRACE_CONT, tid, nullptr, (void*)(intptr_t)sig) == 0;
+    }
+
     // detect a 32-bit tracee from the size the kernel fills in for NT_PRSTATUS
     void detect_bits(pid_t tid)
     {
@@ -313,10 +393,14 @@ struct debugger::impl {
 
     void report(const std::string& why, pid_t tid)
     {
+        if (stepping != step::none && step_tid && step_tid != tid)
+            orphan_step = step_tid; // its step still ends with a trap: drop that one
         cur_tid = tid;
         state = dbg_state::stopped;
         reason = why;
         stepping = step::none;
+        step_tid = 0;
+        stop_seq++;
         if (owner.on_stop)
             owner.on_stop();
     }
@@ -342,7 +426,7 @@ struct debugger::impl {
     }
 
     // a thread stopped with SIGTRAP: figure out why
-    void on_trap(pid_t tid, int event)
+    void on_trap(pid_t tid, int event, bool orphan)
     {
         if (event == PTRACE_EVENT_EXEC) {
             after_exec(tid);
@@ -351,18 +435,28 @@ struct debugger::impl {
         thread_ctx c;
         bool have = get_ctx(tid, c);
         uint64_t pc = have ? c.pc() : 0;
+        bool mine = stepping != step::none && tid == step_tid;
 
         if (reinsert) {
             if (bps.count(reinsert))
                 write_cc(reinsert);
             reinsert = 0;
         }
-        if (stepping == step::into) {
+        // a watch fired: the instruction just before the pc wrote (or read) the memory
+        if (watch_gen) {
+            int fired = take_dr6(tid);
+            std::vector<debugger::watch> w = owner.active_watches();
+            for (size_t i = 0; i < w.size(); i++)
+                if (fired & (1 << i)) {
+                    report(debugger::watch_text(w[i]), tid);
+                    return;
+                }
+        }
+        if (mine && stepping == step::into) {
             report("step", tid);
             return;
         }
-        if (stepping == step::resume) {
-            stepping = step::none;
+        if (mine && stepping == step::resume) {
             do_cont(tid, step::none);
             return;
         }
@@ -376,6 +470,10 @@ struct debugger::impl {
             if (temp_active && temp_bp == bp_at)
                 remove_temp();
             report(why, tid);
+            return;
+        }
+        if (orphan) {
+            run_on(tid, 0); // the end of a step we stopped waiting for
             return;
         }
         if (pause_requested) {
@@ -410,8 +508,7 @@ struct debugger::impl {
             report(util::fmt("signal %d (%s) at %s", sig, strsignal(sig), util::hex(pc).c_str()), tid);
             pending_signal = sig; // left pending; continuing re-delivers it
         } else {
-            pending_signal = sig;
-            do_cont(tid, step::none);
+            run_on(tid, sig);
         }
     }
 
@@ -419,6 +516,8 @@ struct debugger::impl {
     {
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             threads.erase(tid);
+            swallow.erase(tid);
+            dr_gen.erase(tid);
             if (tid == pid) {
                 exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
                 log(util::fmt("process exited with code %d (0x%X)", exit_code, (unsigned)exit_code));
@@ -433,22 +532,35 @@ struct debugger::impl {
             return;
         int sig = WSTOPSIG(status);
         int event = status >> 16;
+        bool known = threads.count(tid) != 0;
         threads[tid] = false;
         cur_tid = tid;
         if (killing) {
             do_cont(tid, step::none);
             return;
         }
+        bool orphan = tid == orphan_step;
+        if (orphan)
+            orphan_step = 0;
         if (event == PTRACE_EVENT_CLONE || event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK) {
             unsigned long newtid = 0;
             ptrace(PTRACE_GETEVENTMSG, tid, nullptr, &newtid);
-            if (newtid)
+            // a new thread starts with a SIGSTOP, unless it already reported that one
+            if (newtid && !threads.count((pid_t)newtid)) {
                 threads[(pid_t)newtid] = true;
-            do_cont(tid, step::none);
+                swallow.insert((pid_t)newtid);
+            }
+            run_on(tid, 0);
+            return;
+        }
+        // a SIGSTOP we caused: a new thread's first stop, or one that let us update the debug
+        // registers. the thread picks those up and runs on
+        if (event == 0 && sig == SIGSTOP && (swallow.erase(tid) || !known)) {
+            run_on(tid, 0);
             return;
         }
         if (sig == SIGTRAP || event != 0) {
-            on_trap(tid, event);
+            on_trap(tid, event, orphan);
             return;
         }
         on_signal(tid, sig);
@@ -458,8 +570,10 @@ struct debugger::impl {
     {
         int sig = pending_signal;
         pending_signal = 0;
+        sync_dregs(tid);
         __ptrace_request req = mode == step::into || mode == step::resume ? PTRACE_SINGLESTEP : PTRACE_CONT;
         stepping = mode;
+        step_tid = mode == step::none ? 0 : tid;
         threads[tid] = true;
         state = dbg_state::running;
         if (ptrace(req, tid, nullptr, (void*)(intptr_t)sig) < 0)
@@ -507,6 +621,12 @@ struct debugger::impl {
         temp_active = false;
         reinsert = 0;
         stepping = step::none;
+        step_tid = orphan_step = 0;
+        swallow.clear();
+        dr_gen.clear();
+        watch_gen = 0;
+        owner.watch_list_.clear(); // runtime addresses of this process
+        owner.watch_pid_ = 0;
         state = dbg_state::none;
         pid = cur_tid = 0;
         at_exec = attached = killing = pause_requested = false;
@@ -543,6 +663,11 @@ bool debugger::start(const std::string& exe, const std::string& args, const std:
 {
     if (d->state != dbg_state::none) {
         err = "a process is already being debugged";
+        return false;
+    }
+    bin_arch arch;
+    if (loader::peek_arch(exe, arch) && arch == bin_arch::arm64) {
+        err = "the debugger runs x86 and x64 programs; this one is arm64";
         return false;
     }
     std::vector<std::string> argv{exe};
@@ -637,8 +762,11 @@ void debugger::detach()
     if (d->temp_active && !d->bps.count(d->temp_bp))
         d->raw_write(d->temp_bp, &d->temp_orig, 1);
     d->temp_active = false;
-    for (const auto& t : d->threads)
+    for (const auto& t : d->threads) {
+        if (d->watch_gen && !t.second)
+            d->poke_dr(t.first, 7, 0); // no watch left behind to trip over
         ptrace(PTRACE_DETACH, t.first, nullptr, nullptr);
+    }
     d->log("detached");
     d->cleanup();
 }
@@ -679,10 +807,10 @@ void debugger::poll(uint32_t timeout_ms)
 
 dbg_state debugger::state() const { return d->state; }
 
-bool debugger::cont(std::string& err) { return d->resume(impl::step::none, err); }
-bool debugger::step_into(std::string& err) { return d->resume(impl::step::into, err); }
+bool debugger::raw_cont(std::string& err) { return d->resume(impl::step::none, err); }
+bool debugger::raw_step_into(std::string& err) { return d->resume(impl::step::into, err); }
 
-bool debugger::step_over(std::string& err)
+bool debugger::raw_step_over(std::string& err)
 {
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
@@ -700,10 +828,10 @@ bool debugger::step_over(std::string& err)
         }
         return d->resume(impl::step::none, err);
     }
-    return step_into(err);
+    return raw_step_into(err);
 }
 
-bool debugger::run_to(uint64_t addr, std::string& err)
+bool debugger::raw_run_to(uint64_t addr, std::string& err)
 {
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
@@ -877,7 +1005,7 @@ bool debugger::write(uint64_t addr, const void* in, size_t n, std::string& err)
     return true;
 }
 
-bool debugger::call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err)
+bool debugger::raw_call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err)
 {
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
@@ -911,6 +1039,11 @@ bool debugger::call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& 
             d->write_cc(b.first);
         return false;
     }
+
+    // no watch stops inside the call either
+    std::vector<watch> watched = active_watches();
+    if (!watched.empty())
+        d->poke_dr(d->cur_tid, 7, 0);
 
     thread_ctx c = saved;
     for (size_t i = 0; i < args.size() && i < 6; i++) {
@@ -984,10 +1117,40 @@ bool debugger::call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& 
         if (had_temp)
             d->write_cc(d->temp_bp);
         d->set_ctx(d->cur_tid, saved);
+        std::string ignore;
+        if (!watched.empty())
+            d->write_dregs(d->cur_tid, watched, ignore);
     }
     if (!ok) {
         err = why.empty() ? "the call didn't return" : why;
         return false;
+    }
+    return true;
+}
+
+// the stopped threads get the list now; the running ones stop for a moment (the kernel only
+// changes a stopped thread's registers) and pick it up before they run on
+bool debugger::apply_watches(std::string& err)
+{
+    if (d->state != dbg_state::stopped) {
+        err = "stop the program first";
+        return false;
+    }
+    std::vector<watch> w = active_watches();
+    if (!d->write_dregs(d->cur_tid, w, err))
+        return false;
+    d->watch_gen++;
+    d->dr_gen[d->cur_tid] = d->watch_gen;
+    for (const auto& t : d->threads) {
+        if (t.first == d->cur_tid)
+            continue;
+        std::string ignore;
+        if (!t.second) {
+            if (d->write_dregs(t.first, w, ignore))
+                d->dr_gen[t.first] = d->watch_gen;
+        } else if (!d->swallow.count(t.first) && syscall(SYS_tgkill, d->pid, t.first, SIGSTOP) == 0) {
+            d->swallow.insert(t.first);
+        }
     }
     return true;
 }
@@ -998,7 +1161,42 @@ uint32_t debugger::pid() const { return (uint32_t)d->pid; }
 uint32_t debugger::tid() const { return (uint32_t)d->cur_tid; }
 int debugger::exit_code() const { return d->exit_code; }
 std::string debugger::stop_reason() const { return d->reason; }
-std::vector<dbg_module> debugger::modules() const { return d->modules; }
+std::vector<dbg_module> debugger::modules() const
+{
+    if (d->state == dbg_state::stopped && d->maps_seq != d->stop_seq) {
+        d->scan_maps();
+        d->maps_seq = d->stop_seq;
+    }
+    return d->modules;
+}
+
+// /proc/<pid>/maps: "lo-hi perms offset dev inode path"
+std::vector<dbg_region> debugger::regions() const
+{
+    std::vector<dbg_region> out;
+    if (!d->pid)
+        return out;
+    for (const std::string& line : util::split(slurp("/proc/" + std::to_string(d->pid) + "/maps"), "\n")) {
+        size_t dash = line.find('-'), sp1 = line.find(' ');
+        if (dash == std::string::npos || sp1 == std::string::npos || sp1 < dash)
+            continue;
+        dbg_region r;
+        r.base = strtoull(line.c_str(), nullptr, 16);
+        uint64_t hi = strtoull(line.c_str() + dash + 1, nullptr, 16);
+        if (hi <= r.base)
+            continue;
+        r.size = hi - r.base;
+        r.perms = line.substr(sp1 + 1, 3);
+        // the path is the sixth field, and may contain spaces
+        size_t at = sp1;
+        for (int field = 0; field < 4 && at != std::string::npos; field++)
+            at = line.find_first_not_of(' ', line.find(' ', at + 1));
+        if (at != std::string::npos && at < line.size())
+            r.what = util::trim(line.substr(at));
+        out.push_back(r);
+    }
+    return out;
+}
 
 std::vector<dbg_thread> debugger::threads() const
 {

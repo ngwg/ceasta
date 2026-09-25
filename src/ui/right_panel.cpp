@@ -179,35 +179,135 @@ static void strings(app_state& s, const std::vector<uint32_t>& idx)
     ImGui::EndTable();
 }
 
-static void segments(app_state& s, const std::string& filter)
+// what the file itself says: warnings first, hashes, headers, sections, resources, version
+static void file_tab(app_state& s, const std::string& filter)
 {
     database& db = *s.db;
-    if (!begin_table("##segments", 4))
-        return;
-    ImGui::TableSetupScrollFreeze(0, 1);
-    ImGui::TableSetupColumn("Name");
-    ImGui::TableSetupColumn("Start", 0, addr_w(db));
-    ImGui::TableSetupColumn("Size");
-    ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableHeadersRow();
-    int i = 0;
-    for (const segment& seg : db.bin.segments) {
-        if (!util::icontains(seg.name, filter))
-            continue;
+    const file_info& fi = db.info;
+    ImGui::BeginChild("##fileinfo", ImVec2(0, 0));
+    for (const std::string& w : fi.warnings) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(theme::log_warn));
+        ImGui::TextWrapped("! %s", w.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!fi.warnings.empty())
+        ImGui::Spacing();
+    auto copyable = [&](const char* label, const std::string& v) {
+        if (v.empty())
+            return;
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
-        ImGui::PushID(i++);
-        if (ImGui::Selectable(seg.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns))
-            app_jump(s, seg.start);
+        ImGui::TextDisabled("%s", label);
+        ImGui::TableNextColumn();
+        ImGui::PushID(label);
+        if (ImGui::Selectable(v.c_str()))
+            ImGui::SetClipboardText(v.c_str());
+        ImGui::SetItemTooltip("click to copy");
         ImGui::PopID();
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("%s", util::hex(seg.start).c_str());
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("%llX", (unsigned long long)seg.size());
-        ImGui::TableNextColumn();
-        ImGui::Text("%c%c%c", (seg.perms & perm_r) ? 'r' : '-', (seg.perms & perm_w) ? 'w' : '-', (seg.perms & perm_x) ? 'x' : '-');
+    };
+    if (ImGui::BeginTable("##hdr", 2, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch);
+        for (const file_info::row& r : fi.header) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", r.label.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextWrapped("%s", r.value.c_str());
+        }
+        copyable("md5", fi.md5);
+        copyable("sha256", fi.sha256);
+        copyable("imphash", fi.imphash);
+        for (const file_info::row& r : fi.version) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", r.label.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextWrapped("%s", r.value.c_str());
+        }
+        ImGui::EndTable();
     }
-    ImGui::EndTable();
+    ImGui::Spacing();
+    ImGui::TextDisabled("sections - entropy near 8 is compressed or encrypted");
+    if (ImGui::BeginTable("##secs", 5, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Name");
+        ImGui::TableSetupColumn("Address", 0, addr_w(db));
+        ImGui::TableSetupColumn("Size");
+        ImGui::TableSetupColumn("Access");
+        ImGui::TableSetupColumn("Entropy", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        int i = 0;
+        for (const file_info::section& sec : fi.sections) {
+            if (!util::icontains(sec.name, filter))
+                continue;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(i++);
+            if (ImGui::Selectable(sec.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) && db.bin.is_mapped(sec.addr))
+                app_jump(s, sec.addr);
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", util::hex(sec.addr).c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%llX", (unsigned long long)sec.size);
+            ImGui::TableNextColumn();
+            bool x = sec.perms.size() == 3 && sec.perms[2] == 'x', w = sec.perms.size() == 3 && sec.perms[1] == 'w';
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(x && w ? theme::log_error : theme::text), "%s", sec.perms.c_str());
+            ImGui::TableNextColumn();
+            // a small bar: how full of randomness it is
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float bw = ImGui::GetFontSize() * 4, h = ImGui::GetTextLineHeight();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(ImVec2(p.x, p.y + h * 0.3f), ImVec2(p.x + bw, p.y + h * 0.7f), theme::band_bg);
+            dl->AddRectFilled(ImVec2(p.x, p.y + h * 0.3f), ImVec2(p.x + bw * (float)(sec.entropy / 8.0), p.y + h * 0.7f),
+                sec.entropy > 7.2 ? theme::log_warn : theme::band_code);
+            ImGui::Dummy(ImVec2(bw, h));
+            ImGui::SameLine();
+            ImGui::TextDisabled("%.2f", sec.entropy);
+        }
+        ImGui::EndTable();
+    }
+    if (!fi.resources.empty()) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("resources - a click shows the bytes");
+        if (ImGui::BeginTable("##res", 4, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableSetupColumn("Type");
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Size");
+            ImGui::TableSetupColumn("What", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            int i = 0;
+            for (const file_info::resource& r : fi.resources) {
+                if (!util::icontains(r.type + " " + r.name, filter))
+                    continue;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::PushID(i++);
+                if (ImGui::Selectable(r.type.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    // the file offset back to where the section maps it
+                    for (const file_info::section& sec : fi.sections)
+                        if (r.file_off >= sec.file_off && r.file_off < sec.file_off + sec.file_size) {
+                            s.hex_process = false;
+                            s.hex_live = false;
+                            s.hex_addr = sec.addr + (r.file_off - sec.file_off);
+                            s.bottom_tab_request = 1;
+                            s.show_bottom = true;
+                        }
+                }
+                ImGui::PopID();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(r.name.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%llu", (unsigned long long)r.size);
+                ImGui::TableNextColumn();
+                std::string what = r.note.empty() ? util::fmt("entropy %.2f", r.entropy) : r.note;
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(what.find("program") != std::string::npos ? theme::log_warn : theme::text),
+                    "%s", what.c_str());
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::EndChild();
 }
 
 static void xrefs(app_state& s)
@@ -294,8 +394,9 @@ void draw(app_state& s)
             strings(s, str_idx);
             ImGui::EndTabItem();
         }
-        if (tab("Segments", 3)) {
-            segments(s, filter);
+        std::string file_label = std::string(db.info.warnings.empty() ? "File" : "File (!)") + "###file";
+        if (tab(file_label.c_str(), 3)) {
+            file_tab(s, filter);
             ImGui::EndTabItem();
         }
         if (tab("Xrefs", 4)) {

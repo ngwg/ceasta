@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ceasta VERSION 0.6.0 LANGUAGES C CXX)
+project(ceasta VERSION 0.11.0 LANGUAGES C CXX)
 
 # ceasta: disassembler + debugger.
 #   core (loaders, analysis, lua, debugger) builds everywhere, the gui is windows / directx 11.
@@ -32,10 +32,11 @@ find_package(Threads REQUIRED)
 
 file(GLOB capstone_sources CONFIGURE_DEPENDS
     third_party/capstone/*.c
-    third_party/capstone/arch/X86/*.c)
+    third_party/capstone/arch/X86/*.c
+    third_party/capstone/arch/AArch64/*.c)
 add_library(capstone STATIC ${capstone_sources})
 target_include_directories(capstone PUBLIC third_party/capstone/include PRIVATE third_party/capstone)
-target_compile_definitions(capstone PUBLIC CAPSTONE_HAS_X86 CAPSTONE_USE_SYS_DYN_MEM)
+target_compile_definitions(capstone PUBLIC CAPSTONE_HAS_X86 CAPSTONE_HAS_ARM64 CAPSTONE_USE_SYS_DYN_MEM)
 
 file(GLOB lua_sources CONFIGURE_DEPENDS third_party/lua/*.c)
 # compiled as c++ so lua errors are exceptions that unwind c++ frames (not longjmp)
@@ -75,20 +76,28 @@ endfunction()
 add_library(ceasta_core STATIC
     src/core/analysis.cpp
     src/core/binary.cpp
+    src/core/bp_cond.cpp
     src/core/database.cpp
+    src/core/dbg_stack.cpp
     src/core/dbg_trace.cpp
     src/core/debugger.cpp
     src/core/debugger_linux.cpp
+    src/core/debugger_steps.cpp
     src/core/decompiler.cpp
     src/core/diff.cpp
     src/core/disasm.cpp
     src/core/elf.cpp
+    src/core/exchange.cpp
+    src/core/fileinfo.cpp
     src/core/json.cpp
+    src/core/kuna.cpp
     src/core/lua_host.cpp
     src/core/mcp.cpp
     src/core/mcp_transport.cpp
     src/core/os.cpp
     src/core/pe.cpp
+    src/core/process.cpp
+    src/core/protos.cpp
     src/core/search.cpp
     src/core/signatures.cpp)
 target_include_directories(ceasta_core PUBLIC src)
@@ -112,6 +121,7 @@ set(ui_sources
     src/ui/graph_view.cpp
     src/ui/ida_view.cpp
     src/ui/left_panel.cpp
+    src/ui/palette.cpp
     src/ui/pseudo_view.cpp
     src/ui/right_panel.cpp
     src/ui/status_bar.cpp
