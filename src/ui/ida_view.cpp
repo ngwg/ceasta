@@ -6,6 +6,7 @@
 #include "ui/graph_view.h"
 #include "ui/pseudo_view.h"
 #include "widgets/nav_band.h"
+#include "widgets/splitter.h"
 #include <algorithm>
 
 namespace ida_view {
@@ -164,7 +165,9 @@ static void listing(app_state& s)
     float x_gutter = ImGui::GetStyle().WindowPadding.x;
     float x_addr = x_gutter + cw * 2.5f;
     float x_bytes = x_addr + cw * (float)(seg_len + 1 + db.fmt_addr(0).size() + 2);
-    float x_text = x_bytes + (s.show_bytes ? cw * 26 : 0.0f);
+    // opcode bytes only when there's room for them (not in a narrow side by side listing)
+    bool bytes = s.show_bytes && ImGui::GetContentRegionAvail().x > cw * 100;
+    float x_text = x_bytes + (bytes ? cw * 26 : 0.0f);
 
     uint64_t pc = 0;
     bool has_pc = app_pc_static(s, pc);
@@ -228,7 +231,7 @@ static void listing(app_state& s)
             float base_x = p.x - ImGui::GetStyle().WindowPadding.x;
             if (!t.addr.empty())
                 dl->AddText(ImVec2(base_x + x_addr, p.y), theme::addr, t.addr.c_str());
-            if (s.show_bytes && !t.bytes.empty())
+            if (bytes && !t.bytes.empty())
                 dl->AddText(ImVec2(base_x + x_bytes, p.y), theme::bytes, t.bytes.c_str());
             float tx = base_x + x_text + ((r.kind == row_kind::func || r.kind == row_kind::label || r.kind == row_kind::seg) ? 0.0f : cw * 2);
             if (!t.text.empty())
@@ -295,17 +298,18 @@ static void header(app_state& s)
     } else {
         ImGui::TextDisabled("%s", db.location(s.cursor).c_str());
     }
-    // the view switch: three small tabs on the right
-    static const char* const names[] = {"Listing", "Graph", "Pseudocode"};
-    static const char* const keys[] = {"Space switches listing / graph", "Space switches listing / graph", "F5"};
-    static const center_view views[] = {center_view::listing, center_view::graph, center_view::pseudo};
+    // the view switch: small tabs on the right
+    static const char* const names[] = {"Listing", "Graph", "Pseudocode", "Both"};
+    static const char* const keys[] = {"Space switches listing / graph", "Space switches listing / graph", "F5",
+                                       "listing and pseudocode side by side (Shift+F5)"};
+    static const center_view views[] = {center_view::listing, center_view::graph, center_view::pseudo, center_view::split};
     ImGuiStyle& st = ImGui::GetStyle();
     float bw = st.ItemSpacing.x * 2;
     for (const char* n : names)
         bw += ImGui::CalcTextSize(n).x + st.FramePadding.x * 2 + 2;
     float right = ImGui::GetWindowWidth() - st.WindowPadding.x;
     ImGui::SameLine(std::max(ImGui::GetCursorPosX(), right - bw));
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         bool on = s.view == views[i];
         ImGui::PushStyleColor(ImGuiCol_Button, on ? ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive) : ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(on ? ImGuiCol_Text : ImGuiCol_TextDisabled));
@@ -313,7 +317,7 @@ static void header(app_state& s)
             s.view = views[i];
         ImGui::PopStyleColor(2);
         ImGui::SetItemTooltip("%s", keys[i]);
-        if (i < 2)
+        if (i < 3)
             ImGui::SameLine(0, 2);
     }
 }
@@ -330,12 +334,28 @@ void draw(app_state& s)
         return;
     }
     header(s);
-    if (s.view == center_view::graph)
+    if (s.view == center_view::graph) {
         graph_view::draw(s);
-    else if (s.view == center_view::pseudo)
+    } else if (s.view == center_view::pseudo) {
         pseudo_view::draw(s);
-    else
+    } else if (s.view == center_view::split) {
+        // the listing on the left, the pseudocode on the right: a click in one moves the other
+        float total = ImGui::GetContentRegionAvail().x;
+        float w = std::max(120.0f, std::min(total - 120.0f, total * s.split_w));
+        ImGui::BeginChild("##split_l", ImVec2(w, 0));
         listing(s);
+        ImGui::EndChild();
+        ImGui::SameLine(0, 0);
+        float px = w;
+        if (widgets::splitter("##split", true, 6.0f, ImGui::GetContentRegionAvail().y, &px, 120.0f, total - 120.0f, 1.0f, 1.0f))
+            s.split_w = px / std::max(1.0f, total);
+        ImGui::SameLine(0, 0);
+        ImGui::BeginChild("##split_r", ImVec2(0, 0));
+        pseudo_view::draw(s);
+        ImGui::EndChild();
+    } else {
+        listing(s);
+    }
 }
 
 }

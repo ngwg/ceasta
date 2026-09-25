@@ -98,6 +98,8 @@ static void view_menu(app_state& s)
         s.view = center_view::graph;
     if (ImGui::MenuItem("Pseudocode", "F5", s.view == center_view::pseudo))
         s.view = center_view::pseudo;
+    if (ImGui::MenuItem("Listing and pseudocode", "Shift+F5", s.view == center_view::split))
+        s.view = center_view::split;
     ImGui::Separator();
     ImGui::MenuItem("Functions panel", nullptr, &s.show_left);
     ImGui::MenuItem("Info and CPU panels", nullptr, &s.show_right);

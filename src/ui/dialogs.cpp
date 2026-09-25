@@ -1,5 +1,6 @@
 #include "ui/dialogs.h"
 #include "ui/palette.h"
+#include "core/decompiler.h"
 #include "core/util.h"
 #include "imgui.h"
 #include "theme.h"
@@ -30,6 +31,9 @@ static const char* title(dialog_kind k)
     case dialog_kind::bookmarks: return "Bookmarks###dlg";
     case dialog_kind::bp_condition: return "Breakpoint condition###dlg";
     case dialog_kind::watch: return "Watch memory###dlg";
+    case dialog_kind::lvar_name: return "Rename variable###dlg";
+    case dialog_kind::lvar_type: return "Variable type###dlg";
+    case dialog_kind::proto: return "Function prototype###dlg";
     default: return "###dlg";
     }
 }
@@ -38,7 +42,8 @@ static bool needs_file(dialog_kind k)
 {
     return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
            k == dialog_kind::search || k == dialog_kind::find || k == dialog_kind::bookmarks ||
-           k == dialog_kind::bp_condition || k == dialog_kind::watch;
+           k == dialog_kind::bp_condition || k == dialog_kind::watch || k == dialog_kind::lvar_name ||
+           k == dialog_kind::lvar_type || k == dialog_kind::proto;
 }
 
 void open(app_state& s, dialog_kind kind, uint64_t addr)
@@ -86,6 +91,22 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
         snprintf(d.buf, sizeof(d.buf), "%s", n.empty() ? db.fmt_addr(head).c_str() : n.c_str());
         uint32_t size = db.an.item_size(head);
         d.watch_size = (size == 1 || size == 2 || size == 4 || size == 8) && head % size == 0 ? (int)size : head % 4 ? 1 : 4;
+    } else if (kind == dialog_kind::proto) {
+        // what the function looks like now: its prototype, else the decompiler's signature
+        const function* fn = db.an.func_containing(addr);
+        if (fn)
+            d.addr = addr = fn->start;
+        auto p = db.protos.find(addr);
+        std::string sig;
+        if (p != db.protos.end()) {
+            prototype pr = p->second;
+            pr.name = db.name_at(addr).empty() ? pr.name : db.name_at(addr);
+            sig = format_prototype(pr);
+        } else {
+            decompiled dc = decompile(db, addr);
+            sig = dc.ok && !dc.lines.empty() ? dc.lines[0].text : "int " + db.location(addr) + "(void)";
+        }
+        snprintf(d.buf, sizeof(d.buf), "%s", sig.c_str());
     } else if (kind == dialog_kind::find) {
         snprintf(d.buf, sizeof(d.buf), "%s", s.search_text.c_str());
     } else if (kind == dialog_kind::run_args) {
@@ -581,6 +602,70 @@ static void watch(app_state& s, dialog_state& d)
     }
 }
 
+// a variable of the pseudocode: its name, or its type (d.key is the variable, d.addr the function)
+static void lvar(app_state& s, dialog_state& d)
+{
+    bool type = d.kind == dialog_kind::lvar_type;
+    database& db = *s.db;
+    auto f = db.lvars.find(d.addr);
+    database::lvar cur;
+    if (f != db.lvars.end() && f->second.count(d.key))
+        cur = f->second.at(d.key);
+    ImGui::Text(type ? "type of %s" : "new name for %s", cur.name.empty() ? d.key.c_str() : cur.name.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("in %s", db.location(d.addr).c_str());
+    ImGui::TextDisabled(type ? "int, char*, DWORD, struct header*, char[16]. empty goes back to the automatic type"
+                             : "empty goes back to its automatic name (%s)", d.key.c_str());
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28);
+    bool enter = ImGui::InputText("##lv", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    if (ok_cancel() || enter) {
+        std::string err, v = util::trim(d.buf);
+        if (!type && v == d.key)
+            v.clear(); // its own name: nothing to keep
+        if (db.set_lvar(d.addr, d.key, type ? cur.name : v, type ? v : cur.type, err)) {
+            app_names_changed(s);
+            s.pseudo_word = type || v.empty() ? s.pseudo_word : v;
+            ImGui::CloseCurrentPopup();
+        } else {
+            d.error = err;
+        }
+    }
+}
+
+// a function's prototype: return type, name and parameters
+static void proto(app_state& s, dialog_state& d)
+{
+    ImGui::Text("prototype of %s", s.db->location(d.addr).c_str());
+    ImGui::TextDisabled("return type, name, parameters: int check(char* key, int len). a new name renames the function,");
+    ImGui::TextDisabled("and its callers show the arguments it takes");
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 40);
+    bool enter = ImGui::InputText("##proto", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    ImGui::Spacing();
+    float bw = ImGui::GetFontSize() * 7;
+    bool ok = ImGui::Button("OK", ImVec2(bw, 0)) || enter;
+    ImGui::SameLine();
+    bool reset = ImGui::Button("Automatic", ImVec2(bw, 0));
+    ImGui::SetItemTooltip("forget this prototype: the decompiler works it out again");
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(bw, 0)))
+        ImGui::CloseCurrentPopup();
+    if (ok || reset) {
+        std::string err;
+        if (s.db->set_proto(d.addr, reset ? std::string() : std::string(d.buf), err)) {
+            app_names_changed(s);
+            ImGui::CloseCurrentPopup();
+        } else {
+            d.error = err;
+        }
+    }
+}
+
 // the bookmarks: pick one to jump there; a note per bookmark; delete removes it
 static void bookmarks(app_state& s, dialog_state& d)
 {
@@ -736,13 +821,15 @@ static void shortcuts(app_state&, dialog_state&)
         {"N", "rename"},                    {";", "comment"},
         {"Ctrl+Z / Ctrl+Y", "undo / redo"},  {"Alt+M / Ctrl+M", "bookmark / bookmarks"},
         {"X", "references to here"},        {"Space", "listing / graph"},
-        {"F5", "pseudocode (decompiler)"},  {"Ctrl+F", "search names, imports, strings, ..."},
+        {"F5", "pseudocode (decompiler)"},  {"Shift+F5", "listing and pseudocode side by side"},
+        {"N (pseudocode)", "rename the name you clicked"}, {"Y (pseudocode)", "its type / the function's prototype"},
+        {"Ctrl+F", "search names, imports, strings, ..."},
         {"Alt+B", "search bytes"},
         {"Up / Down / PgUp / PgDn", "move in the listing"},
         {"F9", "start debugging / continue"}, {"F7", "step into"},
         {"F8", "step over"},                {"F4", "run to cursor"},
         {"Ctrl+F9", "step out (run until return)"}, {"Shift+F7", "step back (undo a step)"},
-        {"F2", "toggle breakpoint"},        {"F12", "pause"},
+        {"F2", "toggle breakpoint (on a variable: watch it)"}, {"F12", "pause"},
         {"Shift+F2", "breakpoint condition"},
         {"Ctrl+F2", "stop debugging"},      {"Ctrl+= / Ctrl+- / Ctrl+0", "text size"},
         {"Ctrl+wheel (graph)", "zoom"},     {"drag (graph)", "pan"},
@@ -812,6 +899,9 @@ void draw(app_state& s)
         case dialog_kind::bookmarks: bookmarks(s, d); break;
         case dialog_kind::bp_condition: bp_condition(s, d); break;
         case dialog_kind::watch: watch(s, d); break;
+        case dialog_kind::lvar_name:
+        case dialog_kind::lvar_type: lvar(s, d); break;
+        case dialog_kind::proto: proto(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

@@ -265,9 +265,11 @@ void add_read_tools(std::vector<tool>& t)
         });
 
     add("decompile_function",
-        "C-like pseudocode for the function at or containing an address or name. Registers stand in for "
-        "variables (rdi, rsi, ... are the arguments on system v; rcx, rdx, r8, r9 on windows), there are no types "
-        "yet, and memory reads look like *(int*)(rdi + 8). Check the disassembly when something looks off.",
+        "C-like pseudocode for the function at or containing an address or name. Stack variables are local_1c "
+        "(0x1c below the return address) and arg_0, arg_4 (stack arguments); registers stand in for the other "
+        "values (rdi, rsi, ... are the arguments on system v; rcx, rdx, r8, r9 on windows). Calls to well-known "
+        "functions (windows api, libc) get their real arguments. rename_variable, set_variable_type and "
+        "set_function_prototype make it read better. Check the disassembly when something looks off.",
         schema({{"function", prop("string", "name or address of the function, or any address inside it")}},
                {"function"}),
         [](mcp_server& s, const json::value& args, std::string& out) {
@@ -675,6 +677,130 @@ void add_edit_tools(std::vector<tool>& t)
         return true;
     };
     t.push_back(std::move(cm));
+
+    // the pseudocode's variables and prototypes
+    auto func_of = [](database& db, const json::value& args, uint64_t& f, std::string& out) {
+        uint64_t a = 0;
+        if (!arg_addr(db, args, "function", a, out))
+            return false;
+        const function* fn = db.an.func_containing(a);
+        if (!fn) {
+            out = "no function at " + hexa(a);
+            return false;
+        }
+        f = fn->start;
+        return true;
+    };
+    // a variable by the name the pseudocode shows now (or its automatic name)
+    auto var_key = [](database& db, uint64_t f, const std::string& name, std::string& key, std::string& out) {
+        decompiled d = decompile(db, f);
+        for (const decomp_var& v : d.vars)
+            if (v.name == name || v.key == name) {
+                key = v.key;
+                return true;
+            }
+        std::string all;
+        for (const decomp_var& v : d.vars)
+            all += (all.empty() ? "" : ", ") + v.name;
+        out = "no variable " + name + " in " + db.location(f) + (all.empty() ? std::string() : " (it has: " + all + ")");
+        return false;
+    };
+
+    tool rv;
+    rv.name = "rename_variable";
+    rv.description =
+        "Rename a variable in a function's pseudocode: a parameter (rdi, arg_0), a stack variable (local_1c) or a "
+        "register the code keeps a value in (rax). Use the name decompile_function shows. Saved with the project; "
+        "an empty name goes back to the automatic one.";
+    rv.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"variable", prop("string", "the variable as the pseudocode shows it")},
+                        {"name", prop("string", "the new name")}},
+                       {"function", "variable", "name"});
+    rv.writes = true;
+    rv.run = [func_of, var_key](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        std::string key, err;
+        if (!db || !func_of(*db, args, f, out) || !var_key(*db, f, util::trim(arg_str(args, "variable")), key, out))
+            return false;
+        std::string type;
+        auto it = db->lvars.find(f);
+        if (it != db->lvars.end() && it->second.count(key))
+            type = it->second.at(key).type;
+        std::string name = util::trim(arg_str(args, "name"));
+        if (!db->set_lvar(f, key, name == key ? std::string() : name, type, err)) {
+            out = "can't rename it: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = "renamed " + arg_str(args, "variable") + " to " + (name.empty() ? key : name) + " in " + db->location(f);
+        return true;
+    };
+    t.push_back(std::move(rv));
+
+    tool vt;
+    vt.name = "set_variable_type";
+    vt.description =
+        "Give a variable of a function's pseudocode a type (int, char*, DWORD, struct header*, char[16]). The "
+        "declaration and the signature show it. Empty goes back to the automatic type.";
+    vt.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"variable", prop("string", "the variable as the pseudocode shows it")},
+                        {"type", prop("string", "the c type")}},
+                       {"function", "variable", "type"});
+    vt.writes = true;
+    vt.run = [func_of, var_key](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        std::string key, err;
+        if (!db || !func_of(*db, args, f, out) || !var_key(*db, f, util::trim(arg_str(args, "variable")), key, out))
+            return false;
+        std::string name;
+        auto it = db->lvars.find(f);
+        if (it != db->lvars.end() && it->second.count(key))
+            name = it->second.at(key).name;
+        if (!db->set_lvar(f, key, name, util::trim(arg_str(args, "type")), err)) {
+            out = "can't set the type: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = "set the type of " + arg_str(args, "variable") + " in " + db->location(f);
+        return true;
+    };
+    t.push_back(std::move(vt));
+
+    tool fp;
+    fp.name = "set_function_prototype";
+    fp.description =
+        "Set a function's prototype in c: \"int check_key(const char* key, int len)\". Its parameters take those "
+        "names and types in its pseudocode, a new name renames the function, and calls to it get that many "
+        "arguments. An empty prototype goes back to what the decompiler works out.";
+    fp.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"prototype", prop("string", "return type, name, parameters")}},
+                       {"function", "prototype"});
+    fp.writes = true;
+    fp.run = [func_of](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        std::string err;
+        if (!db || !func_of(*db, args, f, out))
+            return false;
+        if (!db->set_proto(f, arg_str(args, "prototype"), err)) {
+            out = "can't set it: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        auto p = db->protos.find(f);
+        out = p == db->protos.end() ? "removed the prototype of " + db->location(f)
+                                    : "prototype of " + db->location(f) + ": " + format_prototype(p->second);
+        return true;
+    };
+    t.push_back(std::move(fp));
 
     tool sp;
     sp.name = "save_project";
@@ -1674,7 +1800,8 @@ json::value mcp_server::dispatch(const json::value& msg)
         r["instructions"] =
             "ceasta is a reverse engineering tool. These tools inspect the binary the user has open: "
             "decompile_function and disassemble to read code, list_functions / list_strings / get_xrefs_to to "
-            "navigate, and rename / set_comment to record what you learn. Start with get_binary_info.";
+            "navigate, and rename / set_comment / rename_variable / set_function_prototype to record what you learn. "
+            "Start with get_binary_info.";
         return rpc_result(id, std::move(r));
     }
     if (method == "notifications/initialized" || method == "notifications/cancelled")

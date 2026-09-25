@@ -38,10 +38,10 @@ struct load_job {
     std::string path;
 };
 
-enum class center_view { listing, graph, pseudo };
+enum class center_view { listing, graph, pseudo, split }; // split: listing and pseudocode side by side
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai, palette, bookmarks, bp_condition, watch };
+    save_changes, ai, palette, bookmarks, bp_condition, watch, lvar_name, lvar_type, proto };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
@@ -68,6 +68,7 @@ struct dialog_state {
     int run_action = -1;  // palette: the action to run once it has closed
     int watch_size = 4;   // watch: bytes, and whether reads stop too
     bool watch_access = false;
+    std::string key;      // lvar_name / lvar_type: the variable (its decompiler name), addr the function
 };
 
 struct app_state {
@@ -110,6 +111,10 @@ struct app_state {
     std::vector<std::string> console_history;
     int history_pos = -1;
     bool focus_console = false;
+    std::string pseudo_word;  // the name clicked in the pseudocode (n / y / enter act on it)
+    int pseudo_line = -1;
+    bool pseudo_focus = false;
+    float split_w = 0.5f;     // the listing's share of the side by side view
     uint64_t hex_addr = 0;
     bool hex_follow = true;
     bool hex_live = false;

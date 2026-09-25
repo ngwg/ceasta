@@ -8,6 +8,7 @@
 #include "ui/dialogs.h"
 #include "ui/ida_view.h"
 #include "ui/left_panel.h"
+#include "ui/pseudo_view.h"
 #include "ui/right_panel.h"
 #include "ui/status_bar.h"
 #include "ui/top_bar.h"
@@ -229,7 +230,8 @@ static void finish_job(app_state& s)
     s.cursor = b.has_entry ? b.entry : b.min_addr();
     if (s.db->saved_cursor && b.is_mapped(s.db->saved_cursor)) { // where you were when it was saved
         s.cursor = s.db->saved_cursor;
-        s.view = s.db->saved_view == 1 ? center_view::graph : s.db->saved_view == 2 ? center_view::pseudo : center_view::listing;
+        s.view = s.db->saved_view == 1 ? center_view::graph : s.db->saved_view == 2 ? center_view::pseudo
+               : s.db->saved_view == 3 ? center_view::split : center_view::listing;
     }
     s.hex_addr = s.cursor;
     s.scroll_to_cursor = true;
@@ -251,7 +253,7 @@ static void finish_job(app_state& s)
 static void stash_view(app_state& s)
 {
     s.db->saved_cursor = s.cursor;
-    s.db->saved_view = s.view == center_view::graph ? 1 : s.view == center_view::pseudo ? 2 : 0;
+    s.db->saved_view = s.view == center_view::graph ? 1 : s.view == center_view::pseudo ? 2 : s.view == center_view::split ? 3 : 0;
 }
 
 void app_save(app_state& s)
@@ -1092,19 +1094,24 @@ static void shortcuts(app_state& s)
     // ida style keys, only when not typing
     if (plain_key(ImGuiKey_G))
         dialogs::open(s, dialog_kind::jump, s.cursor);
-    if (plain_key(ImGuiKey_N))
+    // in the pseudocode, n / y / enter work on the name you clicked
+    if (plain_key(ImGuiKey_N) && !(s.pseudo_focus && pseudo_view::rename_selected(s)))
         dialogs::open(s, dialog_kind::rename, s.cursor);
+    if (plain_key(ImGuiKey_Y) && s.pseudo_focus)
+        pseudo_view::retype_selected(s);
     if (plain_key(ImGuiKey_Semicolon))
         dialogs::open(s, dialog_kind::comment, s.cursor);
     if (plain_key(ImGuiKey_X))
         dialogs::open(s, dialog_kind::xrefs, s.cursor);
     if (plain_key(ImGuiKey_Space))
         s.view = s.view == center_view::listing ? center_view::graph : center_view::listing;
-    if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F5))
+        s.view = s.view == center_view::split ? center_view::listing : center_view::split;
+    else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F5, false))
         s.view = s.view == center_view::pseudo ? center_view::listing : center_view::pseudo;
     if (plain_key(ImGuiKey_Escape))
         app_back(s);
-    if (plain_key(ImGuiKey_Enter) || plain_key(ImGuiKey_KeypadEnter))
+    if ((plain_key(ImGuiKey_Enter) || plain_key(ImGuiKey_KeypadEnter)) && !(s.pseudo_focus && pseudo_view::follow_selected(s)))
         app_follow(s, s.cursor);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Enter) || ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_RightArrow))
         app_forward(s);
