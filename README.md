@@ -52,7 +52,7 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 |------|----------|--------------|
 | `ceasta-x.y.z-setup.exe` | windows 10/11 x64 | the full app, installs for your user (no admin), start menu + optional "open with ceasta" |
 | `ceasta-x.y.z-windows-x64.zip` | windows x64 | the full app, portable — unzip and run `ceasta.exe` |
-| `ceasta-cli-x.y.z-linux-x64.tar.gz` | linux x64 | `ceasta-cli` + plugins: analysis, disassembly, decompiler, scripting, terminal debugger ([on linux](#on-linux)) |
+| `ceasta-cli-x.y.z-linux-x64.tar.gz` | linux x64 | `ceasta-cli` + plugins: analysis, disassembly, decompiler, scripting, terminal debugger, binary diff, signatures, and the [MCP server](docs/mcp.md) ([on linux](#on-linux)) |
 
 ## what it does
 
