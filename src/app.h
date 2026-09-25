@@ -2,6 +2,7 @@
 #include "core/database.h"
 #include "core/debugger.h"
 #include "core/lua_host.h"
+#include "core/search.h"
 #include "theme.h"
 #include <atomic>
 #include <cstdint>
@@ -35,7 +36,7 @@ struct load_job {
 
 enum class center_view { listing, graph, pseudo };
 
-enum class dialog_kind { none, jump, rename, comment, xrefs, search, open_raw, attach, run_args, about, shortcuts };
+enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts };
 
 struct dialog_state {
     dialog_kind kind = dialog_kind::none;
@@ -48,6 +49,14 @@ struct dialog_state {
     char raw_base[32] = "0";
     std::vector<process_info> procs;
     char filter[128] = {};
+    // search everything (find): the hits for the query / kinds / version they were made for
+    std::vector<search_hit> hits;
+    std::string hits_query;
+    unsigned hits_kinds = 0;
+    uint64_t hits_version = ~0ull;
+    bool hits_cut = false;
+    int sel = 0;
+    bool refocus = false;
 };
 
 struct app_state {
@@ -81,6 +90,8 @@ struct app_state {
     int bottom_tab_request = -1;
     char func_filter[128] = {};
     char info_filter[128] = {};
+    std::string search_text;         // the last search everything query (ctrl+f)
+    unsigned search_kinds = sk_all;
     std::vector<log_line> log;
     bool log_to_bottom = true;
     char console[1024] = {};
@@ -95,6 +106,11 @@ struct app_state {
 
     // debugger
     std::string debug_args;
+    int step_count = 1;        // instructions per step: f7 / f8 and the step buttons use it
+    int steps_left = 0;        // a multi-instruction step in progress (run a batch per frame)
+    int steps_done = 0;
+    bool step_over_mode = false;
+    bool step_in_flight = false;
     bool dbg_mapped = false;   // runtime addresses of the main image map onto the listing
     uint64_t dbg_delta = 0;    // runtime base - static base
     uint64_t dbg_image_size = 0;
@@ -145,6 +161,7 @@ void dbg_attach(app_state& s, uint32_t pid);
 void dbg_continue(app_state& s);
 void dbg_step_into(app_state& s);
 void dbg_step_over(app_state& s);
+bool dbg_stepping(const app_state& s); // a multi-instruction step is still going
 void dbg_run_to_cursor(app_state& s);
 void dbg_pause(app_state& s);
 void dbg_stop(app_state& s);

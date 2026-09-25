@@ -3,6 +3,7 @@
 #include "core/util.h"
 #include "imgui.h"
 #include "ui/dialogs.h"
+#include <algorithm>
 
 namespace top_bar {
 
@@ -46,6 +47,8 @@ static void edit_menu(app_state& s)
     if (ImGui::MenuItem("Comment...", ";", false, has))
         dialogs::open(s, dialog_kind::comment, s.cursor);
     ImGui::Separator();
+    if (ImGui::MenuItem("Search...", "Ctrl+F", false, has))
+        dialogs::open(s, dialog_kind::find, s.cursor);
     if (ImGui::MenuItem("Search bytes...", "Alt+B", false, has))
         dialogs::open(s, dialog_kind::search, s.cursor);
     if (ImGui::MenuItem("Copy address", nullptr, false, has))
@@ -120,10 +123,16 @@ static void debug_menu(app_state& s)
         dbg_continue(s);
     if (!can && st == dbg_state::none)
         ImGui::SetItemTooltip("%s", why.c_str());
-    if (ImGui::MenuItem("Step into", "F7", false, st == dbg_state::stopped))
+    bool can_step = st == dbg_state::stopped && !dbg_stepping(s);
+    std::string times = s.step_count > 1 ? util::fmt(" x%d", s.step_count) : std::string();
+    if (ImGui::MenuItem(("Step into" + times).c_str(), "F7", false, can_step))
         dbg_step_into(s);
-    if (ImGui::MenuItem("Step over", "F8", false, st == dbg_state::stopped))
+    if (ImGui::MenuItem(("Step over" + times).c_str(), "F8", false, can_step))
         dbg_step_over(s);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 7);
+    if (ImGui::InputInt("instructions per step", &s.step_count, 1, 10))
+        s.step_count = std::min(100000, std::max(1, s.step_count));
+    ImGui::SetItemTooltip("F7 / F8 run this many instructions at once");
     if (ImGui::MenuItem("Run to cursor", "F4", false, st == dbg_state::stopped && s.dbg_mapped))
         dbg_run_to_cursor(s);
     if (ImGui::MenuItem("Pause", "F12", false, st == dbg_state::running))
@@ -212,6 +221,9 @@ static void toolbar(app_state& s)
     if (tool("Jump", "jump to an address or name (G)", has))
         dialogs::open(s, dialog_kind::jump, s.cursor);
     ImGui::SameLine();
+    if (tool("Search", "search functions, names, imports, exports, strings and comments (Ctrl+F)", has))
+        dialogs::open(s, dialog_kind::find, s.cursor);
+    ImGui::SameLine();
     const char* view_label = s.view == center_view::listing ? "Graph" : "Listing";
     if (tool(view_label, "switch between the listing and the function graph (Space)", has))
         s.view = s.view == center_view::listing ? center_view::graph : center_view::listing;
@@ -224,11 +236,19 @@ static void toolbar(app_state& s)
             (ds == dbg_state::none && can) || ds == dbg_state::stopped))
         dbg_continue(s);
     ImGui::SameLine();
-    if (tool("Step in", "step into (F7)", ds == dbg_state::stopped))
+    bool can_step = ds == dbg_state::stopped && !dbg_stepping(s);
+    std::string times = s.step_count > 1 ? util::fmt(" x%d", s.step_count) : std::string();
+    if (tool(("Step in" + times + "###step_in").c_str(), "step into (F7)", can_step))
         dbg_step_into(s);
     ImGui::SameLine();
-    if (tool("Step over", "step over (F8)", ds == dbg_state::stopped))
+    if (tool(("Step over" + times + "###step_over").c_str(), "step over (F8)", can_step))
         dbg_step_over(s);
+    ImGui::SameLine(0, 2);
+    // how many instructions one step runs
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8.0f);
+    if (ImGui::InputInt("##step_count", &s.step_count, 1, 10))
+        s.step_count = std::min(100000, std::max(1, s.step_count));
+    ImGui::SetItemTooltip("instructions per step: F7 / F8 and the step buttons run this many at once");
     ImGui::SameLine();
     if (tool("Pause", "break into the running program (F12)", ds == dbg_state::running))
         dbg_pause(s);

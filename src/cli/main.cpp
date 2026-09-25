@@ -3,6 +3,7 @@
 #include "core/database.h"
 #include "core/diff.h"
 #include "core/os.h"
+#include "core/search.h"
 #include "core/signatures.h"
 #include "core/decompiler.h"
 #include "core/lua_host.h"
@@ -33,6 +34,8 @@ static void usage()
            "  graph <file> <where>          basic blocks and edges of a function\n"
            "  xrefs <file> <where>          references to an address\n"
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
+           "  search <file> <text>          find text in functions, names, imports, exports, strings,\n"
+           "                                comments and segments\n"
            "  diff <old> <new>              match functions between two files, show what changed\n"
            "  export <file>                 write a committable project file (<file>.ceasta)\n"
            "  sigmake <file> [out.sig]      make library signatures from a file that has symbols\n"
@@ -410,6 +413,27 @@ int main(int argc, char** argv)
         }
         for (uint64_t a : db.find_bytes(args[2], 0, 1000))
             printf("%s  %s\n", db.fmt_addr(a).c_str(), db.location(a).c_str());
+        return 0;
+    }
+    if (cmd == "search") {
+        if (args.size() < 3) {
+            usage();
+            return 2;
+        }
+        bool cut = false;
+        std::vector<search_hit> hits = search_everything(db, args[2], sk_all, 200, &cut);
+        for (const search_hit& h : hits) {
+            std::string at = h.addr || h.kind != hit_kind::export_ ? db.fmt_addr(h.addr)
+                                                                   : util::fmt("%-*s", (int)db.fmt_addr(0).size(), "forward");
+            printf("%-8s  %s  %s%s%s\n", hit_kind_name(h.kind), at.c_str(), h.text.c_str(), h.extra.empty() ? "" : "    ",
+                h.extra.c_str());
+        }
+        if (cut)
+            printf("(there are more: this shows up to 200 of each kind)\n");
+        if (hits.empty()) {
+            fprintf(stderr, "nothing matches \"%s\"\n", args[2].c_str());
+            return 1;
+        }
         return 0;
     }
     if (cmd == "export") {

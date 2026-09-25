@@ -3,6 +3,7 @@
 #include "imgui.h"
 #include "theme.h"
 #include "version.h"
+#include <algorithm>
 #include <cstring>
 
 namespace dialogs {
@@ -15,6 +16,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::comment: return "Comment###dlg";
     case dialog_kind::xrefs: return "References###dlg";
     case dialog_kind::search: return "Search bytes###dlg";
+    case dialog_kind::find: return "Search###dlg";
     case dialog_kind::open_raw: return "Open as raw code###dlg";
     case dialog_kind::attach: return "Attach to process###dlg";
     case dialog_kind::run_args: return "Program arguments###dlg";
@@ -24,11 +26,15 @@ static const char* title(dialog_kind k)
     }
 }
 
+static bool needs_file(dialog_kind k)
+{
+    return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
+           k == dialog_kind::search || k == dialog_kind::find;
+}
+
 void open(app_state& s, dialog_kind kind, uint64_t addr)
 {
-    bool needs_file = kind == dialog_kind::jump || kind == dialog_kind::rename || kind == dialog_kind::comment ||
-                      kind == dialog_kind::xrefs || kind == dialog_kind::search;
-    if (needs_file && !s.db)
+    if (needs_file(kind) && !s.db)
         return;
     dialog_state& d = s.dialog;
     d = dialog_state();
@@ -56,6 +62,8 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
             if (f)
                 d.addr = f->start;
         }
+    } else if (kind == dialog_kind::find) {
+        snprintf(d.buf, sizeof(d.buf), "%s", s.search_text.c_str());
     } else if (kind == dialog_kind::run_args) {
         snprintf(d.buf, sizeof(d.buf), "%s", s.debug_args.c_str());
     } else if (kind == dialog_kind::attach) {
@@ -216,6 +224,134 @@ static void search(app_state& s, dialog_state& d)
         ImGui::CloseCurrentPopup();
 }
 
+// up / down in the search box move the selection instead of the keyboard focus
+static int find_keys(ImGuiInputTextCallbackData* cb)
+{
+    int* move = (int*)cb->UserData;
+    if (cb->EventFlag == ImGuiInputTextFlags_CallbackHistory)
+        *move += cb->EventKey == ImGuiKey_UpArrow ? -1 : 1;
+    return 0;
+}
+
+static ImU32 hit_color(hit_kind k)
+{
+    switch (k) {
+    case hit_kind::function: return theme::func;
+    case hit_kind::name: return theme::label;
+    case hit_kind::import: return theme::call;
+    case hit_kind::export_: return theme::label;
+    case hit_kind::string: return theme::string;
+    case hit_kind::comment: return theme::comment;
+    case hit_kind::segment: return theme::segment;
+    default: return theme::addr;
+    }
+}
+
+static void find(app_state& s, dialog_state& d)
+{
+    database& db = *s.db;
+    ImGui::TextDisabled("functions, names, imports, exports, strings, comments and segments - or a hex address");
+    if (ImGui::IsWindowAppearing() || d.refocus)
+        ImGui::SetKeyboardFocusHere();
+    d.refocus = false;
+    int move = 0;
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 44);
+    bool enter = ImGui::InputTextWithHint("##find", "type to search", d.buf, sizeof(d.buf),
+        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_CallbackHistory,
+        find_keys, &move);
+
+    static const struct {
+        const char* label;
+        unsigned bit;
+    } kinds[] = {
+        {"functions", sk_functions}, {"names", sk_names},       {"imports", sk_imports},   {"exports", sk_exports},
+        {"strings", sk_strings},     {"comments", sk_comments}, {"segments", sk_segments},
+    };
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        if (i)
+            ImGui::SameLine();
+        bool on = (s.search_kinds & kinds[i].bit) != 0;
+        if (ImGui::Checkbox(kinds[i].label, &on)) {
+            s.search_kinds = on ? (s.search_kinds | kinds[i].bit) : (s.search_kinds & ~kinds[i].bit);
+            d.refocus = true; // straight back to typing
+        }
+    }
+
+    // search again when the query, the kinds or the names changed
+    std::string q = util::trim(d.buf);
+    if (q != d.hits_query || s.search_kinds != d.hits_kinds || s.version != d.hits_version) {
+        d.hits = search_everything(db, q, s.search_kinds, 1000, &d.hits_cut);
+        d.hits_query = q;
+        d.hits_kinds = s.search_kinds;
+        d.hits_version = s.version;
+        d.sel = 0;
+        s.search_text = q;
+    }
+    int n = (int)d.hits.size();
+    bool scroll = move != 0;
+    if (n)
+        d.sel = std::max(0, std::min(n - 1, d.sel + move));
+
+    uint64_t go = 0;
+    bool picked = false;
+    ImVec2 size(ImGui::GetFontSize() * 52, ImGui::GetTextLineHeightWithSpacing() * 16);
+    ImGuiTableFlags tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+                         ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable;
+    if (ImGui::BeginTable("##hits", 4, tf, size)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        float cw = ImGui::CalcTextSize("0").x;
+        ImGui::TableSetupColumn("Kind", 0, cw * 9);
+        ImGui::TableSetupColumn("Address", 0, cw * (float)std::max<size_t>(8, util::hex(db.bin.max_addr()).size() + 1));
+        ImGui::TableSetupColumn("Match", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Where", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clip;
+        clip.Begin(n);
+        if (scroll)
+            clip.IncludeItemByIndex(d.sel);
+        while (clip.Step())
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                const search_hit& h = d.hits[(size_t)i];
+                ImGui::PushID(i);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGuiSelectableFlags sf = ImGuiSelectableFlags_SpanAllColumns | (h.addr ? 0 : ImGuiSelectableFlags_Disabled);
+                if (ImGui::Selectable(hit_kind_name(h.kind), i == d.sel, sf)) {
+                    d.sel = i;
+                    go = h.addr;
+                    picked = true;
+                }
+                if (scroll && i == d.sel)
+                    ImGui::SetScrollHereY();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", h.addr ? util::hex(h.addr).c_str() : "forward");
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hit_color(h.kind)), "%s", h.text.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", h.extra.c_str());
+                ImGui::PopID();
+            }
+        ImGui::EndTable();
+    }
+    if (enter && n && d.hits[(size_t)d.sel].addr) {
+        go = d.hits[(size_t)d.sel].addr;
+        picked = true;
+    }
+
+    if (q.empty())
+        ImGui::TextDisabled("type a name, part of a string, an import, ... ; up / down pick, enter jumps");
+    else if (!n)
+        ImGui::TextDisabled("nothing matches \"%s\"", q.c_str());
+    else
+        ImGui::TextDisabled("%d result%s%s", n, n == 1 ? "" : "s", d.hits_cut ? " (up to 1000 of each kind)" : "");
+    if (ImGui::Button("Close", ImVec2(ImGui::GetFontSize() * 6, 0)))
+        ImGui::CloseCurrentPopup();
+    if (picked && go) {
+        app_jump(s, db.an.item_head(go));
+        ImGui::CloseCurrentPopup();
+    }
+}
+
 static void open_raw(app_state& s, dialog_state& d)
 {
     ImGui::TextDisabled("for shellcode, firmware and memory dumps");
@@ -317,7 +453,8 @@ static void shortcuts(app_state&, dialog_state&)
         {"Esc / Alt+Left", "back"},         {"Ctrl+Enter / Alt+Right", "forward"},
         {"N", "rename"},                    {";", "comment"},
         {"X", "references to here"},        {"Space", "listing / graph"},
-        {"F5", "pseudocode (decompiler)"},  {"Alt+B", "search bytes"},
+        {"F5", "pseudocode (decompiler)"},  {"Ctrl+F", "search names, imports, strings, ..."},
+        {"Alt+B", "search bytes"},
         {"Up / Down / PgUp / PgDn", "move in the listing"},
         {"F9", "start debugging / continue"}, {"F7", "step into"},
         {"F8", "step over"},                {"F4", "run to cursor"},
@@ -357,9 +494,7 @@ void draw(app_state& s)
         return;
     }
     // dialogs that need a file close themselves when the file goes away
-    bool needs_file = d.kind == dialog_kind::jump || d.kind == dialog_kind::rename || d.kind == dialog_kind::comment ||
-                      d.kind == dialog_kind::xrefs || d.kind == dialog_kind::search;
-    if (needs_file && !s.db) {
+    if (needs_file(d.kind) && !s.db) {
         ImGui::CloseCurrentPopup();
     } else {
         switch (d.kind) {
@@ -368,6 +503,7 @@ void draw(app_state& s)
         case dialog_kind::comment: comment(s, d); break;
         case dialog_kind::xrefs: xrefs(s, d); break;
         case dialog_kind::search: search(s, d); break;
+        case dialog_kind::find: find(s, d); break;
         case dialog_kind::open_raw: open_raw(s, d); break;
         case dialog_kind::attach: attach(s, d); break;
         case dialog_kind::run_args: run_args(s, d); break;

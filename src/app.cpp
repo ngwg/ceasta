@@ -58,6 +58,8 @@ static void load_settings(app_state& s)
             s.dbg.break_on_entry = v == "1";
         else if (k == "debug_args")
             s.debug_args = v;
+        else if (k == "step_count")
+            s.step_count = std::min(100000, std::max(1, atoi(v.c_str())));
         else if (k == "win_w")
             s.win_w = atoi(v.c_str());
         else if (k == "win_h")
@@ -81,6 +83,7 @@ static void save_settings(app_state& s)
                       : s.theme == theme::ui_theme::contrast ? "contrast" : "dark";
     o += std::string("theme=") + tname + "\n";
     o += "debug_args=" + s.debug_args + "\n";
+    o += util::fmt("step_count=%d\n", s.step_count);
     for (const std::string& r : s.recent)
         o += "recent=" + r + "\n";
     std::string err;
@@ -448,33 +451,127 @@ static void dbg_do(app_state& s, bool (debugger::*fn)(std::string&))
         app_log(s, err, 1);
 }
 
+// a debugger command ends a multi-step; the step already under way finishes on its own
+static void cancel_steps(app_state& s)
+{
+    s.steps_left = 0;
+}
+
 void dbg_continue(app_state& s)
 {
+    if (dbg_stepping(s)) {
+        cancel_steps(s);
+        return;
+    }
     if (s.dbg.state() == dbg_state::none)
         dbg_start(s);
     else if (s.dbg.state() == dbg_state::stopped)
         dbg_do(s, &debugger::cont);
 }
 
+bool dbg_stepping(const app_state& s)
+{
+    return s.steps_left > 0 || s.step_in_flight;
+}
+
+static std::string pc_where(const app_state& s)
+{
+    uint64_t st = 0;
+    return app_to_static(s, s.dbg.pc(), st) ? s.db->location(st) : util::hex(s.dbg.pc());
+}
+
+// one line for a whole multi-step, instead of one per instruction
+static void steps_finished(app_state& s, int wanted)
+{
+    int done = s.steps_done;
+    const char* what = s.step_over_mode ? "stepped over" : "stepped into";
+    if (s.dbg.state() != dbg_state::stopped)
+        app_log(s, util::fmt("[debug] the program ended after %d of %d steps", done, wanted));
+    else if (done < wanted)
+        app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, s.dbg.stop_reason().c_str(),
+            pc_where(s).c_str()));
+    else
+        app_log(s, util::fmt("[debug] %s %d instructions, now at %s", what, done, pc_where(s).c_str()));
+}
+
+// runs the steps of a multi-step for about 10 ms per frame, so thousands of them don't freeze
+// the window. a breakpoint, a fault or the exit ends it early.
+static void run_steps(app_state& s)
+{
+    int wanted = s.steps_done + s.steps_left + (s.step_in_flight ? 1 : 0);
+    uint64_t until = os::now_ms() + 10;
+    uint64_t step_began = os::now_ms();
+    for (;;) {
+        if (s.dbg.state() == dbg_state::running) {
+            // a single step lands within microseconds: check again right away at first, and
+            // only wait in longer naps for a call that's being stepped over
+            bool fresh = os::now_ms() - step_began < 2;
+            s.dbg.poll(fresh ? 0 : 1);
+            if (s.dbg.state() == dbg_state::running) {
+                if (os::now_ms() >= until)
+                    return; // still in a step (a long call being stepped over): next frame
+                if (fresh)
+                    std::this_thread::yield();
+                continue;
+            }
+        }
+        if (s.step_in_flight) {
+            s.step_in_flight = false;
+            s.steps_done++;
+            std::string why = s.dbg.stop_reason();
+            if (s.dbg.state() != dbg_state::stopped || (why != "step" && why != "step over"))
+                s.steps_left = 0;
+        }
+        if (s.steps_left <= 0 || s.dbg.state() != dbg_state::stopped)
+            break;
+        if (os::now_ms() >= until)
+            return;
+        std::string err;
+        if (!(s.step_over_mode ? s.dbg.step_over(err) : s.dbg.step_into(err))) {
+            app_log(s, err, 1);
+            s.steps_left = 0;
+            break;
+        }
+        s.steps_left--;
+        s.step_in_flight = true;
+        step_began = os::now_ms();
+    }
+    s.steps_left = 0;
+    steps_finished(s, wanted);
+}
+
+static void begin_steps(app_state& s, bool over)
+{
+    if (s.dbg.state() == dbg_state::none) {
+        dbg_start(s);
+        return;
+    }
+    if (s.dbg.state() != dbg_state::stopped || dbg_stepping(s))
+        return;
+    if (s.step_count <= 1) {
+        dbg_do(s, over ? &debugger::step_over : &debugger::step_into);
+        return;
+    }
+    s.steps_left = s.step_count;
+    s.steps_done = 0;
+    s.step_over_mode = over;
+    s.step_in_flight = false;
+    run_steps(s);
+}
+
 void dbg_step_into(app_state& s)
 {
-    if (s.dbg.state() == dbg_state::none)
-        dbg_start(s);
-    else if (s.dbg.state() == dbg_state::stopped)
-        dbg_do(s, &debugger::step_into);
+    begin_steps(s, false);
 }
 
 void dbg_step_over(app_state& s)
 {
-    if (s.dbg.state() == dbg_state::none)
-        dbg_start(s);
-    else if (s.dbg.state() == dbg_state::stopped)
-        dbg_do(s, &debugger::step_over);
+    begin_steps(s, true);
 }
 
 void dbg_run_to_cursor(app_state& s)
 {
-    if (s.dbg.state() != dbg_state::stopped || !s.dbg_mapped)
+    if (s.dbg.state() != dbg_state::stopped || !s.dbg_mapped || dbg_stepping(s))
         return;
     std::string err;
     if (!s.dbg.run_to(app_to_runtime(s, s.cursor), err))
@@ -483,12 +580,14 @@ void dbg_run_to_cursor(app_state& s)
 
 void dbg_pause(app_state& s)
 {
+    cancel_steps(s);
     if (s.dbg.state() == dbg_state::running)
         dbg_do(s, &debugger::pause);
 }
 
 void dbg_stop(app_state& s)
 {
+    cancel_steps(s);
     if (s.dbg.state() == dbg_state::none)
         return;
     s.dbg.kill();
@@ -497,6 +596,7 @@ void dbg_stop(app_state& s)
 
 void dbg_detach(app_state& s)
 {
+    cancel_steps(s);
     if (s.dbg.state() == dbg_state::none)
         return;
     s.dbg.detach();
@@ -511,7 +611,8 @@ static void setup_debugger(app_state& s)
         uint64_t pc_static = 0;
         bool mapped = app_to_static(s, s.dbg.pc(), pc_static);
         std::string where = mapped ? s.db->location(pc_static) : util::hex(s.dbg.pc());
-        app_log(s, "[debug] stopped: " + s.dbg.stop_reason() + " at " + where);
+        if (!dbg_stepping(s)) // a multi-step logs one line when it ends
+            app_log(s, "[debug] stopped: " + s.dbg.stop_reason() + " at " + where);
         if (mapped)
             app_jump(s, pc_static, false);
         s.lua.fire("stop", (int64_t)(mapped ? pc_static : s.dbg.pc()));
@@ -648,11 +749,15 @@ static void shortcuts(app_state& s)
         app_back(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_B))
         dialogs::open(s, dialog_kind::search, s.cursor);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
+        dialogs::open(s, dialog_kind::find, s.cursor);
 }
 
 void app_frame(app_state& s)
 {
     finish_job(s);
+    if (dbg_stepping(s))
+        run_steps(s);
     if (s.dbg.state() == dbg_state::running)
         s.dbg.poll(0);
 

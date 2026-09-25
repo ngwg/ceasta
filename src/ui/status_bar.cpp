@@ -18,6 +18,9 @@ void draw(app_state& s)
     // state first: what the program is doing right now
     if (s.job) {
         ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.4f, 1), "analyzing %d%%", s.job->progress.percent.load());
+    } else if (dbg_stepping(s)) {
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "debugging: stepping (%d of %d)", s.steps_done,
+            s.steps_done + s.steps_left + (s.step_in_flight ? 1 : 0));
     } else if (s.dbg.state() == dbg_state::running) {
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "debugging: running");
     } else if (s.dbg.state() == dbg_state::stopped) {
