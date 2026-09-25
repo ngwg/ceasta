@@ -36,7 +36,7 @@ uint64_t fingerprint(database& db, uint64_t start, uint64_t end, uint32_t& lengt
     std::vector<uint8_t> mask(len, 1); // 1 = a fixed byte, 0 = wildcard
 
     disassembler dis;
-    if (!dis.open(db.bin.is64() ? bin_arch::x64 : bin_arch::x86))
+    if (!dis.open(db.bin.arch))
         return 0;
     uint64_t a = start;
     int guard = 0;
@@ -44,9 +44,17 @@ uint64_t fingerprint(database& db, uint64_t start, uint64_t end, uint32_t& lengt
         insn in;
         if (!dis.decode(db.bin, a, in) || in.size == 0)
             break;
+        db.an.resolve(in);
+        // arm64 keeps branch offsets and addresses (adrp, adr, the page offset after an adrp)
+        // inside the 4 byte word: wildcard all of it
+        if (in.arm && (in.has_target || in.has_page || in.has_mem)) {
+            size_t off = (size_t)(a - start);
+            for (size_t k = 0; k < 4 && off + k < len; k++)
+                mask[off + k] = 0;
+        }
         // wildcard the displacement of a direct relative branch (its value is an inter-function
         // offset that changes between builds)
-        if (in.is_branch() && !in.indirect && in.has_target) {
+        else if (in.is_branch() && !in.indirect && in.has_target) {
             size_t off = (size_t)(a - start);
             if (in.size >= 5) { // rel32: the last 4 bytes
                 for (int k = 0; k < 4; k++)

@@ -32,7 +32,8 @@ void mcp_usage()
         "  --http [addr:]port   serve http on localhost instead of stdio (e.g. --http 8744)\n"
         "  --allow-debug        add the tools that run the program under the debugger\n"
         "  --allow-lua          add run_lua (runs any lua, with file and shell access)\n"
-        "  --raw32 / --raw64    load the file as raw code\n"
+        "  --raw32 / --raw64    load the file as raw x86 / x64 code\n"
+        "  --raw-arm64          load the file as raw arm64 code\n"
         "  --base <hex>         base address for raw files\n");
 }
 
@@ -152,9 +153,9 @@ int cmd_mcp(int argc, char** argv)
         else if (a == "--http" && i + 1 < argc) {
             use_http = true;
             http = argv[++i];
-        } else if (a == "--raw32" || a == "--raw64") {
+        } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
             opts.force_raw = true;
-            opts.raw_arch = a == "--raw32" ? bin_arch::x86 : bin_arch::x64;
+            opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
         } else if (a == "--base" && i + 1 < argc) {
             util::parse_hex(argv[++i], opts.raw_base);
         } else if (a == "-h" || a == "--help") {

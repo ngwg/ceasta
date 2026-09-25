@@ -152,6 +152,44 @@ void parse_pdata(binary& b, uint32_t rva, uint32_t size)
     }
 }
 
+// arm64 .pdata: 8 byte entries, the start and either packed unwind data or where the .xdata is.
+// fragments of a function (split off by the compiler, no prolog of their own) are skipped
+void parse_pdata_arm64(binary& b, uint32_t rva, uint32_t size)
+{
+    uint32_t n = std::min<uint32_t>(size / 8, 1u << 20);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t begin, unwind;
+        if (!b.read_u32(b.base + rva + (uint64_t)i * 8, begin) || !b.read_u32(b.base + rva + (uint64_t)i * 8 + 4, unwind))
+            break;
+        if (begin == 0 || (begin & 3))
+            continue;
+        uint32_t flag = unwind & 3;
+        if (flag == 2 || flag == 3)
+            continue; // packed, no prolog: a fragment
+        if (flag == 0) {
+            // .xdata header, then epilog scopes, then the unwind codes. a fragment's codes start with end_c
+            uint32_t h;
+            if (!b.read_u32(b.base + unwind, h))
+                continue;
+            uint32_t epilogs = (h >> 22) & 31, words = h >> 27;
+            uint64_t p = b.base + unwind + 4;
+            if (epilogs == 0 && words == 0) {
+                uint32_t h2;
+                if (!b.read_u32(p, h2))
+                    continue;
+                epilogs = h2 & 0xffff;
+                p += 4;
+            }
+            if (!(h & (1u << 21)))
+                p += (uint64_t)epilogs * 4; // e set: the one epilog is described in the header
+            uint8_t first = 0;
+            if (b.read_u8(p, first) && first == 0xe5)
+                continue;
+        }
+        b.func_hints.push_back(b.base + begin);
+    }
+}
+
 void parse_tls(binary& b, uint32_t rva)
 {
     uint64_t list = 0;
@@ -258,8 +296,10 @@ bool pe(binary& b, std::string& err)
         b.arch = bin_arch::x86;
     else if (machine == 0x8664)
         b.arch = bin_arch::x64;
+    else if (machine == 0xaa64)
+        b.arch = bin_arch::arm64;
     else {
-        err = util::fmt("unsupported pe machine 0x%x (only x86 and x64 are supported)", machine);
+        err = util::fmt("unsupported pe machine 0x%x (x86, x64 and arm64 are supported)", machine);
         return false;
     }
     if (!r.ok(opt, 2) || opt_size < 2) {
@@ -274,8 +314,13 @@ bool pe(binary& b, std::string& err)
     }
     if (pe64 != b.is64())
         b.notes.push_back("optional header type doesn't match the machine field");
+    if (b.arch == bin_arch::arm64 && !pe64) {
+        err = "arm64 pe file with a 32 bit optional header";
+        return false;
+    }
     // the optional header type decides pointer sizes in the tables
-    b.arch = pe64 ? bin_arch::x64 : bin_arch::x86;
+    if (b.arch != bin_arch::arm64)
+        b.arch = pe64 ? bin_arch::x64 : bin_arch::x86;
 
     uint32_t min_opt = pe64 ? 112 : 96;
     if (opt_size < min_opt || !r.ok(opt, min_opt)) {
@@ -376,7 +421,9 @@ bool pe(binary& b, std::string& err)
         parse_delay_imports(b, rva);
     if (dir(0, rva, size))
         parse_exports(b, rva, size);
-    if (b.is64() && dir(3, rva, size))
+    if (b.arch == bin_arch::arm64 && dir(3, rva, size))
+        parse_pdata_arm64(b, rva, size);
+    else if (b.is64() && dir(3, rva, size))
         parse_pdata(b, rva, size);
     if (dir(9, rva, size))
         parse_tls(b, rva);
@@ -408,7 +455,7 @@ bool pe(binary& b, std::string& err)
         b.kind = "exe";
     if (dir(14, rva, size)) {
         b.kind += " .net";
-        b.notes.push_back(".net assembly: only the native stub is x86 code, the il isn't disassembled");
+        b.notes.push_back(".net assembly: only the native stub is machine code, the il isn't disassembled");
     }
     return true;
 }

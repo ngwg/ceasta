@@ -401,15 +401,17 @@ static void find(app_state& s, dialog_state& d)
 static void open_raw(app_state& s, dialog_state& d)
 {
     ImGui::TextDisabled("for shellcode, firmware and memory dumps");
-    ImGui::RadioButton("32 bit (x86)", &d.raw_arch, 0);
+    ImGui::RadioButton("x86", &d.raw_arch, 0);
     ImGui::SameLine();
-    ImGui::RadioButton("64 bit (x64)", &d.raw_arch, 1);
+    ImGui::RadioButton("x64", &d.raw_arch, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("arm64", &d.raw_arch, 2);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
     ImGui::InputText("base address (hex)", d.raw_base, sizeof(d.raw_base), ImGuiInputTextFlags_CharsHexadecimal);
     if (ok_cancel()) {
         load_options o;
         o.force_raw = true;
-        o.raw_arch = d.raw_arch ? bin_arch::x64 : bin_arch::x86;
+        o.raw_arch = d.raw_arch == 2 ? bin_arch::arm64 : d.raw_arch ? bin_arch::x64 : bin_arch::x86;
         util::parse_hex(d.raw_base, o.raw_base);
         ImGui::CloseCurrentPopup();
         if (s.platform.open_file_dialog) {

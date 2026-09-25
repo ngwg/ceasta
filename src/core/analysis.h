@@ -53,6 +53,8 @@ struct jump_table {
     unsigned index_reg = 0;        // capstone reg id of the switch index, 0 if unknown
 };
 
+struct insn;
+
 struct analysis_progress {
     std::atomic<int> percent{0};
     std::atomic<bool> cancel{false};
@@ -70,7 +72,14 @@ struct analysis {
     std::unordered_map<uint64_t, uint32_t> thunk_import;  // thunk start -> index in binary.imports
     std::unordered_map<uint64_t, jump_table> tables;      // by jump address
     std::unordered_set<uint64_t> noret_calls;             // calls that never return
+    // arm64 builds addresses in two steps (adrp x0, page; add x0, x0, #off). what the add, load,
+    // store or branch at an address ends up using, and for an adrp, the first use of its page
+    std::unordered_map<uint64_t, uint64_t> pc_refs;
+    std::unordered_map<uint64_t, uint64_t> page_refs;
     uint64_t insn_count = 0;
+
+    // fills in has_mem / mem from pc_refs, so an arm64 add or load reads like x86's [rip + x]
+    void resolve(insn& in) const;
 
     uint8_t flags_at(uint64_t a) const;
     void add_flags(uint64_t a, uint8_t f);

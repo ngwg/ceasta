@@ -90,7 +90,14 @@ public:
     void format(const row& r, line_text& out);
     // instruction text with names in place of addresses
     std::string insn_text(const insn& in) const;
-    bool decode(uint64_t a, insn& out) const { return dis_.decode(bin, a, out); }
+    // decodes the instruction at a, with what the analysis knows it uses (arm64 adrp pairs)
+    bool decode(uint64_t a, insn& out) const
+    {
+        if (!dis_.decode(bin, a, out))
+            return false;
+        an.resolve(out);
+        return true;
+    }
     const char* reg_name(unsigned reg) const { return dis_.reg_name(reg); }
 
     // "48 8b ?? 05" style patterns

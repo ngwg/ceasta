@@ -6,7 +6,7 @@
 // one loaded file, format independent. pe/elf/raw loaders fill this in.
 
 enum class bin_format { none, pe, elf, raw };
-enum class bin_arch { x86, x64 };
+enum class bin_arch { x86, x64, arm64 };
 
 constexpr uint32_t perm_r = 1;
 constexpr uint32_t perm_w = 2;
@@ -66,8 +66,10 @@ struct binary {
     std::vector<uint64_t> ptr_locs;       // addresses holding absolute pointers (from relocations)
     std::vector<uint8_t> file;            // raw file bytes
 
-    int ptr_size() const { return arch == bin_arch::x64 ? 8 : 4; }
-    bool is64() const { return arch == bin_arch::x64; }
+    int ptr_size() const { return arch == bin_arch::x86 ? 4 : 8; }
+    bool is64() const { return arch != bin_arch::x86; }
+    // x86 or x64: what the decompiler, the debugger and the signatures understand
+    bool is_x86() const { return arch != bin_arch::arm64; }
     const segment* seg_at(uint64_t a) const;
     bool is_code(uint64_t a) const;
     bool is_mapped(uint64_t a) const { return seg_at(a) != nullptr; }
@@ -92,6 +94,8 @@ struct binary {
 
 const char* format_name(bin_format f);
 const char* arch_name(bin_arch a);
+// "x86", "x64", "arm64" (and the usual other spellings)
+bool parse_arch(const std::string& s, bin_arch& out);
 
 namespace loader {
 
@@ -99,6 +103,9 @@ namespace loader {
 bool open(const std::string& path, binary& out, std::string& err);
 bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out, std::string& err);
 void raw(std::vector<uint8_t> bytes, const std::string& path, uint64_t base, bin_arch arch, binary& out);
+
+// the machine a pe / elf file is built for, read from its header without loading it
+bool peek_arch(const std::string& path, bin_arch& out);
 
 // format parsers, work on out.file (set by the caller)
 bool pe(binary& out, std::string& err);

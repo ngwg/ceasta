@@ -605,6 +605,11 @@ bool debugger::start(const std::string& exe, const std::string& args, const std:
         err = "a process is already being debugged";
         return false;
     }
+    bin_arch arch;
+    if (loader::peek_arch(exe, arch) && arch == bin_arch::arm64) {
+        err = "the debugger runs x86 and x64 programs; this one is arm64";
+        return false;
+    }
     std::wstring wexe = os::widen(exe);
     std::wstring cmd = L"\"" + wexe + L"\"";
     if (!args.empty())

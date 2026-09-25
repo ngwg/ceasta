@@ -54,7 +54,8 @@ static void usage()
            "                                protocol (stdio, or --http PORT); ceasta-cli mcp --help\n"
            "  debug <exe> [steps]           debugger smoke test: break on entry, step, run to exit\n\n"
            "options:\n"
-           "  --raw32 / --raw64             load the file as raw code\n"
+           "  --raw32 / --raw64             load the file as raw x86 / x64 code\n"
+           "  --raw-arm64                   load the file as raw arm64 code\n"
            "  --base <hex>                  base address for raw files\n"
            "\"where\" is a hex address or any name (sub_401000, start, main, ...)\n",
         CEASTA_VERSION);
@@ -256,9 +257,9 @@ int main(int argc, char** argv)
     bool debug_mode = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--raw32" || a == "--raw64") {
+        if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
             opts.force_raw = true;
-            opts.raw_arch = a == "--raw32" ? bin_arch::x86 : bin_arch::x64;
+            opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
         } else if (a == "--base" && i + 1 < argc) {
             if (!util::parse_hex(argv[++i], opts.raw_base)) {
                 fprintf(stderr, "bad base address\n");

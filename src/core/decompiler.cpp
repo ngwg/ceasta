@@ -2949,6 +2949,11 @@ decompiled decompile(database& db, uint64_t func_start)
         return r;
     }
 
+    if (!db.bin.is_x86()) {
+        r.error = util::fmt("the decompiler reads x86 and x64 code; this is %s (the listing and graph work)",
+            arch_name(db.bin.arch));
+        return r;
+    }
     csh cs = 0;
     if (cs_open(CS_ARCH_X86, db.bin.is64() ? CS_MODE_64 : CS_MODE_32, &cs) != CS_ERR_OK) {
         r.error = "capstone failed to open";

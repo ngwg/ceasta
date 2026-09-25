@@ -52,7 +52,7 @@ struct dialog_state {
     char buf[512] = {};
     std::string error;
     std::vector<uint64_t> results;
-    int raw_arch = 1; // 0 x86, 1 x64
+    int raw_arch = 1; // 0 x86, 1 x64, 2 arm64
     char raw_base[32] = "0";
     std::vector<process_info> procs;
     char filter[128] = {};

@@ -55,6 +55,17 @@ static fs::path to_path(const std::string& s) { return fs::path(s); }
 static std::string from_path(const fs::path& p) { return p.string(); }
 #endif
 
+bool read_head(const std::string& path, size_t n, std::vector<uint8_t>& out)
+{
+    std::ifstream f(to_path(path), std::ios::binary);
+    if (!f)
+        return false;
+    out.assign(n, 0);
+    f.read((char*)out.data(), (std::streamsize)n);
+    out.resize((size_t)std::max<std::streamsize>(f.gcount(), 0));
+    return true;
+}
+
 bool read_file(const std::string& path, std::vector<uint8_t>& out, std::string& err)
 {
     std::error_code ec;

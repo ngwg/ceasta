@@ -523,7 +523,7 @@ void inspect_pe(const binary& b, file_info& out)
     uint32_t crva, csize;
     if (dir(14, crva, csize)) {
         out.header.push_back({"runtime", ".net (clr)"});
-        out.warnings.push_back("a .net assembly: its code is IL for the .net runtime, not x86 - ceasta shows the native stub. "
+        out.warnings.push_back("a .net assembly: its code is IL for the .net runtime, not machine code - ceasta shows the native stub. "
                                "a .net decompiler (dnSpy, ILSpy) reads the rest");
     }
     if (has_bytes(b.file, 0x40, std::min<size_t>(lfanew, 0x400), "Rich", 4))

@@ -1,8 +1,10 @@
 #include "core/binary.h"
 #include "core/util.h"
 #include <algorithm>
+#include <cstring>
+#include <unordered_map>
 
-// elf32 / elf64 little endian loader (x86 and x64). bounds checked, the file is untrusted.
+// elf32 / elf64 little endian loader (x86, x64, arm64). bounds checked, the file is untrusted.
 
 namespace {
 
@@ -98,6 +100,10 @@ void read_symbols(ctx& c, bool et_rel)
             // skip undefined (imports), section and file symbols, special indexes
             if (s.shndx == 0 || s.shndx >= 0xff00 || s.type == 3 || s.type == 4 || s.name.empty())
                 continue;
+            // arm mapping symbols ($x code starts here, $d data, $x.12, ...) aren't names
+            if (s.name[0] == '$' && s.name.size() >= 2 && strchr("xdat", s.name[1]) &&
+                (s.name.size() == 2 || s.name[2] == '.' || s.name[2] == '_'))
+                continue;
             uint64_t addr = s.value;
             if (et_rel) {
                 if (!c.sec_ok(s.shndx))
@@ -135,6 +141,8 @@ void read_relocs(ctx& c)
             continue;
         bool rela = rs.type == sht_rela;
         uint64_t es = c.is64 ? (rela ? 24 : 16) : (rela ? 12 : 8);
+        // glob_dat, jump_slot and relative: 6, 7, 8 on x86 and x64, 1025, 1026, 1027 on arm64
+        uint32_t t0 = b.arch == bin_arch::arm64 ? 1025 : 6;
         uint64_t count = std::min<uint64_t>(rs.size / es, 1u << 20);
         for (uint64_t i = 0; i < count; i++) {
             uint64_t off = rs.offset + i * es;
@@ -159,11 +167,11 @@ void read_relocs(ctx& c)
                 type = (uint32_t)(info & 0xff);
                 symi = info >> 8;
             }
-            if ((type == 6 || type == 7) && symi != 0) {
+            if ((type == t0 || type == t0 + 1) && symi != 0) {
                 elf_sym s;
                 if (c.sym(symtab, symi, s) && s.shndx == 0 && !s.name.empty())
                     b.imports.push_back({std::string(), s.name, where});
-            } else if (type == 8) {
+            } else if (type == t0 + 2) {
                 // R_*_RELATIVE: we load at the link address, so the pointer is just the addend.
                 // lld leaves zeros in rela targets, write the value so data reads right
                 uint64_t target = (uint64_t)addend;
@@ -209,6 +217,169 @@ void read_needed(ctx& c)
     }
 }
 
+bool uleb(const binary& b, uint64_t& p, uint64_t end, uint64_t& out)
+{
+    out = 0;
+    for (int shift = 0; p < end && shift < 64; shift += 7) {
+        uint8_t v;
+        if (!b.read_u8(p++, v))
+            return false;
+        out |= (uint64_t)(v & 0x7f) << shift;
+        if (!(v & 0x80))
+            return true;
+    }
+    return false;
+}
+
+// bytes a value in dwarf pointer encoding enc takes (0 when unknown / variable)
+unsigned enc_size(uint8_t enc, int ptr)
+{
+    switch (enc & 0x0f) {
+    case 0x00: return (unsigned)ptr;
+    case 0x02: case 0x0a: return 2;
+    case 0x03: case 0x0b: return 4;
+    case 0x04: case 0x0c: return 8;
+    default: return 0;
+    }
+}
+
+// a function's unwind info starts from the state right after a call. gcc's split off cold
+// parts (foo.cold) are entered with the caller's frame already set up, so their first rules
+// (before the first advance) move the cfa or save registers: those aren't function starts
+bool fde_is_fragment(const binary& b, uint64_t fde, std::unordered_map<uint64_t, std::pair<uint8_t, bool>>& cies)
+{
+    uint32_t len, cie_ptr;
+    if (!b.read_u32(fde, len) || len == 0 || len == 0xffffffff || !b.read_u32(fde + 4, cie_ptr) || !cie_ptr)
+        return false;
+    uint64_t end = fde + 4 + len, cie = fde + 4 - cie_ptr;
+    auto it = cies.find(cie);
+    if (it == cies.end()) {
+        // the cie: version, augmentation, alignments, return register, then augmentation data
+        std::pair<uint8_t, bool> info{0xff, false};
+        uint32_t clen, id;
+        uint8_t ver;
+        if (b.read_u32(cie, clen) && clen && clen != 0xffffffff && b.read_u32(cie + 4, id) && id == 0 &&
+            b.read_u8(cie + 8, ver)) {
+            uint64_t cend = cie + 4 + clen, p = cie + 9, v;
+            std::string aug = b.read_cstr(p, 16);
+            p += aug.size() + 1;
+            bool ok = aug.find("eh") == std::string::npos && uleb(b, p, cend, v) && uleb(b, p, cend, v);
+            if (ok && ver == 1)
+                p++;
+            else if (ok)
+                ok = uleb(b, p, cend, v);
+            if (ok && !aug.empty() && aug[0] == 'z' && uleb(b, p, cend, v)) {
+                info.second = true;
+                for (size_t i = 1; i < aug.size() && p < cend; i++) {
+                    uint8_t e = 0;
+                    if (aug[i] == 'R') {
+                        b.read_u8(p++, e);
+                        info.first = e;
+                    } else if (aug[i] == 'P') {
+                        b.read_u8(p++, e);
+                        p += enc_size(e, b.ptr_size());
+                    } else if (aug[i] == 'L') {
+                        p++;
+                    } else if (aug[i] != 'S' && aug[i] != 'B' && aug[i] != 'G') {
+                        break;
+                    }
+                }
+            }
+            if (!ok)
+                info.first = 0xff;
+        }
+        it = cies.emplace(cie, info).first;
+    }
+    uint8_t fde_enc = it->second.first;
+    unsigned sz = fde_enc == 0xff ? 0 : enc_size(fde_enc, b.ptr_size());
+    if (!sz)
+        return false;
+    uint64_t p = fde + 8 + 2 * (uint64_t)sz, v;
+    if (it->second.second) {
+        if (!uleb(b, p, end, v))
+            return false;
+        p += v;
+    }
+    for (int n = 0; p < end && n < 64; n++) {
+        uint8_t op;
+        if (!b.read_u8(p++, op))
+            return false;
+        uint8_t hi = op & 0xc0;
+        if (hi == 0x40)
+            return false; // advance_loc: the rules that follow are for later instructions
+        if (hi == 0x80)
+            return true;  // offset: a register is already saved
+        if (hi == 0xc0)
+            continue;     // restore
+        switch (op) {
+        case 0x00: case 0x0a: case 0x0b: // nop, remember / restore state
+            break;
+        case 0x02: case 0x03: case 0x04: // advance_loc1 / 2 / 4
+            return false;
+        case 0x06: case 0x07: case 0x08: case 0x2e: // restore_extended, undefined, same_value, gnu_args_size
+            if (!uleb(b, p, end, v))
+                return false;
+            break;
+        case 0x05: case 0x09: case 0x0c: case 0x0d: case 0x0e: case 0x0f: case 0x10: case 0x11: case 0x12:
+        case 0x13: case 0x14: case 0x15: case 0x16: case 0x2d:
+            return true; // the cfa or a register's rule changes before anything ran
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+// .eh_frame_hdr: a sorted table with the start of every function that has unwind info. gcc and
+// clang write one for nearly every function, stripped or not
+void read_eh_frame_hdr(ctx& c)
+{
+    binary& b = c.b;
+    for (size_t i = 0; i < c.secs.size(); i++) {
+        const shdr& s = c.secs[i];
+        if (s.name != ".eh_frame_hdr" || !c.sec_addr[i] || s.size < 12)
+            continue;
+        uint64_t hdr = c.sec_addr[i], end = hdr + s.size, p = hdr + 4;
+        uint8_t h[4];
+        if (b.read(hdr, h, 4) != 4 || h[0] != 1)
+            return;
+        // one value in dwarf pointer encoding enc: 2 / 4 / 8 bytes, absolute, pc or data relative
+        auto get = [&](uint8_t enc, uint64_t& out) {
+            uint64_t at = p, v = 0;
+            if (enc == 0xff || (enc & 0x80))
+                return false;
+            switch (enc & 0x0f) {
+            case 0x00: if (!b.read_ptr(p, v)) return false; p += (uint64_t)b.ptr_size(); break;
+            case 0x02: case 0x0a: { uint16_t x; if (!b.read_u16(p, x)) return false; v = (enc & 8) ? (uint64_t)(int64_t)(int16_t)x : x; p += 2; break; }
+            case 0x03: case 0x0b: { uint32_t x; if (!b.read_u32(p, x)) return false; v = (enc & 8) ? (uint64_t)(int64_t)(int32_t)x : x; p += 4; break; }
+            case 0x04: case 0x0c: if (!b.read_u64(p, v)) return false; p += 8; break;
+            default: return false;
+            }
+            if ((enc & 0x70) == 0x10)
+                v += at;
+            else if ((enc & 0x70) == 0x30)
+                v += hdr;
+            else if (enc & 0x70)
+                return false;
+            out = c.is64 ? v : v & 0xffffffffull;
+            return true;
+        };
+        uint64_t eh_frame = 0, count = 0;
+        if (!get(h[1], eh_frame) || !get(h[2], count))
+            return;
+        count = std::min<uint64_t>(count, 1u << 20);
+        std::unordered_map<uint64_t, std::pair<uint8_t, bool>> cies; // fde pointer encoding, 'z'
+        for (uint64_t k = 0; k < count && p < end; k++) {
+            uint64_t start = 0, fde = 0;
+            if (!get(h[3], start) || !get(h[3], fde))
+                break;
+            if (b.is_code(start) && !fde_is_fragment(b, fde, cies))
+                b.func_hints.push_back(start);
+        }
+        return;
+    }
+}
+
 void read_init_arrays(ctx& c)
 {
     binary& b = c.b;
@@ -246,8 +417,10 @@ bool elf(binary& b, std::string& err)
         b.arch = bin_arch::x64;
     else if (machine == 3)
         b.arch = bin_arch::x86;
+    else if (machine == 183 && is64)
+        b.arch = bin_arch::arm64;
     else {
-        err = util::fmt("unsupported elf machine %u (only x86 and x64 are supported)", machine);
+        err = util::fmt("unsupported elf machine %u (x86, x64 and arm64 are supported)", machine);
         return false;
     }
 
@@ -429,6 +602,7 @@ bool elf(binary& b, std::string& err)
     read_relocs(c);
     read_needed(c);
     read_init_arrays(c);
+    read_eh_frame_hdr(c);
 
     if (entry && !et_rel && b.is_mapped(entry)) {
         b.entry = entry;

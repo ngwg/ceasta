@@ -554,7 +554,7 @@ void database::note_args(const function& f)
             heads.push_back(a);
         a += sz ? sz : 1;
     }
-    bool pe = bin.format == bin_format::pe, x64 = bin.is64();
+    bool pe = bin.format == bin_format::pe, x64 = bin.is64(), a64 = bin.arch == bin_arch::arm64;
     static const char* const win64[] = {"rcx", "rdx", "r8", "r9"};
     static const char* const sysv[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
     for (size_t i = 0; i < heads.size(); i++) {
@@ -568,7 +568,7 @@ void database::note_args(const function& f)
             p = known_prototype(name_at(call.mem));
         if (!p || p->params.empty())
             continue;
-        size_t nregs = !x64 ? 0 : pe ? 4 : 6;
+        size_t nregs = a64 ? 8 : !x64 ? 0 : pe ? 4 : 6;
         std::vector<bool> done(p->params.size(), false);
         int pushes = 0;
         for (size_t j = i; j-- > 0 && i - j <= 24;) {
@@ -576,7 +576,10 @@ void database::note_args(const function& f)
             if (!decode(heads[j], in) || in.kind != flow::normal)
                 break;
             int arg = -1;
-            if (!x64 && std::string(in.mnem) == "push")
+            if (a64) {
+                if (in.nwr && in.wr[0] < nregs && !in.mem_write) // x0..x7 (w0..w7)
+                    arg = in.wr[0];
+            } else if (!x64 && std::string(in.mnem) == "push")
                 arg = pushes++;
             else if (in.mem_write && in.has_mem_op && !in.mem_index && in.mem_base) {
                 // a stack argument: [rsp + 0x20 + 8 * n] on win64, [rsp + 8 * n] on system v / x86
@@ -810,9 +813,64 @@ size_t database::row_of(uint64_t a)
     return (size_t)(it - r.begin()) - 1;
 }
 
+namespace {
+
+// capstone's arm64 immediates: "#9", "#0x10", "#-0x10"
+std::string a64_imm(int64_t v)
+{
+    if (v >= 0 && v <= 9)
+        return util::fmt("#%d", (int)v);
+    return v < 0 ? "#-0x" + util::hex_lower((uint64_t)-v) : "#0x" + util::hex_lower((uint64_t)v);
+}
+
+bool replace_a64_imm(std::string& s, int64_t v, const std::string& repl, size_t from = 0)
+{
+    std::string tok = a64_imm(v);
+    for (size_t p = from; (p = s.find(tok, p)) != std::string::npos; p += tok.size()) {
+        size_t e = p + tok.size();
+        if (e >= s.size() || util::hex_digit(s[e]) < 0) {
+            s.replace(p, tok.size(), repl);
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 std::string database::insn_text(const insn& in) const
 {
     std::string ops = in.ops;
+    if (in.arm) {
+        // arm64 prints addresses as immediates: put names there. an adrp and the add / load after
+        // it that finishes the address read name@page and name@pageoff, like ida
+        if (in.has_target && !in.indirect) {
+            std::string n = name_at(in.target);
+            if (!n.empty())
+                replace_a64_imm(ops, (int64_t)in.target, n);
+        } else if (in.has_page) {
+            auto pr = an.page_refs.find(in.addr);
+            std::string n = pr == an.page_refs.end() ? std::string() : name_at(pr->second);
+            if (!n.empty())
+                replace_a64_imm(ops, (int64_t)in.page, n + "@page");
+        } else if (in.has_mem && !in.is_branch()) {
+            std::string n = name_at(in.mem);
+            if (!n.empty()) {
+                if (in.has_mem_op) // ldr x0, [x1, #0x10]
+                    replace_a64_imm(ops, in.mem_disp, n + "@pageoff", ops.find('['));
+                else if (in.is_lea && in.has_imm && !in.has_page && in.reg1) // add x0, x0, #0x10
+                    replace_a64_imm(ops, (int64_t)in.imm, n + "@pageoff");
+                else // adr x0, #addr / ldr x0, #addr
+                    replace_a64_imm(ops, (int64_t)in.mem, n);
+            }
+        }
+        std::string out = in.mnem;
+        if (!ops.empty()) {
+            out.append(out.size() < 8 ? 8 - out.size() : 1, ' ');
+            out += ops;
+        }
+        return out;
+    }
     if (in.has_target && !in.indirect) {
         std::string n = name_at(in.target);
         if (!n.empty())
@@ -938,7 +996,7 @@ void database::format(const row& r, line_text& out)
     case row_kind::code: {
         insn in;
         out.comment = comment_at(r.addr);
-        if (!dis_.decode(bin, r.addr, in)) {
+        if (!decode(r.addr, in)) {
             out.text = "db ??";
             return;
         }
@@ -953,7 +1011,7 @@ void database::format(const row& r, line_text& out)
             out.style = ls_jump;
         else if (in.kind == flow::ret || in.kind == flow::stop)
             out.style = ls_ret;
-        else if (ins::is_nop(in.id))
+        else if (ins::is_nop(in))
             out.style = ls_nop;
         if (in.has_target && !in.indirect)
             out.target = in.target;
@@ -961,6 +1019,17 @@ void database::format(const row& r, line_text& out)
             out.target = in.mem;
         else if (in.has_imm && bin.is_mapped(in.imm) && (an.flags_at(in.imm) & (fl_label | fl_str | fl_func)))
             out.target = in.imm;
+        if (in.has_page) {
+            auto pr = an.page_refs.find(r.addr);
+            if (pr != an.page_refs.end())
+                out.target = pr->second;
+        }
+        if (in.arm && in.has_mem && bin.is_mapped(in.mem) && !an.string_at(in.mem)) {
+            // blr x8 through a slot: what it calls. an address the text couldn't name: where it is
+            std::string n = name_at(in.mem);
+            if (in.is_branch() || n.empty() || out.text.find(n) == std::string::npos)
+                out.auto_comment = location(in.mem);
+        }
         uint64_t cand[3] = {in.has_target ? in.target : 0, in.has_mem ? in.mem : 0, in.has_imm ? in.imm : 0};
         for (uint64_t c : cand) {
             const string_item* s = c ? an.string_at(c) : nullptr;
@@ -1114,7 +1183,7 @@ std::string database::serialize(bool with_program) const
     // stable line by line and diffs cleanly
     std::string s = "ceasta 1\nfile " + bin.name + "\n" + util::fmt("crc %08X\n", crc);
     if (bin.format == bin_format::raw)
-        s += util::fmt("load raw %s %llx\n", bin.is64() ? "x64" : "x86", (unsigned long long)bin.base);
+        s += util::fmt("load raw %s %llx\n", arch_name(bin.arch), (unsigned long long)bin.base);
     for (const auto& n : user_names)
         s += "name " + util::hex(n.first) + " " + n.second + "\n";
     for (const auto& c : user_comments)
@@ -1343,8 +1412,9 @@ bool read_project_info(const std::string& project, project_info& out, std::strin
             }
         } else if (line.compare(0, 9, "load raw ") == 0) {
             out.opts.force_raw = true;
-            out.opts.raw_arch = line.compare(9, 3, "x86") == 0 ? bin_arch::x86 : bin_arch::x64;
             size_t sp = line.find(' ', 9);
+            if (!parse_arch(line.substr(9, sp == std::string::npos ? std::string::npos : sp - 9), out.opts.raw_arch))
+                out.opts.raw_arch = bin_arch::x64;
             if (sp != std::string::npos)
                 util::parse_hex(line.substr(sp + 1), out.opts.raw_base);
         } else if (line.compare(0, 8, "program ") == 0) {

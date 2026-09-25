@@ -334,6 +334,14 @@ void draw(app_state& s)
         return;
     }
     header(s);
+    // a listing that just came up (from the menu, a key, the palette or the tabs above) starts at
+    // the cursor, not wherever its window was scrolled last time
+    static center_view last = center_view::listing;
+    if (s.view != last) {
+        if (s.view == center_view::listing || s.view == center_view::split)
+            s.scroll_to_cursor = true;
+        last = s.view;
+    }
     if (s.view == center_view::graph) {
         graph_view::draw(s);
     } else if (s.view == center_view::pseudo) {

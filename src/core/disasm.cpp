@@ -26,7 +26,9 @@ bool disassembler::open(bin_arch arch)
 {
     close();
     csh h = 0;
-    if (cs_open(CS_ARCH_X86, arch == bin_arch::x64 ? CS_MODE_64 : CS_MODE_32, &h) != CS_ERR_OK)
+    cs_err e = arch == bin_arch::arm64 ? cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &h)
+                                       : cs_open(CS_ARCH_X86, arch == bin_arch::x64 ? CS_MODE_64 : CS_MODE_32, &h);
+    if (e != CS_ERR_OK)
         return false;
     cs_option(h, CS_OPT_DETAIL, CS_OPT_ON);
     scratch_ = cs_malloc(h);
@@ -58,6 +60,8 @@ bool disassembler::decode(const uint8_t* buf, size_t n, uint64_t addr, insn& out
     out = insn();
     if (!handle_ || !buf || n == 0)
         return false;
+    if (arch_ == bin_arch::arm64)
+        return decode_arm64(buf, n, addr, out);
     const uint8_t* code = buf;
     size_t size = std::min<size_t>(n, 15); // longest x86 instruction
     uint64_t a = addr;
@@ -144,6 +148,196 @@ bool disassembler::decode(const uint8_t* buf, size_t n, uint64_t addr, insn& out
     return true;
 }
 
+// ---- arm64 ----
+
+namespace {
+
+// bytes a register holds, by its name: w 4, x 8, b 1, h 2, s 4, d 8, q and v 16
+unsigned a64_reg_bytes(const char* n)
+{
+    if (!n || !*n)
+        return 0;
+    if (!strcmp(n, "sp") || !strcmp(n, "fp") || !strcmp(n, "lr") || !strcmp(n, "xzr"))
+        return 8;
+    if (!strcmp(n, "wsp") || !strcmp(n, "wzr"))
+        return 4;
+    switch (n[0]) {
+    case 'w': return 4;
+    case 'x': return 8;
+    case 'b': return 1;
+    case 'h': return 2;
+    case 's': return 4;
+    case 'd': return 8;
+    case 'q': case 'v': case 'z': return 16;
+    default: return 0;
+    }
+}
+
+bool starts(const char* s, const char* p)
+{
+    return strncmp(s, p, strlen(p)) == 0;
+}
+
+// loads and stores: ld*, st* and the atomics that read and write memory
+bool a64_mem_insn(const char* m)
+{
+    return (m[0] == 'l' && m[1] == 'd') || (m[0] == 's' && m[1] == 't') || starts(m, "cas") || starts(m, "swp");
+}
+
+// the flag setting aliases that name a register they only read (cmp is subs wzr, ...)
+bool a64_no_dest(const char* m)
+{
+    return !strcmp(m, "cmp") || !strcmp(m, "cmn") || !strcmp(m, "tst") || !strcmp(m, "ccmp") || !strcmp(m, "ccmn") ||
+           starts(m, "fcmp") || starts(m, "fccmp");
+}
+
+} // namespace
+
+bool disassembler::decode_arm64(const uint8_t* buf, size_t n, uint64_t addr, insn& out)
+{
+    if (n < 4 || (addr & 3))
+        return false;
+    const uint8_t* code = buf;
+    size_t size = 4;
+    uint64_t a = addr;
+    cs_insn* ci = (cs_insn*)scratch_;
+    if (!cs_disasm_iter((csh)handle_, &code, &size, &a, ci))
+        return false;
+    csh h = (csh)handle_;
+    out.arm = true;
+    out.addr = addr;
+    out.size = 4;
+    memcpy(out.bytes, ci->bytes, 4);
+    out.id = ci->id;
+    snprintf(out.mnem, sizeof(out.mnem), "%s", ci->mnemonic);
+    snprintf(out.ops, sizeof(out.ops), "%s", ci->op_str);
+    const cs_arm64& x = ci->detail->arm64;
+    unsigned id = ci->id;
+    out.sets_flags = x.update_flags;
+
+    switch (id) {
+    case ARM64_INS_BL: case ARM64_INS_BLR: case ARM64_INS_BLRAA: case ARM64_INS_BLRAAZ: case ARM64_INS_BLRAB:
+    case ARM64_INS_BLRABZ:
+        out.kind = flow::call;
+        out.indirect = id != ARM64_INS_BL;
+        break;
+    case ARM64_INS_B:
+        out.kind = x.cc == ARM64_CC_INVALID || x.cc == ARM64_CC_AL || x.cc == ARM64_CC_NV ? flow::jump : flow::cond;
+        break;
+    case ARM64_INS_BR: case ARM64_INS_BRAA: case ARM64_INS_BRAAZ: case ARM64_INS_BRAB: case ARM64_INS_BRABZ:
+        out.kind = flow::jump;
+        out.indirect = true;
+        break;
+    case ARM64_INS_CBZ: case ARM64_INS_CBNZ: case ARM64_INS_TBZ: case ARM64_INS_TBNZ:
+        out.kind = flow::cond;
+        break;
+    case ARM64_INS_RET: case ARM64_INS_RETAA: case ARM64_INS_RETAB: case ARM64_INS_ERET: case ARM64_INS_ERETAA:
+    case ARM64_INS_ERETAB:
+        out.kind = flow::ret;
+        break;
+    case ARM64_INS_BRK: case ARM64_INS_HLT: case ARM64_INS_UDF:
+        out.kind = flow::stop;
+        break;
+    default:
+        break;
+    }
+    bool branch = out.kind == flow::jump || out.kind == flow::cond || out.kind == flow::call;
+    const char* m = ci->mnemonic;
+    bool mem_insn = a64_mem_insn(m);
+    bool store = mem_insn && (m[0] == 's' || starts(m, "cas") || starts(m, "swp"));
+    size_t ml = strlen(m);
+    char last = ml ? m[ml - 1] : 0;
+    // ldp, stp, ldnp, ldxp, stlxp, ldpsw ... (swp is a swap, not a pair)
+    bool pair = mem_insn && !starts(m, "swp") && (last == 'p' || starts(m, "ldpsw"));
+    unsigned access = 0; // bytes one register of the load / store moves
+    if (mem_insn) {
+        if (strstr(m, "sw"))
+            access = 4;
+        else if (last == 'b' && !starts(m, "st1") && !starts(m, "ld1"))
+            access = 1;
+        else if (last == 'h')
+            access = 2;
+        out.mem_signed = strstr(m + 2, "rs") != nullptr || starts(m, "ldpsw");
+    }
+
+    auto add_write = [&](unsigned reg) {
+        int r = regs::a64_num(reg);
+        if (r < 0 || out.nwr >= 3)
+            return;
+        for (uint8_t i = 0; i < out.nwr; i++)
+            if (out.wr[i] == (uint8_t)r)
+                return;
+        out.wr[out.nwr++] = (uint8_t)r;
+    };
+    bool no_dest = a64_no_dest(m);
+    int regs_seen = 0;
+    bool literal = false;
+    for (uint8_t i = 0; i < x.op_count && i < 8; i++) {
+        const cs_arm64_op& op = x.operands[i];
+        if (op.type == ARM64_OP_REG) {
+            if (regs_seen == 0)
+                out.reg0 = op.reg;
+            else if (regs_seen == 1)
+                out.reg1 = op.reg;
+            else if (regs_seen == 2)
+                out.reg2 = op.reg;
+            regs_seen++;
+            if ((op.access & CS_AC_WRITE) && !no_dest && !store)
+                add_write(op.reg);
+            if (op.ext || op.shift.type == ARM64_SFT_LSL) {
+                out.ext = op.ext ? (uint8_t)(a64_uxtb + (op.ext - ARM64_EXT_UXTB)) : (uint8_t)a64_lsl;
+                out.shift = (uint8_t)op.shift.value;
+            }
+            if (mem_insn && !access && regs_seen == 1)
+                access = a64_reg_bytes(cs_reg_name(h, op.reg));
+        } else if (op.type == ARM64_OP_IMM) {
+            if (branch) {
+                out.has_target = true; // the last one: tbz w0, #3, target
+                out.target = (uint64_t)op.imm;
+            } else if (id == ARM64_INS_ADRP) {
+                out.has_page = true;
+                out.page = (uint64_t)op.imm;
+            } else if (id == ARM64_INS_ADR) {
+                out.has_mem = true;
+                out.is_lea = true;
+                out.mem = (uint64_t)op.imm;
+            } else if (mem_insn && regs_seen >= 1 && !x.post_index && i == regs_seen) {
+                literal = true; // ldr x0, #address
+                out.has_mem = true;
+                out.mem = (uint64_t)op.imm;
+            } else if (!out.has_imm) {
+                out.has_imm = true;
+                uint64_t v = (uint64_t)op.imm;
+                if (op.shift.type == ARM64_SFT_LSL && op.shift.value < 64)
+                    v <<= op.shift.value;
+                out.imm = v;
+            }
+        } else if (op.type == ARM64_OP_MEM) {
+            out.has_mem_op = true;
+            out.mem_base = op.mem.base;
+            out.mem_index = op.mem.index;
+            out.mem_disp = op.mem.disp;
+            out.mem_scale = op.mem.index ? 1 << (op.shift.type == ARM64_SFT_LSL ? op.shift.value : 0) : 0;
+            out.mem_write = store;
+            if (x.writeback)
+                add_write(op.mem.base);
+        }
+    }
+    if (mem_insn && !starts(m, "prfm")) {
+        out.mem_size = (uint8_t)std::min(access * (pair ? 2 : 1), 255u);
+        if (literal)
+            out.mem_write = false;
+    } else if (starts(m, "prfm")) {
+        out.has_mem = false; // a prefetch touches nothing
+        out.has_mem_op = false;
+    }
+    if (out.kind == flow::call)
+        add_write(ARM64_REG_LR);
+    if (out.indirect)
+        out.has_target = false;
+    return true;
+}
+
 bool disassembler::decode(const binary& b, uint64_t addr, insn& out)
 {
     uint8_t buf[16];
@@ -189,23 +383,52 @@ bool same_reg(unsigned a, unsigned b)
     return a != X86_REG_INVALID && canon(a) == canon(b);
 }
 
+int a64_num(unsigned r)
+{
+    if (r >= ARM64_REG_X0 && r <= ARM64_REG_X28)
+        return (int)(r - ARM64_REG_X0);
+    if (r >= ARM64_REG_W0 && r <= ARM64_REG_W30)
+        return (int)(r - ARM64_REG_W0);
+    switch (r) {
+    case ARM64_REG_FP: return 29;
+    case ARM64_REG_LR: return 30;
+    case ARM64_REG_SP: case ARM64_REG_WSP: return 31;
+    default: return -1;
+    }
+}
+
 }
 
 namespace ins {
 
-bool is_nop(unsigned id) { return id == X86_INS_NOP; }
-bool is_endbr(unsigned id) { return id == X86_INS_ENDBR64 || id == X86_INS_ENDBR32; }
-bool is_movsxd(unsigned id) { return id == X86_INS_MOVSXD; }
-bool is_move(unsigned id) { return id == X86_INS_MOV || id == X86_INS_MOVSXD || id == X86_INS_MOVZX || id == X86_INS_MOVSX; }
-bool is_add(unsigned id) { return id == X86_INS_ADD; }
-bool is_cmp(unsigned id) { return id == X86_INS_CMP; }
-bool is_ja(unsigned id) { return id == X86_INS_JA; }
-bool is_jae(unsigned id) { return id == X86_INS_JAE; }
-bool is_push(unsigned id) { return id == X86_INS_PUSH; }
-
-bool is_suspicious(unsigned id)
+bool is_nop(const insn& in) { return in.arm ? in.id == ARM64_INS_NOP : in.id == X86_INS_NOP; }
+bool is_endbr(const insn& in)
 {
-    switch (id) {
+    return in.arm ? in.id == ARM64_INS_BTI : in.id == X86_INS_ENDBR64 || in.id == X86_INS_ENDBR32;
+}
+bool is_movsxd(const insn& in) { return !in.arm && in.id == X86_INS_MOVSXD; }
+bool is_move(const insn& in)
+{
+    return !in.arm && (in.id == X86_INS_MOV || in.id == X86_INS_MOVSXD || in.id == X86_INS_MOVZX || in.id == X86_INS_MOVSX);
+}
+bool is_add(const insn& in) { return !in.arm && in.id == X86_INS_ADD; }
+bool is_cmp(const insn& in) { return !in.arm && in.id == X86_INS_CMP; }
+bool is_ja(const insn& in) { return !in.arm && in.id == X86_INS_JA; }
+bool is_jae(const insn& in) { return !in.arm && in.id == X86_INS_JAE; }
+bool is_push(const insn& in) { return !in.arm && in.id == X86_INS_PUSH; }
+
+bool is_suspicious(const insn& in)
+{
+    if (in.arm) {
+        switch (in.id) {
+        case ARM64_INS_HVC: case ARM64_INS_SMC: case ARM64_INS_ERET: case ARM64_INS_ERETAA: case ARM64_INS_ERETAB:
+        case ARM64_INS_DCPS1: case ARM64_INS_DCPS2: case ARM64_INS_DCPS3: case ARM64_INS_HLT:
+            return true;
+        default:
+            return false;
+        }
+    }
+    switch (in.id) {
     case X86_INS_IN: case X86_INS_OUT: case X86_INS_INSB: case X86_INS_INSD: case X86_INS_INSW:
     case X86_INS_OUTSB: case X86_INS_OUTSD: case X86_INS_OUTSW: case X86_INS_CLI: case X86_INS_STI:
     case X86_INS_HLT: case X86_INS_IRET: case X86_INS_IRETD: case X86_INS_IRETQ: case X86_INS_LJMP:
@@ -217,6 +440,33 @@ bool is_suspicious(unsigned id)
     default:
         return false;
     }
+}
+
+bool a64_adrp(const insn& in) { return in.arm && in.has_page; }
+bool a64_add_imm(const insn& in) { return in.arm && in.id == ARM64_INS_ADD && in.has_imm && in.reg0 && in.reg1 && !in.reg2; }
+bool a64_add_reg(const insn& in) { return in.arm && in.id == ARM64_INS_ADD && !in.has_imm && in.reg2; }
+bool a64_mov_reg(const insn& in) { return in.arm && in.id == ARM64_INS_MOV && !in.has_imm && in.reg0 && in.reg1 && !in.reg2; }
+bool a64_cmp_imm(const insn& in) { return in.arm && in.id == ARM64_INS_CMP && in.has_imm && in.reg0; }
+bool a64_bhi(const insn& in) { return in.arm && in.kind == flow::cond && !strcmp(in.mnem, "b.hi"); }
+bool a64_bhs(const insn& in) { return in.arm && in.kind == flow::cond && (!strcmp(in.mnem, "b.hs") || !strcmp(in.mnem, "b.cs")); }
+bool a64_bls(const insn& in) { return in.arm && in.kind == flow::cond && !strcmp(in.mnem, "b.ls"); }
+bool a64_blo(const insn& in) { return in.arm && in.kind == flow::cond && (!strcmp(in.mnem, "b.lo") || !strcmp(in.mnem, "b.cc")); }
+
+bool a64_prologue(uint32_t w)
+{
+    return ((w & 0xffc07fff) == 0xa9807bfd && (w & 0x00200000)) || // stp x29, x30, [sp, #-n]!
+           (w & 0xff8003ff) == 0xd10003ff ||                        // sub sp, sp, #n
+           w == 0xd503233f || w == 0xd503237f ||                    // paciasp, pacibsp
+           w == 0xd503245f || w == 0xd50324df;                      // bti c, bti jc
+}
+
+bool a64_gap_before(uint32_t w)
+{
+    return w == 0 || w == 0xd65f03c0 || w == 0xd65f0bff || w == 0xd65f0fff || // udf, ret, retaa, retab
+           w == 0xd503201f ||                                               // nop
+           (w & 0xfc000000) == 0x14000000 ||                                // b
+           (w & 0xfffffc1f) == 0xd61f0000 ||                                // br
+           (w & 0xffe0001f) == 0xd4200000;                                  // brk
 }
 
 }
@@ -266,7 +516,7 @@ bool disassembler::writes(const uint8_t* buf, size_t n, uint64_t addr,
     const std::function<bool(const char* reg, uint64_t& value)>& reg, std::vector<mem_write>& out)
 {
     out.clear();
-    if (!handle_ || !buf || n == 0)
+    if (!handle_ || !buf || n == 0 || arch_ == bin_arch::arm64)
         return false;
     const uint8_t* code = buf;
     size_t size = std::min<size_t>(n, 15);
