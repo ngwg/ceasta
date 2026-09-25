@@ -152,7 +152,7 @@ including the debugger tools and the safety notes, is in [connect an AI](docs/mc
 
 ## on linux
 
-the gui is windows-only, but the command line tool does the analysis, disassembly, decompiler, scripting and a terminal debugger. grab `ceasta-cli-x.y.z-linux-x64.tar.gz`, unpack and run — nothing else to install:
+the ready-to-run download is the command line tool: it does the analysis, disassembly, decompiler, scripting, a terminal debugger, binary diff, signatures and the mcp server. the full graphical app ships for windows today; a linux gui (glfw + opengl) is in the tree but experimental — you build it yourself (see [build](#build)), and it isn't in the downloads yet. grab `ceasta-cli-x.y.z-linux-x64.tar.gz`, unpack and run — nothing else to install:
 
 ```
 tar xzf ceasta-cli-*-linux-x64.tar.gz
@@ -187,9 +187,14 @@ everything needed is in the repo — just a compiler, nothing to fetch.
 - or cmake: `cmake -S . -B build` then `cmake --build build --config Release`
 - release files (zip + installer, needs [inno setup 6](https://jrsoftware.org/isinfo.php)): `powershell -ExecutionPolicy Bypass -File installer\package.ps1`
 
-**linux** (core + cli, the gui is windows-only)
+**linux** (core + cli)
 ```
 cmake -S . -B build && cmake --build build -j
+```
+
+**linux gui** (experimental — needs `libglfw3-dev` and an opengl dev package)
+```
+cmake -S . -B build -DCEASTA_LINUX_GUI=ON && cmake --build build -j
 ```
 
 ## code
