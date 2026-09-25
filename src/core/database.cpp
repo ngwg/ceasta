@@ -793,8 +793,12 @@ std::string database::serialize(bool with_program) const
         s += "name " + util::hex(n.first) + " " + n.second + "\n";
     for (const auto& c : user_comments)
         s += "comment " + util::hex(c.first) + " " + escape_line(c.second) + "\n";
-    for (uint64_t b : breakpoints)
+    for (uint64_t b : breakpoints) {
         s += "bp " + util::hex(b) + "\n";
+        auto c = bp_conditions.find(b);
+        if (c != bp_conditions.end() && !c->second.empty())
+            s += "bpcond " + util::hex(b) + " " + escape_line(c->second) + "\n";
+    }
     for (const auto& b : bookmarks)
         s += "bookmark " + util::hex(b.first) + (b.second.empty() ? std::string() : " " + escape_line(b.second)) + "\n";
     for (const xref& x : extra_xrefs)
@@ -908,6 +912,8 @@ bool database::load_annotations(std::string& err)
             breakpoints.insert(a);
         else if (kind == "bookmark" && bin.is_mapped(a))
             bookmarks[a] = unescape_line(rest);
+        else if (kind == "bpcond" && bin.is_mapped(a))
+            bp_conditions[a] = unescape_line(rest);
         else if (kind == "xref") {
             // "xref <from> <to> <kind>": a runtime-learned cross reference
             uint64_t to = 0;

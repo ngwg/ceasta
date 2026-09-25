@@ -1,5 +1,6 @@
 #include "cli/dbg_repl.h"
 
+#include "core/bp_cond.h"
 #include "core/database.h"
 #include "core/dbg_trace.h"
 #include "core/debugger.h"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -24,6 +26,9 @@ namespace {
 
 std::unique_ptr<database> g_db;
 debugger g_dbg;
+bp_conditions g_cond;                    // "b <addr> if <expr>"
+std::map<uint64_t, std::string> g_bpcond; // runtime address -> condition
+std::map<uint64_t, int> g_hits;
 uint64_t g_delta = 0;        // runtime - static, for the main image
 bool g_have_delta = false;
 
@@ -75,11 +80,32 @@ std::string disasm_rt(uint64_t rt, uint32_t& size)
     return "??";
 }
 
+// a breakpoint whose condition is false doesn't count as a stop: keep going
+bool skip_this_stop()
+{
+    if (g_dbg.state() != dbg_state::stopped || g_dbg.stop_reason() != "breakpoint")
+        return false;
+    auto c = g_bpcond.find(g_dbg.pc());
+    if (c == g_bpcond.end())
+        return false;
+    std::string err;
+    bool stop = g_cond.check(g_dbg, c->second, ++g_hits[g_dbg.pc()], err);
+    if (!err.empty())
+        printf("the condition doesn't work: %s\n", err.c_str());
+    if (stop)
+        return false;
+    return g_dbg.cont(err);
+}
+
 bool wait_stop(int timeout_ms = 60000)
 {
     uint64_t until = os::now_ms() + (uint64_t)timeout_ms;
-    while (g_dbg.state() == dbg_state::running && os::now_ms() < until)
-        g_dbg.poll(50);
+    while (os::now_ms() < until) {
+        while (g_dbg.state() == dbg_state::running && os::now_ms() < until)
+            g_dbg.poll(50);
+        if (!skip_this_stop())
+            break;
+    }
     return g_dbg.state() != dbg_state::running;
 }
 
@@ -182,6 +208,8 @@ void help()
         "  finish            run until the current function returns\n"
         "  until <addr>      run to an address\n"
         "  b <addr>          set a breakpoint     bd <addr>  delete    bl  list\n"
+        "  b <addr> if <e>   stop only when a lua expression holds: rax == 5, hits == 3,\n"
+        "                    str(rdi) == \"admin\", u32(rsp + 8) > 100\n"
         "  r                 registers            set <reg> <val>\n"
         "  u [addr] [n]      disassemble          dec [addr]  decompile the function\n"
         "  x <addr> [n]      hex dump memory      k [n]  stack\n"
@@ -326,15 +354,29 @@ int cmd_dbg(int argc, char** argv)
         } else if (c == "b" || c == "break") {
             uint64_t rt;
             if (tok.size() < 2 || !resolve_rt(tok[1], rt)) { printf("need an address\n"); continue; }
-            if (g_dbg.add_bp(rt, err)) printf("breakpoint at %s\n", loc_rt(rt).c_str());
-            else printf("%s\n", err.c_str());
+            // "b <addr> if <lua expression>"
+            std::string cond;
+            std::string rest = util::trim(line);
+            size_t at_if = rest.find(" if ");
+            if (at_if != std::string::npos)
+                cond = util::trim(rest.substr(at_if + 4));
+            if (!cond.empty() && !g_cond.valid(cond, err)) { printf("bad condition: %s\n", err.c_str()); continue; }
+            if (!g_dbg.add_bp(rt, err)) { printf("%s\n", err.c_str()); continue; }
+            if (cond.empty())
+                g_bpcond.erase(rt);
+            else
+                g_bpcond[rt] = cond;
+            printf("breakpoint at %s%s\n", loc_rt(rt).c_str(), cond.empty() ? "" : (" when " + cond).c_str());
         } else if (c == "bd" || c == "delete") {
             uint64_t rt;
             if (tok.size() < 2 || !resolve_rt(tok[1], rt)) { printf("need an address\n"); continue; }
+            g_bpcond.erase(rt);
             printf(g_dbg.del_bp(rt) ? "deleted\n" : "no breakpoint there\n");
         } else if (c == "bl") {
-            for (uint64_t a : g_dbg.bps())
-                printf("  %s\n", loc_rt(a).c_str());
+            for (uint64_t a : g_dbg.bps()) {
+                auto cond = g_bpcond.find(a);
+                printf("  %s%s\n", loc_rt(a).c_str(), cond == g_bpcond.end() ? "" : ("  when " + cond->second).c_str());
+            }
         } else if (c == "r" || c == "regs") {
             cmd_regs();
         } else if (c == "set") {

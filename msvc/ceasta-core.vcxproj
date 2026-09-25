@@ -45,6 +45,7 @@
   <ItemGroup>
     <ClCompile Include="..\src\core\analysis.cpp" />
     <ClCompile Include="..\src\core\binary.cpp" />
+    <ClCompile Include="..\src\core\bp_cond.cpp" />
     <ClCompile Include="..\src\core\database.cpp" />
     <ClCompile Include="..\src\core\dbg_trace.cpp" />
     <ClCompile Include="..\src\core\debugger.cpp" />

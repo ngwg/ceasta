@@ -1069,21 +1069,31 @@ void add_debug_inspect_tools(std::vector<tool>& t)
 
     add("debug_set_breakpoint",
         "Break when execution reaches an address or name of the file. Works before debug_start too; addresses "
-        "follow the program when it loads somewhere else (aslr / pie).",
-        schema({{"address", prop("string", "hex address or name")}}, {"address"}),
+        "follow the program when it loads somewhere else (aslr / pie). With a condition it only stops when the "
+        "condition holds: a Lua expression over the registers (rax, ecx, ...), hits (how often it was reached), "
+        "and memory readers u8/u16/u32/u64(addr), str(addr), wstr(addr) - e.g. \"rdi == 3\", \"hits == 100\", "
+        "\"str(rcx) == 'admin'\".",
+        schema({{"address", prop("string", "hex address or name")},
+                {"condition", prop("string", "optional: stop only when this Lua expression is true")}},
+               {"address"}),
         [](mcp_server& s, const json::value& args, std::string& out) {
             database* db = need_db(s, out);
             uint64_t a;
             std::string err;
             if (!db || !arg_addr(*db, args, "address", a, out))
                 return false;
+            std::string cond = util::trim(arg_str(args, "condition"));
             if (!s.debug.add_bp || !s.debug.add_bp(a, err)) {
                 out = "can't set it: " + err;
                 return false;
             }
+            if (s.debug.set_condition && !s.debug.set_condition(a, cond, err)) {
+                out = "the breakpoint is set, but the condition isn't valid: " + err;
+                return false;
+            }
             if (s.on_changed)
                 s.on_changed();
-            out = "breakpoint at " + db->location(a) + " (" + hexa(a) + ")";
+            out = "breakpoint at " + db->location(a) + " (" + hexa(a) + ")" + (cond.empty() ? "" : " when " + cond);
             return true;
         });
 
@@ -1107,8 +1117,10 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             if (!db)
                 return false;
             std::vector<uint64_t> b = s.debug.bps ? s.debug.bps() : std::vector<uint64_t>();
-            for (uint64_t a : b)
-                out += hexa(a) + "  " + db->location(a) + "\n";
+            for (uint64_t a : b) {
+                std::string c = s.debug.condition_of ? s.debug.condition_of(a) : std::string();
+                out += hexa(a) + "  " + db->location(a) + (c.empty() ? std::string() : "  when " + c) + "\n";
+            }
             if (b.empty())
                 out = "no breakpoints\n";
             return true;

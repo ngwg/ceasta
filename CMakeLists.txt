@@ -75,6 +75,7 @@ endfunction()
 add_library(ceasta_core STATIC
     src/core/analysis.cpp
     src/core/binary.cpp
+    src/core/bp_cond.cpp
     src/core/database.cpp
     src/core/dbg_trace.cpp
     src/core/debugger.cpp

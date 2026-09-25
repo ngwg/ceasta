@@ -84,6 +84,8 @@ static const std::vector<action>& actions()
         {"Debug", "Stop (end the program)", "Ctrl+F2", has_process, [](app_state& s) { dbg_stop(s); }},
         {"Debug", "Detach", "", has_process, [](app_state& s) { dbg_detach(s); }},
         {"Debug", "Toggle breakpoint", "F2", has_file, [](app_state& s) { app_toggle_bp(s, s.cursor); }},
+        {"Debug", "Breakpoint condition (stop only when...)", "Shift+F2", has_file,
+            [](app_state& s) { open_dialog(s, dialog_kind::bp_condition); }},
         {"Debug", "Attach to a process...", "", [](const app_state& s) { return no_process(s) && debugger::supported(); },
             [](app_state& s) { open_dialog(s, dialog_kind::attach); }},
         {"Debug", "Program arguments...", "", no_process, [](app_state& s) { open_dialog(s, dialog_kind::run_args); }},

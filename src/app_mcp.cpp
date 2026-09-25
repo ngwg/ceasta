@@ -63,10 +63,7 @@ void fill_debug_link(app_state& s, app_mcp& m)
 {
     mcp_debug_link& d = m.server.debug;
     d.get = [&s] { return &s.dbg; };
-    d.pump = [&s] {
-        if (s.dbg.state() == dbg_state::running)
-            s.dbg.poll(0);
-    };
+    d.pump = [&s] { app_dbg_pump(s, 0); };
     d.to_runtime = [&s](uint64_t a) { return app_to_runtime(s, a); };
     d.to_static = [&s](uint64_t rt, uint64_t& out) { return app_to_static(s, rt, out); };
     d.start = [&s, &m](const std::string& args, std::string& err) {
@@ -112,11 +109,21 @@ void fill_debug_link(app_state& s, app_mcp& m)
     d.del_bp = [&s](uint64_t a) {
         if (!s.db || !s.db->breakpoints.erase(a))
             return false;
+        s.db->bp_conditions.erase(a);
         s.db->dirty = true;
         s.version++;
         if (s.dbg.state() != dbg_state::none && s.dbg_mapped)
             s.dbg.del_bp(app_to_runtime(s, a));
         return true;
+    };
+    d.set_condition = [&s](uint64_t a, const std::string& cond, std::string& err) {
+        return app_set_bp_condition(s, a, cond, err);
+    };
+    d.condition_of = [&s](uint64_t a) {
+        if (!s.db)
+            return std::string();
+        auto c = s.db->bp_conditions.find(a);
+        return c == s.db->bp_conditions.end() ? std::string() : c->second;
     };
     d.bps = [&s] {
         return s.db ? std::vector<uint64_t>(s.db->breakpoints.begin(), s.db->breakpoints.end()) : std::vector<uint64_t>();

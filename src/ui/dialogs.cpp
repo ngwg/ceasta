@@ -28,6 +28,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::ai: return "Connect an AI###dlg";
     case dialog_kind::palette: return "Actions###dlg";
     case dialog_kind::bookmarks: return "Bookmarks###dlg";
+    case dialog_kind::bp_condition: return "Breakpoint condition###dlg";
     default: return "###dlg";
     }
 }
@@ -35,7 +36,8 @@ static const char* title(dialog_kind k)
 static bool needs_file(dialog_kind k)
 {
     return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
-           k == dialog_kind::search || k == dialog_kind::find || k == dialog_kind::bookmarks;
+           k == dialog_kind::search || k == dialog_kind::find || k == dialog_kind::bookmarks ||
+           k == dialog_kind::bp_condition;
 }
 
 void open(app_state& s, dialog_kind kind, uint64_t addr)
@@ -68,6 +70,10 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
             if (f)
                 d.addr = f->start;
         }
+    } else if (kind == dialog_kind::bp_condition) {
+        d.addr = db.an.item_head(addr);
+        auto c = db.bp_conditions.find(d.addr);
+        snprintf(d.buf, sizeof(d.buf), "%s", c == db.bp_conditions.end() ? "" : c->second.c_str());
     } else if (kind == dialog_kind::find) {
         snprintf(d.buf, sizeof(d.buf), "%s", s.search_text.c_str());
     } else if (kind == dialog_kind::run_args) {
@@ -492,6 +498,34 @@ static void save_changes(app_state& s, dialog_state& d)
     }
 }
 
+// when the breakpoint at d.addr should stop: a lua expression over registers and memory
+static void bp_condition(app_state& s, dialog_state& d)
+{
+    ImGui::Text("stop at %s only when:", s.db->location(d.addr).c_str());
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 34);
+    bool enter = ImGui::InputTextWithHint("##cond", "rax == 5", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::TextDisabled("registers (rax, ecx, ...), hits, and memory: u8 / u16 / u32 / u64(addr), str(addr)");
+    ImGui::TextDisabled("  hits == 10     rcx > 0x100 and rdx ~= 0     str(rdi) == \"admin\"     u32(rsp + 8) == 1");
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    ImGui::Spacing();
+    float bw = ImGui::GetFontSize() * 9;
+    bool ok = ImGui::Button("OK", ImVec2(bw, 0)) || enter;
+    ImGui::SameLine();
+    bool clear = ImGui::Button("Always stop", ImVec2(bw, 0));
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(bw, 0)))
+        ImGui::CloseCurrentPopup();
+    if (ok || clear) {
+        std::string err;
+        if (app_set_bp_condition(s, d.addr, clear ? std::string() : std::string(d.buf), err))
+            ImGui::CloseCurrentPopup();
+        else
+            d.error = err;
+    }
+}
+
 // the bookmarks: pick one to jump there; a note per bookmark; delete removes it
 static void bookmarks(app_state& s, dialog_state& d)
 {
@@ -654,6 +688,7 @@ static void shortcuts(app_state&, dialog_state&)
         {"F8", "step over"},                {"F4", "run to cursor"},
         {"Ctrl+F9", "step out (run until return)"}, {"Shift+F7", "step back (undo a step)"},
         {"F2", "toggle breakpoint"},        {"F12", "pause"},
+        {"Shift+F2", "breakpoint condition"},
         {"Ctrl+F2", "stop debugging"},      {"Ctrl+= / Ctrl+- / Ctrl+0", "text size"},
         {"Ctrl+wheel (graph)", "zoom"},     {"drag (graph)", "pan"},
     };
@@ -720,6 +755,7 @@ void draw(app_state& s)
         case dialog_kind::ai: ai(s, d); break;
         case dialog_kind::palette: palette::draw(s, d); break;
         case dialog_kind::bookmarks: bookmarks(s, d); break;
+        case dialog_kind::bp_condition: bp_condition(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

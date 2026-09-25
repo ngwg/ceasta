@@ -2,6 +2,7 @@
 #include "core/util.h"
 #include "imgui.h"
 #include "theme.h"
+#include "ui/dialogs.h"
 #include <algorithm>
 #include <cstring>
 
@@ -203,20 +204,26 @@ static void breakpoints(app_state& s)
     }
     uint64_t remove = 0;
     bool clear = ImGui::Button("Remove all");
-    if (ImGui::BeginTable("##bps", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersInnerV)) {
+    if (ImGui::BeginTable("##bps", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Address");
         ImGui::TableSetupColumn("Where");
         ImGui::TableSetupColumn("Instruction", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Stops when", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
         int i = 0;
         for (uint64_t a : db.breakpoints) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::PushID(i++);
-            if (ImGui::Selectable(db.fmt_addr(a).c_str(), false, ImGuiSelectableFlags_SpanAllColumns))
+            if (ImGui::Selectable(db.fmt_addr(a).c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
                 app_jump(s, a);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    dialogs::open(s, dialog_kind::bp_condition, a);
+            }
             if (ImGui::BeginPopupContextItem("##bp_ctx")) {
+                if (ImGui::MenuItem("Condition...", "Shift+F2"))
+                    dialogs::open(s, dialog_kind::bp_condition, a);
                 if (ImGui::MenuItem("Remove"))
                     remove = a;
                 ImGui::EndPopup();
@@ -228,6 +235,18 @@ static void breakpoints(app_state& s)
             insn in;
             if (db.decode(a, in))
                 ImGui::TextDisabled("%s", db.insn_text(in).c_str());
+            ImGui::TableNextColumn();
+            auto c = db.bp_conditions.find(a);
+            if (c != db.bp_conditions.end()) {
+                auto h = s.bp_hits.find(a);
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::call), "%s", c->second.c_str());
+                if (h != s.bp_hits.end()) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(%d hits)", h->second);
+                }
+            } else {
+                ImGui::TextDisabled("always");
+            }
         }
         ImGui::EndTable();
     }

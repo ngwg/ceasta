@@ -541,6 +541,44 @@ static void map_debuggee(app_state& s)
     }
 }
 
+void app_dbg_pump(app_state& s, uint32_t timeout_ms)
+{
+    if (s.dbg.state() == dbg_state::running)
+        s.dbg.poll(timeout_ms);
+    // past breakpoints whose condition didn't hold; the next one may stop again
+    for (int i = 0; i < 256 && s.auto_continue && s.dbg.state() == dbg_state::stopped; i++) {
+        s.auto_continue = false;
+        std::string err;
+        if (!s.dbg.cont(err)) {
+            app_log(s, "[debug] " + err, 1);
+            break;
+        }
+        s.dbg.poll(0);
+    }
+    if (s.dbg.state() != dbg_state::stopped)
+        s.auto_continue = false;
+}
+
+bool app_set_bp_condition(app_state& s, uint64_t addr, const std::string& expr, std::string& err)
+{
+    if (!s.db || !s.db->bin.is_mapped(addr))
+        return false;
+    std::string e = util::trim(expr);
+    if (!e.empty() && !s.conditions.valid(e, err))
+        return false;
+    if (!s.db->breakpoints.count(addr))
+        app_toggle_bp(s, addr);
+    if (e.empty())
+        s.db->bp_conditions.erase(addr);
+    else
+        s.db->bp_conditions[addr] = e;
+    s.db->dirty = true;
+    s.version++;
+    app_log(s, e.empty() ? "breakpoint at " + s.db->location(addr) + " stops every time"
+                         : "breakpoint at " + s.db->location(addr) + " stops when " + e);
+    return true;
+}
+
 void app_toggle_bp(app_state& s, uint64_t addr)
 {
     if (!s.db || !s.db->bin.is_mapped(addr))
@@ -548,6 +586,7 @@ void app_toggle_bp(app_state& s, uint64_t addr)
     bool live = s.dbg.state() != dbg_state::none && s.dbg_mapped;
     if (s.db->breakpoints.count(addr)) {
         s.db->breakpoints.erase(addr);
+        s.db->bp_conditions.erase(addr);
         if (live)
             s.dbg.del_bp(addr + s.dbg_delta);
         app_log(s, "breakpoint removed at " + s.db->location(addr));
@@ -573,6 +612,7 @@ void dbg_start(app_state& s)
     if (s.dbg.state() != dbg_state::none)
         return;
     std::string err;
+    s.bp_hits.clear();
     if (!s.dbg.start(s.db->bin.path, s.debug_args, "", err))
         app_log(s, err, 2);
     else
@@ -656,7 +696,7 @@ static void run_steps(app_state& s)
             // a single step lands within microseconds: check again right away at first, and
             // only wait in longer naps for a call that's being stepped over
             bool fresh = os::now_ms() - step_began < 2;
-            s.dbg.poll(fresh ? 0 : 1);
+            app_dbg_pump(s, fresh ? 0 : 1);
             if (s.dbg.state() == dbg_state::running) {
                 if (os::now_ms() >= until)
                     return; // still in a step (a long call being stepped over): next frame
@@ -797,6 +837,20 @@ static void setup_debugger(app_state& s)
     s.dbg.on_stop = [&s]() {
         uint64_t pc_static = 0;
         bool mapped = app_to_static(s, s.dbg.pc(), pc_static);
+        // a breakpoint with a condition stops only when the condition holds
+        if (mapped && s.db && s.dbg.stop_reason() == "breakpoint") {
+            auto c = s.db->bp_conditions.find(pc_static);
+            if (c != s.db->bp_conditions.end() && !c->second.empty()) {
+                std::string err;
+                bool stop = s.conditions.check(s.dbg, c->second, ++s.bp_hits[pc_static], err);
+                if (!err.empty())
+                    app_log(s, "[debug] the condition at " + s.db->location(pc_static) + " doesn't work: " + err, 1);
+                if (!stop) {
+                    s.auto_continue = true; // quietly: app_dbg_pump carries on
+                    return;
+                }
+            }
+        }
         std::string where = mapped ? s.db->location(pc_static) : util::hex(s.dbg.pc());
         if (!dbg_stepping(s)) // a multi-step logs one line when it ends
             app_log(s, "[debug] stopped: " + s.dbg.stop_reason() + " at " + where);
@@ -861,7 +915,7 @@ void app_background(app_state& s)
     if (dbg_stepping(s))
         run_steps(s);
     if (s.dbg.state() == dbg_state::running)
-        s.dbg.poll(10);
+        app_dbg_pump(s, 10);
     else
         os::sleep_ms(10);
 }
@@ -926,7 +980,9 @@ static void shortcuts(app_state& s)
     // debugger keys work everywhere
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F2))
         dbg_stop(s);
-    else if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+    else if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F2))
+        dialogs::open(s, dialog_kind::bp_condition, s.cursor);
+    else if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F2, false))
         app_toggle_bp(s, s.cursor);
     if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F9, false))
         dbg_continue(s);
@@ -987,8 +1043,7 @@ void app_frame(app_state& s)
         set_title(s);
     if (dbg_stepping(s))
         run_steps(s);
-    if (s.dbg.state() == dbg_state::running)
-        s.dbg.poll(0);
+    app_dbg_pump(s, 0);
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);

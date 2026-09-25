@@ -1,4 +1,5 @@
 #pragma once
+#include "core/bp_cond.h"
 #include "core/database.h"
 #include "core/debugger.h"
 #include "core/lua_host.h"
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -39,7 +41,7 @@ struct load_job {
 enum class center_view { listing, graph, pseudo };
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai, palette, bookmarks };
+    save_changes, ai, palette, bookmarks, bp_condition };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
@@ -121,6 +123,9 @@ struct app_state {
     bool step_over_mode = false;
     bool step_in_flight = false;
     bool step_until_return = false; // the multi-step is a step out
+    bp_conditions conditions;         // evaluates breakpoint conditions
+    std::map<uint64_t, int> bp_hits;  // per breakpoint (static address), this run
+    bool auto_continue = false;       // a breakpoint whose condition was false: keep running
     bool dbg_mapped = false;   // runtime addresses of the main image map onto the listing
     uint64_t dbg_delta = 0;    // runtime base - static base
     uint64_t dbg_image_size = 0;
@@ -186,6 +191,10 @@ void app_open_dialog_kind(app_state& s, dialog_kind kind, uint64_t addr = 0);
 // debugger, addresses are static (listing) unless said otherwise
 bool app_can_debug(const app_state& s, std::string* why = nullptr);
 void app_toggle_bp(app_state& s, uint64_t addr);
+// a condition for the breakpoint at addr (adds the breakpoint); "" makes it unconditional
+bool app_set_bp_condition(app_state& s, uint64_t addr, const std::string& expr, std::string& err);
+// poll the debugger, and keep going past breakpoints whose condition is false
+void app_dbg_pump(app_state& s, uint32_t timeout_ms = 0);
 void dbg_start(app_state& s);
 void dbg_attach(app_state& s, uint32_t pid);
 void dbg_continue(app_state& s);

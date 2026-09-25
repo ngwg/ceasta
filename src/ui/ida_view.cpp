@@ -91,6 +91,8 @@ static void row_menu(app_state& s, uint64_t a)
     ImGui::Separator();
     if (ImGui::MenuItem("Toggle breakpoint", "F2"))
         app_toggle_bp(s, a);
+    if (ImGui::MenuItem("Breakpoint condition...", "Shift+F2"))
+        dialogs::open(s, dialog_kind::bp_condition, a);
     if (ImGui::MenuItem("Run to here", "F4", false, s.dbg.state() == dbg_state::stopped && s.dbg_mapped)) {
         s.cursor = a;
         dbg_run_to_cursor(s);
@@ -198,8 +200,11 @@ static void listing(app_state& s)
 
             float mid = p.y + lh * 0.5f;
             float gx = p.x + x_gutter - ImGui::GetStyle().WindowPadding.x + cw * 0.9f;
-            if (item_row && db.breakpoints.count(r.addr))
+            if (item_row && db.breakpoints.count(r.addr)) {
                 dl->AddCircleFilled(ImVec2(gx, mid), lh * 0.28f, theme::bp);
+                if (db.bp_conditions.count(r.addr)) // a condition: a ring
+                    dl->AddCircleFilled(ImVec2(gx, mid), lh * 0.13f, theme::band_bg);
+            }
             if (item_row && db.bookmarks.count(r.addr)) // a bookmark: a bar at the left edge
                 dl->AddRectFilled(ImVec2(p.x - ImGui::GetStyle().WindowPadding.x + 1, p.y + 2),
                     ImVec2(p.x - ImGui::GetStyle().WindowPadding.x + 4, p.y + lh - 2), theme::label);

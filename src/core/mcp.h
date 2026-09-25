@@ -26,6 +26,9 @@ struct mcp_debug_link {
     std::function<bool(uint64_t addr, std::string& err)> add_bp;
     std::function<bool(uint64_t addr)> del_bp;
     std::function<std::vector<uint64_t>()> bps;
+    // a lua condition for a breakpoint ("" = always stop), and the one it has
+    std::function<bool(uint64_t addr, const std::string& cond, std::string& err)> set_condition;
+    std::function<std::string(uint64_t addr)> condition_of;
     std::function<uint64_t(uint64_t)> to_runtime;
     std::function<bool(uint64_t runtime, uint64_t& out)> to_static; // false outside the image
     std::function<void()> pump; // handle pending debug events (the cli polls here, the gui every frame)

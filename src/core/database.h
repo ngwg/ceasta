@@ -59,6 +59,7 @@ public:
     std::map<uint64_t, std::string> user_names;
     std::map<uint64_t, std::string> user_comments;
     std::set<uint64_t> breakpoints; // static addresses
+    std::map<uint64_t, std::string> bp_conditions; // lua expressions (see bp_cond.h); no entry = always stop
     std::vector<xref> extra_xrefs;  // learned at runtime (indirect call / jump targets)
     uint32_t crc = 0;
 

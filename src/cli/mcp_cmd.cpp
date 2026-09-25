@@ -1,5 +1,6 @@
 #include "cli/mcp_cmd.h"
 
+#include "core/bp_cond.h"
 #include "core/database.h"
 #include "core/debugger.h"
 #include "core/lua_host.h"
@@ -11,6 +12,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -43,6 +45,9 @@ struct cli_debug {
     bool have_delta = false;
     bool applied = false;   // pending breakpoints written into the process
     std::set<uint64_t> bps; // static addresses the user asked for
+    std::map<uint64_t, std::string> conds; // their conditions (static address)
+    std::map<uint64_t, int> hits;
+    bp_conditions eval;
 
     uint64_t to_rt(uint64_t st) const { return st + delta; }
     bool to_st(uint64_t rt, uint64_t& out) const
@@ -72,6 +77,15 @@ struct cli_debug {
                 dbg.add_bp(to_rt(s), err);
             applied = true;
         }
+        // a breakpoint whose condition is false: keep going
+        uint64_t at = 0;
+        for (int i = 0; i < 256 && dbg.state() == dbg_state::stopped && dbg.stop_reason() == "breakpoint" &&
+                        to_st(dbg.pc(), at) && conds.count(at); i++) {
+            std::string err;
+            if (eval.check(dbg, conds[at], ++hits[at], err) || !dbg.cont(err))
+                break;
+            dbg.poll(0);
+        }
     }
 };
 
@@ -100,11 +114,25 @@ void fill_link(mcp_server& s, cli_debug& c)
     };
     s.debug.del_bp = [&c](uint64_t st) {
         bool had = c.bps.erase(st) > 0;
+        c.conds.erase(st);
         if (c.have_delta && c.dbg.state() != dbg_state::none)
             c.dbg.del_bp(c.to_rt(st));
         return had;
     };
     s.debug.bps = [&c] { return std::vector<uint64_t>(c.bps.begin(), c.bps.end()); };
+    s.debug.set_condition = [&c](uint64_t st, const std::string& cond, std::string& err) {
+        if (!cond.empty() && !c.eval.valid(cond, err))
+            return false;
+        if (cond.empty())
+            c.conds.erase(st);
+        else
+            c.conds[st] = cond;
+        return true;
+    };
+    s.debug.condition_of = [&c](uint64_t st) {
+        auto it = c.conds.find(st);
+        return it == c.conds.end() ? std::string() : it->second;
+    };
 }
 
 } // namespace
