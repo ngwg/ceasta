@@ -773,6 +773,388 @@ void inspect_elf(const binary& b, file_info& out)
         }
 }
 
+// ------------------------------------------------------------------ mach-o
+
+uint32_t rd_be32(const std::vector<uint8_t>& f, uint64_t off)
+{
+    if (off + 4 > f.size())
+        return 0;
+    const uint8_t* p = &f[(size_t)off];
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+// a packed version: xxxx.yy.zz
+std::string macho_version(uint32_t v)
+{
+    std::string s = util::fmt("%u.%u", v >> 16, (v >> 8) & 0xff);
+    if (v & 0xff)
+        s += util::fmt(".%u", v & 0xff);
+    return s;
+}
+
+const char* macho_platform(uint32_t p)
+{
+    switch (p) {
+    case 1: return "macos";
+    case 2: return "ios";
+    case 3: return "tvos";
+    case 4: return "watchos";
+    case 5: return "bridgeos";
+    case 6: return "mac catalyst";
+    case 7: return "ios simulator";
+    case 8: return "tvos simulator";
+    case 9: return "watchos simulator";
+    case 10: return "driverkit";
+    case 11: return "visionos";
+    case 12: return "visionos simulator";
+    default: return "other";
+    }
+}
+
+// the code signature (big endian blobs in __LINKEDIT): who signed it, how, and the entitlements
+void macho_signature(const binary& b, uint64_t off, uint64_t size, file_info& out, std::string& sec,
+    std::vector<std::string>& ents)
+{
+    const std::vector<uint8_t>& f = b.file;
+    if (size < 12 || off + size > f.size() || rd_be32(f, off) != 0xfade0cc0) {
+        out.version.push_back({"signature", "damaged"});
+        return;
+    }
+    uint32_t count = std::min<uint32_t>(rd_be32(f, off + 8), 64);
+    uint32_t cd_flags = 0;
+    bool has_cd = false, has_cms = false;
+    std::string ident, team, signer;
+    uint8_t platform = 0;
+    for (uint32_t i = 0; i < count && 12 + (i + 1) * 8ull <= size; i++) {
+        uint32_t type = rd_be32(f, off + 12 + i * 8), boff = rd_be32(f, off + 16 + i * 8);
+        if (boff + 8ull > size)
+            continue;
+        uint64_t blob = off + boff;
+        uint32_t magic = rd_be32(f, blob), len = rd_be32(f, blob + 4);
+        if (len < 8 || boff + (uint64_t)len > size)
+            continue;
+        if (type == 0 && magic == 0xfade0c02 && len >= 44) {
+            // the code directory
+            has_cd = true;
+            uint32_t version = rd_be32(f, blob + 8);
+            cd_flags = rd_be32(f, blob + 12);
+            uint32_t ident_off = rd_be32(f, blob + 20);
+            platform = f[(size_t)blob + 38];
+            util::byte_reader r{f};
+            if (ident_off && ident_off < len)
+                ident = r.cstr(blob + ident_off, std::min<uint32_t>(len - ident_off, 256));
+            if (version >= 0x20200 && len >= 52) {
+                uint32_t team_off = rd_be32(f, blob + 48);
+                if (team_off && team_off < len)
+                    team = r.cstr(blob + team_off, std::min<uint32_t>(len - team_off, 64));
+            }
+        } else if (type == 5 && magic == 0xfade7171) {
+            // entitlements, an xml plist: the keys that aren't <false/>
+            std::string x(f.begin() + (ptrdiff_t)blob + 8, f.begin() + (ptrdiff_t)(blob + len));
+            size_t at = 0;
+            while ((at = x.find("<key>", at)) != std::string::npos && ents.size() < 64) {
+                size_t e = x.find("</key>", at);
+                if (e == std::string::npos)
+                    break;
+                std::string key = x.substr(at + 5, e - at - 5);
+                size_t v = x.find_first_not_of(" \t\r\n", e + 6);
+                if (v == std::string::npos || x.compare(v, 8, "<false/>") != 0)
+                    ents.push_back(key);
+                at = e + 6;
+            }
+        } else if (type == 0x10000 && magic == 0xfade0b01 && len > 8) {
+            // a cms signature with certificates: the signer's name is in there as text
+            has_cms = true;
+            static const char* const who[] = {"Developer ID Application: ", "Apple Distribution: ", "Apple Development: ",
+                "Mac Developer: ", "3rd Party Mac Developer Application: ", "iPhone Distribution: ", "iPhone Developer: ",
+                "Software Signing"};
+            for (const char* w : who) {
+                size_t wl = strlen(w);
+                auto it = std::search(f.begin() + (ptrdiff_t)blob, f.begin() + (ptrdiff_t)(blob + len), w, w + wl);
+                if (it == f.begin() + (ptrdiff_t)(blob + len))
+                    continue;
+                // a der string: its tag and length come just before the text
+                size_t at = (size_t)(it - f.begin()), n = 0;
+                uint8_t tag = at >= 2 ? f[at - 2] : 0, dl = at >= 1 ? f[at - 1] : 0;
+                if ((tag == 0x0c || tag == 0x13 || tag == 0x14 || tag == 0x16) && dl >= wl && dl < 0x80)
+                    n = dl;
+                std::string name;
+                for (; it != f.begin() + (ptrdiff_t)(blob + len) && *it >= 0x20 && *it < 0x7f && name.size() < (n ? n : 128); ++it)
+                    name += (char)*it;
+                signer = name == "Software Signing" ? "apple" : name;
+                break;
+            }
+        }
+    }
+    bool adhoc = (cd_flags & 0x2) || !has_cms;
+    std::string how = !has_cd ? "no code directory" : adhoc ? ((cd_flags & 0x20000) ? "ad-hoc (by the linker)" : "ad-hoc")
+                                                           : (signer.empty() ? "with a certificate" : signer);
+    if (platform)
+        how += ", an apple platform binary";
+    out.version.push_back({"signed", how});
+    if (!ident.empty())
+        out.version.push_back({"identifier", ident});
+    if (!team.empty() && team != "not set")
+        out.version.push_back({"team", team});
+    sec += adhoc ? ", ad-hoc signed" : ", signed";
+    if (cd_flags & 0x10000)
+        sec += ", hardened runtime";
+    if (cd_flags & 0x2000)
+        sec += ", library validation";
+    if (cd_flags & 0x800)
+        sec += ", restrict";
+}
+
+void inspect_macho(const binary& b, file_info& out)
+{
+    const std::vector<uint8_t>& f = b.file;
+    util::byte_reader r{f};
+    uint64_t base = b.slice_off, end = b.slice_size ? b.slice_off + b.slice_size : f.size();
+    if (r.u32(base) != 0xfeedfacf) {
+        out.header.push_back({"format", "mach-o (not read)"});
+        return;
+    }
+    uint32_t cpu = r.u32(base + 4), sub = r.u32(base + 8) & 0xffffff, type = r.u32(base + 12);
+    uint32_t ncmds = r.u32(base + 16), sizeofcmds = r.u32(base + 20), flags = r.u32(base + 24);
+    const char* kind = type == 2 ? "executable" : type == 6 ? "dynamic library" : type == 8 ? "bundle (a plugin)"
+                     : type == 1 ? "object file" : type == 0xb ? "kernel extension" : type == 7 ? "dynamic linker"
+                     : type == 4 ? "core dump" : "file";
+    std::string fmt = std::string("Mach-O 64-bit ") + kind;
+    if (!b.slices.empty()) {
+        std::string all;
+        // apple's names: x86_64, arm64
+        auto mac_name = [](bin_arch a) { return a == bin_arch::x64 ? "x86_64" : arch_name(a); };
+        for (bin_arch a : b.slices)
+            all += std::string(all.empty() ? "" : ", ") + mac_name(a);
+        fmt += " - universal (" + all + "), this is its " + mac_name(b.arch) + " part";
+    }
+    out.header.push_back({"format", fmt});
+    bool arm64e = cpu == 0x0100000c && sub == 2;
+    out.header.push_back({"cpu", cpu == 0x01000007 ? "x86_64" : arm64e ? "arm64e (pointer authentication)" : "arm64"});
+    if (b.has_entry)
+        out.header.push_back({"entry point", util::fmt("0x%llX", (unsigned long long)b.entry)});
+
+    std::string built, tools, uuid, id, dyld, rpaths, source;
+    std::vector<std::string> weak_libs;
+    bool thread_entry = false, has_sig = false, symbols = false;
+    uint32_t cryptid = 0, crypt_off = 0, crypt_size = 0;
+    uint64_t sig_off = 0, sig_size = 0, file_end = 0;
+    std::vector<std::string> ents;
+    std::string sec_extra;
+    bool swift = false, objc = false, go = false;
+    // a bad sizeofcmds can't reach past the file: every read below stays inside [base, end)
+    uint64_t off = base + 32, cmds_end = std::min<uint64_t>(base + 32 + (uint64_t)sizeofcmds, end);
+    for (uint32_t i = 0; i < ncmds && i < 65536 && off + 8 <= cmds_end && off + 8 <= end; i++) {
+        uint32_t cmd = r.u32(off), size = r.u32(off + 4);
+        if (size < 8 || off + size > cmds_end)
+            break;
+        auto str_at = [&](uint32_t field) {
+            uint32_t o = r.u32(off + field);
+            return o < size ? r.cstr(off + o, size - o) : std::string();
+        };
+        switch (cmd) {
+        case 0x19: { // segment: its sections
+            uint64_t vmaddr = r.u64(off + 24), fileoff = r.u64(off + 40), filesize = r.u64(off + 48);
+            uint32_t prot = r.u32(off + 60), nsects = r.u32(off + 64);
+            std::string segname;
+            for (int k = 0; k < 16 && f.size() > off + 8 + k && f[(size_t)(off + 8 + k)]; k++)
+                segname += (char)f[(size_t)(off + 8 + k)];
+            (void)vmaddr;
+            if (filesize)
+                file_end = std::max(file_end, fileoff + filesize);
+            for (uint32_t k = 0; k < nsects && k < 256 && 72 + (k + 1) * 80ull <= size; k++) {
+                uint64_t so = off + 72 + k * 80ull;
+                std::string sect, sseg;
+                for (int j = 0; j < 16 && f[(size_t)(so + j)]; j++)
+                    sect += (char)f[(size_t)(so + j)];
+                for (int j = 0; j < 16 && f[(size_t)(so + 16 + j)]; j++)
+                    sseg += (char)f[(size_t)(so + 16 + j)]; // an object file's one segment has no name
+                uint64_t addr = r.u64(so + 32), ssize = r.u64(so + 40);
+                uint32_t soff = r.u32(so + 48), sflags = r.u32(so + 64), stype = sflags & 0xff;
+                swift |= sect.compare(0, 8, "__swift5") == 0;
+                objc |= sect == "__objc_classlist" || sect == "__objc_imageinfo";
+                go |= sect == "__go_buildinfo" || sect == "__gopclntab" || sect == "__gosymtab";
+                file_info::section fs;
+                fs.name = (sseg.empty() ? segname : sseg) + "," + sect;
+                fs.addr = addr;
+                fs.size = ssize;
+                bool zero = stype == 1 || stype == 0xc || stype == 0x12;
+                fs.file_off = zero ? 0 : base + soff;
+                fs.file_size = zero || !soff ? 0 : ssize;
+                bool code = (sflags & 0x80000400) != 0;
+                bool w = type == 1 ? !code : (prot & 2) != 0;
+                fs.perms = std::string((prot & 1) || type == 1 ? "r" : "-") + (w ? "w" : "-") + (code ? "x" : "-");
+                if (fs.file_size && fs.file_off < end)
+                    fs.entropy = entropy(&f[(size_t)fs.file_off], (size_t)std::min<uint64_t>(fs.file_size, end - fs.file_off));
+                out.sections.push_back(fs);
+            }
+            break;
+        }
+        case 0x32: { // build version: platform, minimum os, sdk, tools
+            uint32_t plat = r.u32(off + 8), minos = r.u32(off + 12), sdk = r.u32(off + 16), ntools = r.u32(off + 20);
+            built = util::fmt("%s %s or later", macho_platform(plat), macho_version(minos).c_str());
+            if (sdk)
+                built += " (sdk " + macho_version(sdk) + ")";
+            for (uint32_t t = 0; t < ntools && t < 8 && 24 + (t + 1) * 8ull <= size; t++) {
+                uint32_t tool = r.u32(off + 24 + t * 8), ver = r.u32(off + 28 + t * 8);
+                const char* tn = tool == 1 ? "clang" : tool == 2 ? "swift" : tool == 3 ? "ld" : tool == 4 ? "lld" : nullptr;
+                if (tn)
+                    tools += util::fmt("%s%s %s", tools.empty() ? "" : ", ", tn, macho_version(ver).c_str());
+            }
+            break;
+        }
+        case 0x24: case 0x25: case 0x2f: case 0x30: { // version min (older linkers)
+            const char* plat = cmd == 0x24 ? "macos" : cmd == 0x25 ? "ios" : cmd == 0x2f ? "tvos" : "watchos";
+            built = util::fmt("%s %s or later", plat, macho_version(r.u32(off + 8)).c_str());
+            if (r.u32(off + 12))
+                built += " (sdk " + macho_version(r.u32(off + 12)) + ")";
+            break;
+        }
+        case 0x1b: // uuid
+            if (size >= 24) {
+                const uint8_t* u = &f[(size_t)off + 8];
+                uuid = util::fmt("%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X", u[0], u[1], u[2], u[3], u[4],
+                    u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+            }
+            break;
+        case 0xd: // this library's own name
+            id = str_at(8) + " (version " + macho_version(r.u32(off + 16)) + ")";
+            break;
+        case 0x18 | 0x80000000: // weak dylib
+            weak_libs.push_back(str_at(8));
+            break;
+        case 0xe: dyld = str_at(8); break;
+        case 0x1c | 0x80000000: rpaths += (rpaths.empty() ? "" : ", ") + str_at(8); break;
+        case 0x2a: { // source version a.b.c.d.e
+            uint64_t v = r.u64(off + 8);
+            source = util::fmt("%llu.%llu.%llu", (unsigned long long)(v >> 40), (unsigned long long)((v >> 30) & 0x3ff),
+                (unsigned long long)((v >> 20) & 0x3ff));
+            break;
+        }
+        case 0x5: thread_entry = true; break;
+        case 0x1d: // code signature
+            has_sig = true;
+            sig_off = base + r.u32(off + 8);
+            sig_size = r.u32(off + 12);
+            break;
+        case 0x2c: // encryption
+            crypt_off = r.u32(off + 8);
+            crypt_size = r.u32(off + 12);
+            cryptid = r.u32(off + 16);
+            break;
+        case 0x2: // symtab: any local names left?
+            symbols = r.u32(off + 12) > 0;
+            break;
+        case 0xb: // dysymtab: local symbols
+            symbols = r.u32(off + 12) > 0;
+            break;
+        default:
+            break;
+        }
+        off += size;
+    }
+    if (!built.empty())
+        out.header.push_back({"built for", built});
+    if (!tools.empty())
+        out.header.push_back({"built with", tools});
+    if (!source.empty() && source != "0.0.0")
+        out.header.push_back({"source version", source});
+    if (!uuid.empty())
+        out.header.push_back({"uuid", uuid});
+    if (!id.empty())
+        out.header.push_back({"library id", id});
+    if (!dyld.empty())
+        out.header.push_back({"dynamic linker", dyld});
+    if (!b.libs.empty()) {
+        std::string libs;
+        for (const std::string& l : b.libs) {
+            libs += (libs.empty() ? "" : ", ") + l;
+            if (std::find(weak_libs.begin(), weak_libs.end(), l) != weak_libs.end())
+                libs += " (weak)";
+        }
+        out.header.push_back({"needs", libs});
+    }
+    if (!rpaths.empty())
+        out.header.push_back({"rpaths", rpaths});
+    std::string lang;
+    for (const std::string& l : b.libs) {
+        swift |= l.find("libswiftCore") != std::string::npos;
+        objc |= l.find("libobjc") != std::string::npos;
+    }
+    if (swift)
+        lang += "swift";
+    if (objc)
+        lang += std::string(lang.empty() ? "" : ", ") + "objective-c";
+    if (go)
+        lang += std::string(lang.empty() ? "" : ", ") + "go (a go runtime is built in: most functions are the runtime's)";
+    if (!lang.empty())
+        out.header.push_back({"language", lang});
+
+    bool canary = false, fortify = false;
+    for (const import_entry& e : b.imports) {
+        canary = canary || e.name == "__stack_chk_fail" || e.name == "__stack_chk_guard";
+        fortify = fortify || (e.name.size() > 6 && e.name.compare(0, 2, "__") == 0 && e.name.compare(e.name.size() - 4, 4, "_chk") == 0);
+    }
+    std::string sec = type == 2 ? ((flags & 0x200000) ? "pie" : "no pie") : "position independent";
+    sec += (flags & 0x20000) ? ", executable stack" : ", nx stack";
+    sec += canary ? ", stack canary" : ", no canary";
+    if (fortify)
+        sec += ", fortify";
+    if (arm64e)
+        sec += ", pac";
+    if (has_sig)
+        macho_signature(b, sig_off, sig_size, out, sec, ents);
+    else
+        sec += ", not signed";
+    if (cryptid)
+        sec += ", encrypted";
+    if (type != 1) // an object file isn't run, none of it applies
+        out.header.push_back({"security", sec});
+    out.header.push_back({"symbols", symbols ? "yes (not stripped)" : "stripped"});
+    if (!ents.empty()) {
+        std::string e;
+        for (const std::string& k : ents)
+            e += (e.empty() ? "" : ", ") + k;
+        out.version.push_back({"entitlements", e});
+    }
+
+    // warnings
+    if (cryptid)
+        out.warnings.push_back(util::fmt("the code is encrypted (fairplay, an app store app): 0x%x bytes from file offset 0x%x read "
+                                         "as noise until it's decrypted on a device",
+            crypt_size, crypt_off));
+    if (has_bytes(f, (size_t)base, (size_t)std::min<uint64_t>(end, base + 0x1000), "UPX!", 4))
+        out.warnings.push_back("packed with UPX: the real code is compressed and unpacks itself when it runs. upx -d unpacks it");
+    if (type == 2 && thread_entry)
+        out.warnings.push_back("an old style entry point (LC_UNIXTHREAD): made by an old linker, or by hand");
+    if (!has_sig && cpu == 0x0100000c && (type == 2 || type == 6 || type == 8))
+        out.warnings.push_back("not signed: macos on apple silicon only runs signed arm64 code (codesign -s - signs it ad-hoc)");
+    std::string jit;
+    for (const std::string& k : ents) {
+        if (k == "com.apple.security.get-task-allow")
+            out.warnings.push_back("get-task-allow: any debugger may attach (a development build)");
+        else if (k == "com.apple.security.cs.disable-library-validation")
+            out.warnings.push_back("disable-library-validation: it loads libraries signed by anyone");
+        else if (k == "com.apple.security.cs.allow-dyld-environment-variables")
+            out.warnings.push_back("allow-dyld-environment-variables: DYLD_INSERT_LIBRARIES works on it (code can be injected)");
+        else if (k == "com.apple.security.cs.allow-unsigned-executable-memory" || k == "com.apple.security.cs.allow-jit" ||
+                 k == "com.apple.security.cs.disable-executable-page-protection")
+            jit += (jit.empty() ? "" : ", ") + k.substr(k.rfind('.') + 1);
+    }
+    if (!jit.empty())
+        out.warnings.push_back(jit + ": it may run code it writes to memory (a jit, or something unpacking itself)");
+    uint64_t slice_len = end - base;
+    // an object file keeps its symbols and relocations outside any segment
+    if (type != 1 && file_end && slice_len > file_end + 16)
+        out.warnings.push_back(util::fmt("%s after the end of the program (an overlay): data attached to the file",
+            kib(slice_len - file_end).c_str()));
+    for (const file_info::section& s : out.sections)
+        if (s.entropy > 7.2 && s.file_size > 4096 && !cryptid) {
+            out.warnings.push_back(util::fmt("%s has an entropy of %.2f: compressed or encrypted data", s.name.c_str(), s.entropy));
+            break;
+        }
+}
+
 } // namespace
 
 file_info inspect(const binary& b)
@@ -789,6 +1171,8 @@ file_info inspect(const binary& b)
         inspect_pe(b, out);
     else if (b.format == bin_format::elf)
         inspect_elf(b, out);
+    else if (b.format == bin_format::macho)
+        inspect_macho(b, out);
     else
         out.header.push_back({"format", util::fmt("raw %s code at 0x%llX", arch_name(b.arch), (unsigned long long)b.base)});
     if (out.entropy > 7.5 && b.file.size() > 16384)

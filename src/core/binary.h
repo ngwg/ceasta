@@ -3,9 +3,9 @@
 #include <string>
 #include <vector>
 
-// one loaded file, format independent. pe/elf/raw loaders fill this in.
+// one loaded file, format independent. pe/elf/mach-o/raw loaders fill this in.
 
-enum class bin_format { none, pe, elf, raw };
+enum class bin_format { none, pe, elf, raw, macho };
 enum class bin_arch { x86, x64, arm64 };
 
 constexpr uint32_t perm_r = 1;
@@ -64,7 +64,17 @@ struct binary {
     std::vector<symbol_entry> symbols;
     std::vector<uint64_t> func_hints;     // extra function starts (pdata, tls callbacks, init arrays)
     std::vector<uint64_t> ptr_locs;       // addresses holding absolute pointers (from relocations)
+    // exception landing pads (c++, rust): code only the unwinder jumps to. (function, pad): the
+    // pad is part of that function, not one of its own
+    std::vector<std::pair<uint64_t, uint64_t>> landing_pads;
+    // the file lists every function start (mach-o LC_FUNCTION_STARTS): code found any other way
+    // (a switch case nobody resolved, a pointer into the middle) is part of the function around it
+    bool starts_complete = false;
     std::vector<uint8_t> file;            // raw file bytes
+    // a universal (fat) mach-o file: the architectures in it, and where the loaded one is in file
+    std::vector<bin_arch> slices;
+    uint64_t slice_off = 0;
+    uint64_t slice_size = 0;              // 0: not a slice, the whole file
 
     int ptr_size() const { return arch == bin_arch::x86 ? 4 : 8; }
     bool is64() const { return arch != bin_arch::x86; }
@@ -99,16 +109,28 @@ bool parse_arch(const std::string& s, bin_arch& out);
 
 namespace loader {
 
-// detects pe / elf, anything else loads as a raw blob (x64, base 0)
-bool open(const std::string& path, binary& out, std::string& err);
-bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out, std::string& err);
+struct options {
+    // which part of a universal mach-o file to load. unset: x86_64 when it has one (the
+    // decompiler reads it), else arm64
+    bool has_slice = false;
+    bin_arch slice = bin_arch::x64;
+};
+
+// detects pe / elf / mach-o, anything else loads as a raw blob (x64, base 0)
+bool open(const std::string& path, binary& out, std::string& err, const options& o = options());
+bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out, std::string& err,
+    const options& o = options());
 void raw(std::vector<uint8_t> bytes, const std::string& path, uint64_t base, bin_arch arch, binary& out);
 
-// the machine a pe / elf file is built for, read from its header without loading it
+// the machine a pe / elf / mach-o file is built for, read from its header without loading it
 bool peek_arch(const std::string& path, bin_arch& out);
 
 // format parsers, work on out.file (set by the caller)
 bool pe(binary& out, std::string& err);
 bool elf(binary& out, std::string& err);
+bool macho(binary& out, std::string& err, const options& o);
+// a mach-o file, thin or universal (by its first bytes)
+bool is_macho(const std::vector<uint8_t>& head);
+bool macho_arch(const std::vector<uint8_t>& head, bin_arch& out);
 
 }

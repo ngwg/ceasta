@@ -2,6 +2,8 @@
 #include "core/database.h"
 #include "core/os.h"
 #include "imgui.h"
+#include <string>
+#include <unordered_map>
 
 // look of the app. three themes (dark, light, high contrast). the listing and
 // pseudocode colors are plain globals so a theme change updates them live.
@@ -17,6 +19,29 @@ inline const char* theme_name(ui_theme t)
     case ui_theme::contrast: return "high contrast";
     default: return "dark";
     }
+}
+
+// a shortcut as the keyboard says it: on a mac the ctrl shortcuts are the cmd key (imgui swaps
+// the two there), so "Ctrl+S" shows as "Cmd+S". takes string literals (kept by address)
+inline const char* keys(const char* s)
+{
+#ifdef __APPLE__
+    static std::unordered_map<const char*, std::string> cache;
+    auto it = cache.find(s);
+    if (it != cache.end())
+        return it->second.c_str();
+    std::string t = s;
+    if (t == "Alt+F4")
+        t = "Cmd+Q"; // quitting
+    for (const char* from : {"Ctrl+", "ctrl+"}) {
+        const char* to = from[0] == 'C' ? "Cmd+" : "cmd+";
+        for (size_t at = 0; (at = t.find(from, at)) != std::string::npos; at += 4)
+            t.replace(at, 5, to);
+    }
+    return cache.emplace(s, t).first->second.c_str();
+#else
+    return s;
+#endif
 }
 
 // ---- listing / syntax colors (set by apply_theme) ----
@@ -333,6 +358,10 @@ inline void load_fonts()
 #ifdef _WIN32
         "C:\\Windows\\Fonts\\consola.ttf",
         "C:\\Windows\\Fonts\\cour.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Menlo.ttc", // the first face in it is menlo regular
+        "/System/Library/Fonts/Monaco.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
 #else
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",

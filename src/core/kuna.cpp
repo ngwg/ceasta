@@ -16,11 +16,31 @@ std::string kuna_find(const std::string& configured)
 
 std::string kuna_unsupported(const binary& b)
 {
-    if (b.format != bin_format::pe && b.format != bin_format::elf)
-        return "kuna reads pe and elf files; this one was opened as raw code";
+    if (b.format != bin_format::pe && b.format != bin_format::elf && b.format != bin_format::macho)
+        return "kuna reads pe, elf and mach-o files; this one was opened as raw code";
     if (b.path.empty() || !os::exists(b.path))
         return "the program isn't on disk for kuna to read";
     return std::string();
+}
+
+std::string kuna_input(const binary& b, std::string& err)
+{
+    if (!b.slice_size)
+        return b.path;
+    if (b.slice_off > b.file.size() || b.slice_size > b.file.size() - b.slice_off) {
+        err = "the universal file's part is out of range";
+        return std::string();
+    }
+    const uint8_t* p = b.file.data() + b.slice_off;
+    uint32_t crc = util::crc32(p, (size_t)b.slice_size);
+    std::string dir = os::join(os::user_dir(), "kuna");
+    std::string out = os::join(dir, util::fmt("%08X-%s-%s", crc, arch_name(b.arch), b.name.c_str()));
+    if (os::exists(out))
+        return out;
+    os::make_dirs(dir);
+    if (!os::write_file(out, std::string((const char*)p, (size_t)b.slice_size), err))
+        return std::string();
+    return out;
 }
 
 namespace {

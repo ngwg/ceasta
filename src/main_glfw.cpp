@@ -1,4 +1,4 @@
-// linux (and any x11 / wayland) gui entry point: glfw + opengl3, around the same app_init /
+// linux (x11 / wayland) and macos gui entry point: glfw + opengl3, around the same app_init /
 // app_frame the windows build uses.
 #include "app.h"
 #include "core/os.h"
@@ -9,8 +9,17 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
+#ifdef __APPLE__
+#define GL_SILENCE_DEPRECATION // opengl still works on macos, it's only marked old
+#include <GLFW/glfw3.h>        // brings in <OpenGL/gl.h>
+// mac_platform.mm
+std::string mac_open_file_dialog(const char* title);
+std::string mac_save_file_dialog(const char* title, const std::string& suggested);
+void mac_fix_menu();
+#else
 #include <GLFW/glfw3.h>
 #include <GL/gl.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -52,10 +61,23 @@ static std::string run_dialog(const std::string& cmd)
     return rc == 0 ? out : std::string();
 }
 
-// file dialogs through zenity / kdialog when present; otherwise empty (drag and drop and the
-// command line still work)
+// a modal panel swallows the mouse button's release: nothing stays held down after one
+static void after_modal()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.ClearInputKeys();
+    io.ClearInputMouse();
+}
+
+// file dialogs: the system's panels on macos; zenity / kdialog when present elsewhere, otherwise
+// empty (drag and drop and the command line still work)
 static std::string open_file_dialog(const char* title)
 {
+#ifdef __APPLE__
+    std::string r = mac_open_file_dialog(title);
+    after_modal();
+    return r;
+#endif
     std::string t = shell_quote(title ? title : "Open"), tool = dialog_tool();
     if (tool == "zenity")
         return run_dialog("zenity --file-selection --title=" + t + " 2>/dev/null");
@@ -66,6 +88,11 @@ static std::string open_file_dialog(const char* title)
 
 static std::string save_file_dialog(const char* title, const std::string& suggested)
 {
+#ifdef __APPLE__
+    std::string r = mac_save_file_dialog(title, suggested);
+    after_modal();
+    return r;
+#endif
     std::string t = shell_quote(title ? title : "Save"), f = shell_quote(suggested), tool = dialog_tool();
     if (tool == "zenity")
         return run_dialog("zenity --file-selection --save --title=" + t + " --filename=" + f + " 2>/dev/null");
@@ -107,6 +134,8 @@ int main(int argc, char** argv)
                 CEASTA_VERSION);
             return 0;
         }
+        if (a.compare(0, 5, "-psn_") == 0)
+            continue; // what older macos adds when finder starts an app
         args.push_back(a);
     }
 
@@ -115,10 +144,20 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "couldn't start glfw (no display?)\n");
         return 1;
     }
+#ifdef __APPLE__
+    // macos only gives a modern context as 3.2 core, forward compatible (glsl 150)
+    mac_fix_menu();
+    const char* glsl_version = "#version 150";
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#else
     // opengl 3.0 + glsl 130, the imgui opengl3 backend's baseline
     const char* glsl_version = "#version 130";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+#endif
     // the desktop matches the window to ceasta.desktop (its icon, its name) by this class
     glfwWindowHintString(GLFW_X11_CLASS_NAME, "ceasta");
     glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "ceasta");
@@ -141,9 +180,11 @@ int main(int argc, char** argv)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr; // our own settings.ini lives in the user folder
 
-    float xscale = 1.0f, yscale = 1.0f;
-    glfwGetWindowContentScale(window, &xscale, &yscale);
-    float scale = xscale > 0 ? xscale : 1.0f;
+    // 1 on macos, where the window works in points and a retina screen just has more pixels per
+    // point (imgui draws its fonts at that density); the monitor's scale on x11
+    float scale = ImGui_ImplGlfw_GetContentScaleForWindow(window);
+    if (!(scale > 0))
+        scale = 1.0f;
 
     theme::apply_theme();
     ImGuiStyle& style = ImGui::GetStyle();

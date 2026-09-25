@@ -1,6 +1,7 @@
 name: build
 
-# every push: build + test on linux and windows, make the installer and try it.
+# every push: build + test on linux, windows and macos, make the installer, the appimage and the
+# mac app, and try them.
 # a v* tag (or a manual run with release_tag set) also publishes a github release.
 on:
   push:
@@ -133,9 +134,94 @@ jobs:
             dist/*.zip
             dist/*-setup.exe
 
+  macos:
+    name: macos - app + cli (apple silicon and intel)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: glfw (static, both architectures)
+        run: |
+          curl -fsSL -o glfw.zip https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip
+          unzip -q glfw.zip
+          cmake -S glfw-3.4 -B glfw-build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF -DGLFW_BUILD_DOCS=OFF \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_INSTALL_PREFIX="$PWD/glfw-install"
+          cmake --build glfw-build --parallel
+          cmake --install glfw-build
+
+      - name: build (one binary for arm64 and x86_64)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_PREFIX_PATH="$PWD/glfw-install"
+          cmake --build build --parallel
+          lipo -info build/ceasta-cli
+          lipo -info build/ceasta.app/Contents/MacOS/ceasta
+          test -f build/ceasta.app/Contents/Resources/plugins/hello.lua
+          test -f build/ceasta.app/Contents/Resources/ceasta.icns
+
+      - name: try the cli on the system's own programs
+        run: |
+          cli=build/ceasta-cli
+          $cli --version
+          # /bin/ls: universal (x86_64 + arm64e), chained fixups, signed by apple
+          $cli info /bin/ls | head -40
+          test "$($cli funcs /bin/ls | wc -l | tr -d ' ')" -gt 50
+          test "$($cli imports /bin/ls | wc -l | tr -d ' ')" -gt 20
+          # the arm64e part: its stubs (adrp / add / ldr / braa) call imports by name
+          stubs=$($cli funcs /bin/ls --arch arm64 | grep -c ' j_' || true)
+          echo "arm64e import stubs: $stubs"
+          test "$stubs" -gt 20
+          entry=$($cli info /bin/ls | awk '$1 == "entry" { print $2 }')
+          $cli decompile /bin/ls "$entry" | head -30
+          $cli info /usr/bin/curl | grep -E '^(format|signed|security|entitlements)'
+
+      - name: package (the app in a dmg, the cli in a tarball)
+        run: |
+          version=$(sed -n 's/^#define CEASTA_VERSION "\(.*\)"/\1/p' src/version.h)
+          mkdir -p dist dmg
+          cp -R build/ceasta.app dmg/
+          # signed ad-hoc as a whole, so the bundle's seal is intact: a broken one reads as "damaged"
+          codesign --force --deep --sign - dmg/ceasta.app
+          codesign --verify --deep --strict --verbose=2 dmg/ceasta.app
+          ln -s /Applications dmg/Applications
+          for i in 1 2 3; do
+            hdiutil create -volname "ceasta $version" -srcfolder dmg -ov -format UDZO dist/ceasta-$version-macos.dmg && break
+            sleep 5
+          done
+          test -f dist/ceasta-$version-macos.dmg
+          name=ceasta-cli-$version-macos
+          mkdir -p cli/$name
+          cp build/ceasta-cli README.md LICENSE docs/CHANGELOG.md docs/THIRD_PARTY_NOTICES.md cli/$name/
+          cp -r plugins cli/$name/
+          codesign --force --sign - cli/$name/ceasta-cli
+          tar -C cli -czf dist/$name.tar.gz $name
+
+      - name: try the app
+        run: |
+          app=dmg/ceasta.app/Contents/MacOS/ceasta
+          $app --version
+          # it has to open its window and keep running (opengl, the plugins): still alive after 10 s
+          $app /bin/ls > app.log 2>&1 &
+          pid=$!
+          sleep 10
+          if kill -0 $pid 2>/dev/null; then
+            echo "the app ran until it was stopped"
+            kill $pid
+          else
+            cat app.log
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceasta-macos
+          path: dist/*
+
   release:
     name: publish github release
-    needs: [linux, linux-gui, windows]
+    needs: [linux, linux-gui, windows, macos]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-24.04
     permissions:
@@ -167,6 +253,8 @@ jobs:
           - **ceasta-$version-windows-x64.zip** - portable, unzip and run \`ceasta.exe\`.
           - **ceasta-$version-linux-x64.AppImage** - the gui for linux (x64, ubuntu 22.04 or newer and the like): \`chmod +x\` it and run it. if your system has no fuse, run it with \`--appimage-extract-and-run\`.
           - **ceasta-cli-$version-linux-x64.tar.gz** - the command line tool for linux: analysis, disassembly, the decompiler, a terminal debugger (\`ceasta-cli dbg\`), binary diff, library signatures, lua scripting, and the mcp server (\`ceasta-cli mcp\`) for connecting an ai.
+          - **ceasta-$version-macos.dmg** - the app for macos 11 or newer, apple silicon and intel in one. it isn't notarized by apple, so the first time macos stops it: right-click ceasta.app > Open, or on macos 15 and later System Settings > Privacy & Security > Open Anyway. (or: \`xattr -dr com.apple.quarantine /Applications/ceasta.app\`.) no debugger on macos yet.
+          - **ceasta-cli-$version-macos.tar.gz** - the command line tool for macos (apple silicon and intel). if macos won't run it: \`xattr -d com.apple.quarantine ceasta-cli\`.
 
           checksums are in SHA256SUMS.txt.
           EOF

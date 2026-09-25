@@ -1,8 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
+# macos: runs on 11 (big sur, the first for apple silicon) and later. set before project()
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "the oldest macos ceasta runs on")
 project(ceasta VERSION 0.11.0 LANGUAGES C CXX)
 
 # ceasta: disassembler + debugger.
-#   core (loaders, analysis, lua, debugger) builds everywhere, the gui is windows / directx 11.
+#   core (loaders, analysis, lua, debugger) builds everywhere. the gui: windows / directx 11,
+#   linux (glfw + opengl, -DCEASTA_LINUX_GUI=ON), macos (ceasta.app, glfw + opengl).
 #   cmake -B build && cmake --build build --config Release
 
 set(CMAKE_CXX_STANDARD 17)
@@ -92,6 +95,7 @@ add_library(ceasta_core STATIC
     src/core/json.cpp
     src/core/kuna.cpp
     src/core/lua_host.cpp
+    src/core/macho.cpp
     src/core/mcp.cpp
     src/core/mcp_transport.cpp
     src/core/os.cpp
@@ -158,7 +162,7 @@ endif()
 # ---- experimental linux gui (glfw + opengl3), off by default ----
 # cmake -B build -DCEASTA_LINUX_GUI=ON  (needs libglfw3-dev and an opengl dev package)
 option(CEASTA_LINUX_GUI "build the experimental linux gui (glfw + opengl3)" OFF)
-if(CEASTA_LINUX_GUI AND NOT WIN32)
+if(CEASTA_LINUX_GUI AND NOT WIN32 AND NOT APPLE)
     find_package(glfw3 QUIET)
     find_package(OpenGL QUIET)
     if(glfw3_FOUND AND OpenGL_FOUND)
@@ -171,6 +175,41 @@ if(CEASTA_LINUX_GUI AND NOT WIN32)
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/plugins $<TARGET_FILE_DIR:ceasta>/plugins)
     else()
         message(WARNING "CEASTA_LINUX_GUI is on but glfw3 / OpenGL were not found; skipping the gui")
+    endif()
+endif()
+
+# ---- macos app (glfw + opengl3): ceasta.app ----
+# needs glfw: brew install glfw, or -DCMAKE_PREFIX_PATH=<where a glfw build is installed>
+if(APPLE)
+    option(CEASTA_MAC_GUI "build ceasta.app (needs glfw)" ON)
+endif()
+if(APPLE AND CEASTA_MAC_GUI)
+    find_package(glfw3 QUIET)
+    find_package(OpenGL QUIET)
+    if(glfw3_FOUND AND OpenGL_FOUND)
+        enable_language(OBJCXX)
+        set(mac_icon ${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/ceasta.icns)
+        set_source_files_properties(${mac_icon} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+        add_executable(ceasta MACOSX_BUNDLE
+            src/main_glfw.cpp
+            src/mac_platform.mm
+            third_party/imgui/backends/imgui_impl_glfw.cpp
+            third_party/imgui/backends/imgui_impl_opengl3.cpp
+            ${mac_icon})
+        # what a static glfw needs too
+        target_link_libraries(ceasta PRIVATE ceasta_ui glfw OpenGL::GL "-framework Cocoa" "-framework IOKit"
+            "-framework CoreFoundation" "-framework QuartzCore")
+        set_target_properties(ceasta PROPERTIES
+            MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/Info.plist.in
+            MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION}
+            MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION})
+        ceasta_warnings(ceasta)
+        # the plugins that ship with it live in the bundle's Resources folder
+        add_custom_command(TARGET ceasta POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/plugins
+                    $<TARGET_BUNDLE_CONTENT_DIR:ceasta>/Resources/plugins)
+    else()
+        message(WARNING "glfw or OpenGL not found: ceasta.app isn't built (brew install glfw)")
     endif()
 endif()
 

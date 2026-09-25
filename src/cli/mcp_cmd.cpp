@@ -36,6 +36,7 @@ void mcp_usage()
         "  --raw32 / --raw64    load the file as raw x86 / x64 code\n"
         "  --raw-arm64          load the file as raw arm64 code\n"
         "  --base <hex>         base address for raw files\n"
+        "  --arch x64|arm64     which part of a universal mach-o file to open\n"
         "  --kuna-path <file>   where kuna is, for decompile_with_kuna (default: kuna on PATH)\n");
 }
 
@@ -158,6 +159,12 @@ int cmd_mcp(int argc, char** argv)
         } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
             opts.force_raw = true;
             opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
+        } else if (a == "--arch" && i + 1 < argc) {
+            opts.has_slice = true;
+            if (!parse_arch(argv[++i], opts.slice)) {
+                fprintf(stderr, "--arch takes x64 or arm64\n");
+                return 2;
+            }
         } else if (a == "--base" && i + 1 < argc) {
             util::parse_hex(argv[++i], opts.raw_base);
         } else if (a == "--kuna-path" && i + 1 < argc) {

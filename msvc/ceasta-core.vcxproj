@@ -61,6 +61,7 @@
     <ClCompile Include="..\src\core\fileinfo.cpp" />
     <ClCompile Include="..\src\core\json.cpp" />
     <ClCompile Include="..\src\core\lua_host.cpp" />
+    <ClCompile Include="..\src\core\macho.cpp" />
     <ClCompile Include="..\src\core\mcp.cpp" />
     <ClCompile Include="..\src\core\mcp_transport.cpp" />
     <ClCompile Include="..\src\core\os.cpp" />

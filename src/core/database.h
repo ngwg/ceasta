@@ -51,6 +51,9 @@ struct load_options {
     bool force_raw = false;
     bin_arch raw_arch = bin_arch::x64;
     uint64_t raw_base = 0;
+    // a universal mach-o file: which part to open (unset: x86_64 when it has one)
+    bool has_slice = false;
+    bin_arch slice = bin_arch::x64;
     std::string project; // a project file to read names / comments from (and save to)
 };
 
