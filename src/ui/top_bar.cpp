@@ -158,9 +158,11 @@ static void debug_menu(app_state& s)
         dbg_detach(s);
     ImGui::Separator();
     if (ImGui::MenuItem("Toggle breakpoint", "F2", false, s.db != nullptr))
-        app_toggle_bp(s, s.cursor);
+        app_bp_key(s, s.cursor);
     if (ImGui::MenuItem("Breakpoint condition...", "Shift+F2", false, s.db != nullptr))
         dialogs::open(s, dialog_kind::bp_condition, s.cursor);
+    if (ImGui::MenuItem("Watch memory...", "F2 on data", false, s.db != nullptr))
+        dialogs::open(s, dialog_kind::watch, s.cursor);
     if (ImGui::MenuItem("Attach to process...", nullptr, false, debugger::supported() && st == dbg_state::none))
         dialogs::open(s, dialog_kind::attach, 0);
     if (ImGui::MenuItem("Program arguments...", nullptr, false, st == dbg_state::none))

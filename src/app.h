@@ -41,7 +41,7 @@ struct load_job {
 enum class center_view { listing, graph, pseudo };
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai, palette, bookmarks, bp_condition };
+    save_changes, ai, palette, bookmarks, bp_condition, watch };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
@@ -66,6 +66,8 @@ struct dialog_state {
     bool refocus = false;
     bool proceed = false; // save_changes answered with save / don't save
     int run_action = -1;  // palette: the action to run once it has closed
+    int watch_size = 4;   // watch: bytes, and whether reads stop too
+    bool watch_access = false;
 };
 
 struct app_state {
@@ -191,6 +193,15 @@ void app_open_dialog_kind(app_state& s, dialog_kind kind, uint64_t addr = 0);
 // debugger, addresses are static (listing) unless said otherwise
 bool app_can_debug(const app_state& s, std::string* why = nullptr);
 void app_toggle_bp(app_state& s, uint64_t addr);
+// f2: a breakpoint on code; on data (a variable) it offers a watch instead, since an int3 there
+// would change the data
+void app_bp_key(app_state& s, uint64_t addr);
+// watchpoints, for this run. addr is static when it's part of the file, else a runtime address
+// (the heap, the stack); del_watch takes the runtime address the debugger lists
+bool app_add_watch(app_state& s, uint64_t addr, int size, bool access, std::string& err);
+bool app_del_watch(app_state& s, uint64_t runtime);
+std::string app_where_runtime(const app_state& s, uint64_t runtime); // a name in the listing, or hex
+std::string app_stop_text(const app_state& s); // the stop reason, a watched address by its name
 // a condition for the breakpoint at addr (adds the breakpoint); "" makes it unconditional
 bool app_set_bp_condition(app_state& s, uint64_t addr, const std::string& expr, std::string& err);
 // poll the debugger, and keep going past breakpoints whose condition is false

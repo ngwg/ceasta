@@ -126,7 +126,7 @@ void draw(app_state& s)
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "running  (pid %u)", s.dbg.pid());
         return;
     }
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::pc_arrow), "stopped: %s", s.dbg.stop_reason().c_str());
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::pc_arrow), "stopped: %s", app_stop_text(s).c_str());
     ImGui::SameLine();
     ImGui::TextDisabled("pid %u  thread %u", s.dbg.pid(), s.dbg.tid());
     ImGui::Separator();

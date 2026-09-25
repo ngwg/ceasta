@@ -138,7 +138,7 @@ void draw(app_state& s)
     float pad = ImGui::GetStyle().WindowPadding.x;
 
     ImGuiListClipper clip;
-    clip.Begin((int)c.result.lines.size(), lh);
+    clip.Begin((int)c.result.lines.size(), lh + ImGui::GetStyle().ItemSpacing.y); // the row pitch
     while (clip.Step()) {
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
             const decomp_line& l = c.result.lines[(size_t)i];

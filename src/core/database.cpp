@@ -203,6 +203,10 @@ std::string database::location(uint64_t a) const
     const function* f = an.func_containing(a);
     if (f)
         return name_at(f->start) + "+" + util::hex(a - f->start);
+    // inside a named variable (an array, a struct): buf+2
+    uint64_t head = an.item_head(a);
+    if (head != a && !(n = name_at(head)).empty())
+        return n + "+" + util::hex(a - head);
     return fmt_addr(a);
 }
 

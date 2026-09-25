@@ -89,10 +89,16 @@ static void row_menu(app_state& s, uint64_t a)
     if (ImGui::MenuItem(db.bookmarks.count(db.an.item_head(a)) ? "Remove bookmark" : "Bookmark", "Alt+M"))
         app_toggle_bookmark(s, a);
     ImGui::Separator();
-    if (ImGui::MenuItem("Toggle breakpoint", "F2"))
-        app_toggle_bp(s, a);
-    if (ImGui::MenuItem("Breakpoint condition...", "Shift+F2"))
-        dialogs::open(s, dialog_kind::bp_condition, a);
+    const segment* seg = db.bin.seg_at(a);
+    bool code = (db.an.flags_at(a) & fl_code) || (seg && seg->exec()) || db.breakpoints.count(a);
+    if (code) {
+        if (ImGui::MenuItem("Toggle breakpoint", "F2"))
+            app_toggle_bp(s, a);
+        if (ImGui::MenuItem("Breakpoint condition...", "Shift+F2"))
+            dialogs::open(s, dialog_kind::bp_condition, a);
+    } else if (ImGui::MenuItem("Watch (stop when it's written)...", "F2")) {
+        dialogs::open(s, dialog_kind::watch, a);
+    }
     if (ImGui::MenuItem("Run to here", "F4", false, s.dbg.state() == dbg_state::stopped && s.dbg_mapped)) {
         s.cursor = a;
         dbg_run_to_cursor(s);
@@ -165,17 +171,20 @@ static void listing(app_state& s)
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float visible_h = ImGui::GetWindowHeight();
     float scroll_y = ImGui::GetScrollY();
+    // a row takes its height plus the item spacing: the clipper has to know, or the last rows
+    // of the file sit below the end of the scroll range
+    float pitch = lh + ImGui::GetStyle().ItemSpacing.y;
     line_text t;
 
     ImGuiListClipper clip;
-    clip.Begin((int)rows.size(), lh);
+    clip.Begin((int)rows.size(), pitch);
     if (s.scroll_to_cursor)
         clip.IncludeItemByIndex((int)cur_row);
     while (clip.Step()) {
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
             const row& r = rows[(size_t)i];
             if (s.scroll_to_cursor && (size_t)i == cur_row) {
-                float y = i * lh;
+                float y = i * pitch;
                 if (y < scroll_y || y + lh > scroll_y + visible_h)
                     ImGui::SetScrollHereY(0.3f);
             }
@@ -253,7 +262,7 @@ static void listing(app_state& s)
 
     // arrow keys move the cursor while the listing has focus
     if (focused && !ImGui::GetIO().WantTextInput) {
-        int page = std::max(1, (int)(visible_h / lh) - 2);
+        int page = std::max(1, (int)(visible_h / pitch) - 2);
         int delta = 0;
         if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
             delta = -1;

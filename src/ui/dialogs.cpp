@@ -29,6 +29,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::palette: return "Actions###dlg";
     case dialog_kind::bookmarks: return "Bookmarks###dlg";
     case dialog_kind::bp_condition: return "Breakpoint condition###dlg";
+    case dialog_kind::watch: return "Watch memory###dlg";
     default: return "###dlg";
     }
 }
@@ -37,7 +38,7 @@ static bool needs_file(dialog_kind k)
 {
     return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
            k == dialog_kind::search || k == dialog_kind::find || k == dialog_kind::bookmarks ||
-           k == dialog_kind::bp_condition;
+           k == dialog_kind::bp_condition || k == dialog_kind::watch;
 }
 
 void open(app_state& s, dialog_kind kind, uint64_t addr)
@@ -74,6 +75,13 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
         d.addr = db.an.item_head(addr);
         auto c = db.bp_conditions.find(d.addr);
         snprintf(d.buf, sizeof(d.buf), "%s", c == db.bp_conditions.end() ? "" : c->second.c_str());
+    } else if (kind == dialog_kind::watch) {
+        // the variable under the cursor: its name, and its size when the cpu can watch that
+        uint64_t head = db.an.item_head(addr);
+        std::string n = db.name_at(head);
+        snprintf(d.buf, sizeof(d.buf), "%s", n.empty() ? db.fmt_addr(head).c_str() : n.c_str());
+        uint32_t size = db.an.item_size(head);
+        d.watch_size = (size == 1 || size == 2 || size == 4 || size == 8) && head % size == 0 ? (int)size : head % 4 ? 1 : 4;
     } else if (kind == dialog_kind::find) {
         snprintf(d.buf, sizeof(d.buf), "%s", s.search_text.c_str());
     } else if (kind == dialog_kind::run_args) {
@@ -526,6 +534,49 @@ static void bp_condition(app_state& s, dialog_state& d)
     }
 }
 
+// a watchpoint: the program stops right after something writes (or reads) the memory
+static void watch(app_state& s, dialog_state& d)
+{
+    ImGui::TextDisabled("a variable's name or address; heap and stack addresses work too");
+    focus_first();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28);
+    bool enter = ImGui::InputText("##what", d.buf, sizeof(d.buf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("bytes");
+    for (int n : {1, 2, 4, 8}) {
+        ImGui::SameLine();
+        ImGui::RadioButton(util::fmt("%d##sz", n).c_str(), &d.watch_size, n);
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("stop when it's");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("written", !d.watch_access))
+        d.watch_access = false;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("read or written", d.watch_access))
+        d.watch_access = true;
+    bool stopped = s.dbg.state() == dbg_state::stopped;
+    if (!stopped)
+        ImGui::TextDisabled(s.dbg.state() == dbg_state::none ? "watches work while debugging: start the program (F9) first"
+                                                             : "pause the program (F12) to add a watch");
+    else
+        ImGui::TextDisabled("up to 4 watches, for this run; the Breakpoints tab lists them");
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    if (ok_cancel(stopped) || (enter && stopped)) {
+        uint64_t a = 0;
+        std::string err;
+        if (!s.db->resolve(d.buf, a))
+            d.error = "no such address or name";
+        else if (!app_add_watch(s, a, d.watch_size, d.watch_access, err))
+            d.error = err;
+        else {
+            s.bottom_tab_request = 2;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+}
+
 // the bookmarks: pick one to jump there; a note per bookmark; delete removes it
 static void bookmarks(app_state& s, dialog_state& d)
 {
@@ -756,6 +807,7 @@ void draw(app_state& s)
         case dialog_kind::palette: palette::draw(s, d); break;
         case dialog_kind::bookmarks: bookmarks(s, d); break;
         case dialog_kind::bp_condition: bp_condition(s, d); break;
+        case dialog_kind::watch: watch(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

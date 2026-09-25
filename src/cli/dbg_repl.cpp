@@ -109,6 +109,19 @@ bool wait_stop(int timeout_ms = 60000)
     return g_dbg.state() != dbg_state::running;
 }
 
+// the stop reason, a watched address by its name
+std::string stop_text()
+{
+    std::string why = g_dbg.stop_reason();
+    for (const debugger::watch& w : g_dbg.watches()) {
+        std::string hex = util::hex(w.addr);
+        if (why.compare(0, 10, "watchpoint") == 0 && why.size() > hex.size() &&
+            why.compare(why.size() - hex.size(), hex.size(), hex) == 0)
+            return why.substr(0, why.size() - hex.size()) + loc_rt(w.addr);
+    }
+    return why;
+}
+
 void show_stop()
 {
     if (g_dbg.state() == dbg_state::none) {
@@ -118,7 +131,7 @@ void show_stop()
     uint64_t pc = g_dbg.pc();
     uint32_t sz = 0;
     std::string ins = disasm_rt(pc, sz);
-    std::string why = g_dbg.stop_reason();
+    std::string why = stop_text();
     printf("\n%s  %s\n    %s\n", loc_rt(pc).c_str(), why.empty() ? "" : ("(" + why + ")").c_str(), ins.c_str());
 }
 
@@ -133,6 +146,24 @@ bool resolve_rt(const std::string& tok, uint64_t& rt)
     uint64_t v = 0;
     if (util::parse_hex(tok, v)) { rt = to_rt(v); return true; } // treat as a static address
     return false;
+}
+
+// an address in live memory: a register, $pc / $sp, a name or address of the file (moved to
+// where it is in the process), or else a raw runtime address (the heap, the stack)
+bool resolve_live(const std::string& tok, uint64_t& rt)
+{
+    std::string t = util::lower(tok[0] == '$' ? tok.substr(1) : tok);
+    for (const reg_value& r : g_dbg.registers())
+        if (r.name == t) {
+            rt = r.value;
+            return true;
+        }
+    uint64_t st = 0;
+    if (g_db && g_db->resolve(tok, st)) {
+        rt = g_db->bin.is_mapped(st) ? to_rt(st) : st;
+        return true;
+    }
+    return resolve_rt(tok, rt);
 }
 
 void cmd_regs()
@@ -210,6 +241,8 @@ void help()
         "  b <addr>          set a breakpoint     bd <addr>  delete    bl  list\n"
         "  b <addr> if <e>   stop only when a lua expression holds: rax == 5, hits == 3,\n"
         "                    str(rdi) == \"admin\", u32(rsp + 8) > 100\n"
+        "  watch <addr> [n]  stop after the program writes those n bytes (1, 2, 4, 8; default 4)\n"
+        "  awatch <addr> [n] stop after it reads or writes them      unwatch <addr>\n"
         "  r                 registers            set <reg> <val>\n"
         "  u [addr] [n]      disassemble          dec [addr]  decompile the function\n"
         "  x <addr> [n]      hex dump memory      k [n]  stack\n"
@@ -377,6 +410,20 @@ int cmd_dbg(int argc, char** argv)
                 auto cond = g_bpcond.find(a);
                 printf("  %s%s\n", loc_rt(a).c_str(), cond == g_bpcond.end() ? "" : ("  when " + cond->second).c_str());
             }
+            for (const debugger::watch& w : g_dbg.watches())
+                printf("  watch %s, %d byte%s, %s\n", loc_rt(w.addr).c_str(), w.size, w.size == 1 ? "" : "s",
+                    w.access ? "read or write" : "write");
+        } else if (c == "watch" || c == "awatch") {
+            uint64_t rt;
+            if (tok.size() < 2 || !resolve_live(tok[1], rt)) { printf("usage: %s <addr> [1|2|4|8]\n", c.c_str()); continue; }
+            int n = tok.size() > 2 ? atoi(tok[2].c_str()) : 4;
+            if (!g_dbg.add_watch(rt, n, c == "awatch", err)) { printf("%s\n", err.c_str()); continue; }
+            printf("watching %s (%d byte%s): stops after a %s\n", loc_rt(rt).c_str(), n, n == 1 ? "" : "s",
+                c == "awatch" ? "read or write" : "write");
+        } else if (c == "unwatch") {
+            uint64_t rt;
+            if (tok.size() < 2 || !resolve_live(tok[1], rt)) { printf("need an address\n"); continue; }
+            printf(g_dbg.del_watch(rt) ? "stopped watching %s\n" : "no watch at %s\n", loc_rt(rt).c_str());
         } else if (c == "r" || c == "regs") {
             cmd_regs();
         } else if (c == "set") {

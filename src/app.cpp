@@ -602,6 +602,62 @@ void app_toggle_bp(app_state& s, uint64_t addr)
     s.version++;
 }
 
+void app_bp_key(app_state& s, uint64_t addr)
+{
+    if (!s.db || !s.db->bin.is_mapped(addr))
+        return;
+    uint64_t head = s.db->an.item_head(addr);
+    const segment* seg = s.db->bin.seg_at(head);
+    bool code = (s.db->an.flags_at(head) & fl_code) || (seg && seg->exec());
+    if (code || s.db->breakpoints.count(head))
+        app_toggle_bp(s, head);
+    else
+        dialogs::open(s, dialog_kind::watch, head);
+}
+
+std::string app_where_runtime(const app_state& s, uint64_t runtime)
+{
+    uint64_t st = 0;
+    return app_to_static(s, runtime, st) ? s.db->location(st) : util::hex(runtime);
+}
+
+bool app_add_watch(app_state& s, uint64_t addr, int size, bool access, std::string& err)
+{
+    if (s.dbg.state() != dbg_state::stopped) {
+        err = s.dbg.state() == dbg_state::none ? "start the program first (F9)" : "pause the program first (F12)";
+        return false;
+    }
+    uint64_t rt = s.db && s.dbg_mapped && s.db->bin.is_mapped(addr) ? app_to_runtime(s, addr) : addr;
+    if (!s.dbg.add_watch(rt, size, access, err))
+        return false;
+    app_log(s, util::fmt("[debug] watching %s (%d byte%s): the program stops after it's %s", app_where_runtime(s, rt).c_str(),
+        size, size == 1 ? "" : "s", access ? "read or written" : "written"));
+    return true;
+}
+
+bool app_del_watch(app_state& s, uint64_t runtime)
+{
+    std::string where = app_where_runtime(s, runtime);
+    if (!s.dbg.del_watch(runtime))
+        return false;
+    app_log(s, "[debug] stopped watching " + where);
+    return true;
+}
+
+std::string app_stop_text(const app_state& s)
+{
+    std::string why = s.dbg.stop_reason();
+    if (why.compare(0, 10, "watchpoint") != 0)
+        return why;
+    for (const debugger::watch& w : s.dbg.watches()) {
+        std::string hex = util::hex(w.addr);
+        size_t at = why.find(hex);
+        if (at != std::string::npos && at + hex.size() == why.size())
+            return why.substr(0, at) + app_where_runtime(s, w.addr);
+    }
+    return why;
+}
+
 void dbg_start(app_state& s)
 {
     std::string why;
@@ -675,8 +731,9 @@ static void steps_finished(app_state& s)
     std::string why = s.dbg.stop_reason();
     if (s.dbg.state() != dbg_state::stopped)
         app_log(s, util::fmt("[debug] the program ended after %d of %d steps", done, wanted));
-    else if (why != "step" && why != "step over") // a breakpoint, a fault, a pause
-        app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, why.c_str(), pc_where(s).c_str()));
+    else if (why != "step" && why != "step over") // a breakpoint, a watch, a fault, a pause
+        app_log(s, util::fmt("[debug] stopped after %d of %d steps: %s at %s", done, wanted, app_stop_text(s).c_str(),
+            pc_where(s).c_str()));
     else if (s.step_until_return)
         app_log(s, util::fmt("[debug] returned to %s (%d steps)", pc_where(s).c_str(), done));
     else
@@ -853,7 +910,7 @@ static void setup_debugger(app_state& s)
         }
         std::string where = mapped ? s.db->location(pc_static) : util::hex(s.dbg.pc());
         if (!dbg_stepping(s)) // a multi-step logs one line when it ends
-            app_log(s, "[debug] stopped: " + s.dbg.stop_reason() + " at " + where);
+            app_log(s, "[debug] stopped: " + app_stop_text(s) + " at " + where);
         if (mapped)
             app_jump(s, pc_static, false);
         s.lua.fire("stop", (int64_t)(mapped ? pc_static : s.dbg.pc()));
@@ -983,7 +1040,7 @@ static void shortcuts(app_state& s)
     else if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F2))
         dialogs::open(s, dialog_kind::bp_condition, s.cursor);
     else if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F2, false))
-        app_toggle_bp(s, s.cursor);
+        app_bp_key(s, s.cursor);
     if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F9, false))
         dbg_continue(s);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F7))

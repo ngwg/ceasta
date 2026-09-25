@@ -23,7 +23,7 @@ void draw(app_state& s)
     } else if (s.dbg.state() == dbg_state::running) {
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "debugging: running");
     } else if (s.dbg.state() == dbg_state::stopped) {
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::pc_arrow), "debugging: stopped (%s)", s.dbg.stop_reason().c_str());
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::pc_arrow), "debugging: stopped (%s)", app_stop_text(s).c_str());
     } else {
         ImGui::TextDisabled("ready");
     }

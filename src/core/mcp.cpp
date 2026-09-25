@@ -765,6 +765,13 @@ std::string symbolize(mcp_server& s, database& db, debugger& d, uint64_t v)
     return std::string();
 }
 
+// a watched runtime address, by name when it's in the file
+std::string watch_where(mcp_server& s, database& db, debugger& d, uint64_t a)
+{
+    std::string sym = symbolize(s, db, d, a);
+    return sym.empty() || sym[0] == '"' ? hexa(a) : sym + " (" + hexa(a) + ")";
+}
+
 std::string where_text(mcp_server& s, database& db, debugger& d, uint64_t pc)
 {
     uint64_t st = 0;
@@ -789,7 +796,14 @@ std::string state_text(mcp_server& s, database& db)
     }
     if (d->state() == dbg_state::running)
         return "running (debug_pause stops it)";
-    return "stopped: " + d->stop_reason() + "\nat " + where_text(s, db, *d, d->pc()) + "\n";
+    std::string why = d->stop_reason();
+    for (const debugger::watch& w : d->watches()) { // "watchpoint: write to counter (0x...)"
+        std::string hex = util::hex(w.addr);
+        if (why.size() > hex.size() && why.compare(why.size() - hex.size(), hex.size(), hex) == 0 &&
+            why.compare(0, 10, "watchpoint") == 0)
+            why = why.substr(0, why.size() - hex.size()) + watch_where(s, db, *d, w.addr);
+    }
+    return "stopped: " + why + "\nat " + where_text(s, db, *d, d->pc()) + "\n";
 }
 
 debugger* stopped_dbg(mcp_server& s, std::string& out)
@@ -804,6 +818,23 @@ debugger* stopped_dbg(mcp_server& s, std::string& out)
         return nullptr;
     }
     return d;
+}
+
+// "address" of a live-memory tool: a register name, a name or address of the file (moved to
+// where it is in the process), or a raw runtime address
+bool live_addr(mcp_server& s, database& db, debugger& d, const json::value& args, uint64_t& a, std::string& out)
+{
+    std::string t = util::lower(util::trim(arg_str(args, "address")));
+    for (const reg_value& r : d.registers())
+        if (!t.empty() && util::lower(r.name) == t) {
+            a = r.value;
+            return true;
+        }
+    if (!arg_addr(db, args, "address", a, out))
+        return false;
+    if (db.bin.is_mapped(a) && s.debug.to_runtime)
+        a = s.debug.to_runtime(a);
+    return true;
 }
 
 // after a run command: wait for the stop, then describe where it is
@@ -1111,7 +1142,8 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             return ok;
         });
 
-    add("debug_list_breakpoints", "The breakpoints (static addresses of the file).", schema({}),
+    add("debug_list_breakpoints", "The breakpoints (static addresses of the file) and the watches (runtime addresses).",
+        schema({}),
         [](mcp_server& s, const json::value&, std::string& out) {
             database* db = need_db(s, out);
             if (!db)
@@ -1123,6 +1155,45 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             }
             if (b.empty())
                 out = "no breakpoints\n";
+            debugger* d = dbg_of(s);
+            if (d)
+                for (const debugger::watch& w : d->watches())
+                    out += util::fmt("watch %s, %d byte%s, stops after a %s\n", watch_where(s, *db, *d, w.addr).c_str(), w.size,
+                        w.size == 1 ? "" : "s", w.access ? "read or write" : "write");
+            return true;
+        });
+
+    add("debug_watch",
+        "A watchpoint: the program stops right after an instruction writes the memory (with access: reads or "
+        "writes it) - find who changes a variable, a flag, a buffer. Address as for debug_read_memory: a register, "
+        "a name or address of the file, or a runtime address (heap, stack). 1, 2, 4 or 8 bytes, aligned to the "
+        "size; up to 4 at once; they last for this run. The stop reason reads \"watchpoint: write to ...\". "
+        "remove=true takes it away. The program has to be stopped.",
+        schema({{"address", prop("string", "register name, file name/address, or runtime address")},
+                {"size", prop("integer", "bytes: 1, 2, 4 or 8 (default 4)")},
+                {"access", prop("boolean", "stop on reads too, not only writes (default false)")},
+                {"remove", prop("boolean", "remove the watch at this address instead")}},
+               {"address"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            debugger* d = db ? stopped_dbg(s, out) : nullptr;
+            uint64_t a = 0;
+            if (!d || !live_addr(s, *db, *d, args, a, out))
+                return false;
+            if (arg_bool(args, "remove", false)) {
+                bool ok = d->del_watch(a);
+                out = ok ? "stopped watching " + watch_where(s, *db, *d, a) : "no watch at " + watch_where(s, *db, *d, a);
+                return ok;
+            }
+            int size = arg_int(args, "size", 4, 1, 8);
+            bool access = arg_bool(args, "access", false);
+            std::string err;
+            if (!d->add_watch(a, size, access, err)) {
+                out = "can't watch it: " + err;
+                return false;
+            }
+            out = util::fmt("watching %s, %d byte%s: the program stops after a %s. debug_continue runs to it.",
+                watch_where(s, *db, *d, a).c_str(), size, size == 1 ? "" : "s", access ? "read or write" : "write");
             return true;
         });
 
@@ -1179,20 +1250,8 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             if (!d)
                 return false;
             uint64_t a = 0;
-            std::string t = util::lower(util::trim(arg_str(args, "address")));
-            bool got = false;
-            for (const reg_value& r : d->registers())
-                if (!t.empty() && util::lower(r.name) == t) {
-                    a = r.value;
-                    got = true;
-                    break;
-                }
-            if (!got) {
-                if (!arg_addr(*db, args, "address", a, out))
-                    return false;
-                if (db->bin.is_mapped(a) && s.debug.to_runtime)
-                    a = s.debug.to_runtime(a);
-            }
+            if (!live_addr(s, *db, *d, args, a, out))
+                return false;
             std::vector<uint8_t> buf((size_t)arg_int(args, "length", 128, 1, 4096));
             size_t n = d->read(a, buf.data(), buf.size());
             if (!n) {
@@ -1213,20 +1272,8 @@ void add_debug_inspect_tools(std::vector<tool>& t)
             if (!d)
                 return false;
             uint64_t a = 0;
-            std::string t = util::lower(util::trim(arg_str(args, "address")));
-            bool got = false;
-            for (const reg_value& r : d->registers())
-                if (!t.empty() && util::lower(r.name) == t) {
-                    a = r.value;
-                    got = true;
-                    break;
-                }
-            if (!got) {
-                if (!arg_addr(*db, args, "address", a, out))
-                    return false;
-                if (db->bin.is_mapped(a) && s.debug.to_runtime)
-                    a = s.debug.to_runtime(a);
-            }
+            if (!live_addr(s, *db, *d, args, a, out))
+                return false;
             std::vector<uint8_t> bytes;
             for (const std::string& tok : util::split(arg_str(args, "bytes"), " ,")) {
                 uint64_t v;

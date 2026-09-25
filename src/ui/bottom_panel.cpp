@@ -120,8 +120,9 @@ static void hex(app_state& s)
     ImGui::BeginChild("##hex", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     int target_row = (int)((sel_head - first) / 16);
+    float pitch = lh + ImGui::GetStyle().ItemSpacing.y; // a row and the spacing after it
     ImGuiListClipper clip;
-    clip.Begin((int)std::min<uint64_t>(rows, 0x7fffffff), lh);
+    clip.Begin((int)std::min<uint64_t>(rows, 0x7fffffff), pitch);
     if (s.hex_follow)
         clip.IncludeItemByIndex(target_row);
     static uint64_t last_scrolled = ~0ull;
@@ -129,7 +130,7 @@ static void hex(app_state& s)
         for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
             uint64_t a = first + (uint64_t)r * 16;
             if (r == target_row && last_scrolled != sel_head) {
-                float y = r * lh;
+                float y = r * pitch;
                 if (y < ImGui::GetScrollY() || y + lh > ImGui::GetScrollY() + ImGui::GetWindowHeight())
                     ImGui::SetScrollHereY(0.4f);
                 last_scrolled = sel_head;
@@ -167,10 +168,10 @@ static void hex(app_state& s)
                 char c[2] = {(buf[i] >= 32 && buf[i] < 127) ? (char)buf[i] : '.', 0};
                 dl->AddText(ImVec2(ax + cw * i, p.y), theme::string, c);
             }
-            // clicks select the byte under the mouse
+            // clicks select the byte under the mouse, a right click also offers a watch on it
             ImGui::PushID(r);
             ImGui::InvisibleButton("##hexrow", ImVec2(std::max(ax + cw * 17 - p.x, 1.0f), lh));
-            if (ImGui::IsItemClicked()) {
+            if (ImGui::IsItemClicked() || ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                 float mx = ImGui::GetIO().MousePos.x;
                 int col = -1;
                 if (mx >= hx && mx < hx + cw * 48)
@@ -185,10 +186,69 @@ static void hex(app_state& s)
                     s.hex_follow = follow;
                 }
             }
+            if (ImGui::BeginPopupContextItem("##hex_ctx")) {
+                if (ImGui::MenuItem("Watch (stop when it's written)...", nullptr, false, s.dbg.state() != dbg_state::none))
+                    dialogs::open(s, dialog_kind::watch, s.hex_addr);
+                if (ImGui::MenuItem("Copy address"))
+                    ImGui::SetClipboardText(db.fmt_addr(s.hex_addr).c_str());
+                ImGui::EndPopup();
+            }
             ImGui::PopID();
         }
     }
     ImGui::EndChild();
+}
+
+// the watchpoints of this run, above the breakpoints
+static void watches(app_state& s)
+{
+    std::vector<debugger::watch> ws = s.dbg.watches();
+    if (ws.empty())
+        return;
+    uint64_t remove = 0;
+    bool none = false;
+    if (ImGui::BeginTable("##watches", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Watching");
+        ImGui::TableSetupColumn("Bytes");
+        ImGui::TableSetupColumn("Stops when", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        int i = 0;
+        for (const debugger::watch& w : ws) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(i++);
+            uint64_t st = 0;
+            bool here = app_to_static(s, w.addr, st);
+            if (ImGui::Selectable(app_where_runtime(s, w.addr).c_str(), false, ImGuiSelectableFlags_SpanAllColumns) && here)
+                app_jump(s, st);
+            if (ImGui::BeginPopupContextItem("##w_ctx")) {
+                if (ImGui::MenuItem("Remove"))
+                    remove = w.addr;
+                if (ImGui::MenuItem("Remove all watches"))
+                    none = true;
+                ImGui::EndPopup();
+            }
+            ImGui::SetItemTooltip("%s  (right-click to remove)", util::hex(w.addr).c_str());
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", w.size);
+            ImGui::TableNextColumn();
+            uint64_t v = 0;
+            bool have = s.dbg.state() == dbg_state::stopped && s.dbg.read(w.addr, &v, (size_t)w.size) == (size_t)w.size;
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::call), "%s", w.access ? "read or written" : "written");
+            if (have) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(now %s)", util::hex(v).c_str());
+            }
+        }
+        ImGui::EndTable();
+    }
+    if (remove)
+        app_del_watch(s, remove);
+    if (none)
+        for (const debugger::watch& w : ws)
+            app_del_watch(s, w.addr);
+    ImGui::Spacing();
 }
 
 static void breakpoints(app_state& s)
@@ -198,8 +258,10 @@ static void breakpoints(app_state& s)
         return;
     }
     database& db = *s.db;
+    watches(s);
     if (db.breakpoints.empty()) {
-        ImGui::TextDisabled("no breakpoints. select a line and press F2.");
+        ImGui::TextDisabled(s.dbg.watches().empty() ? "no breakpoints. select a line and press F2 (on a variable, F2 watches it)."
+                                                    : "no breakpoints. select a line and press F2.");
         return;
     }
     uint64_t remove = 0;
@@ -300,7 +362,8 @@ void draw(app_state& s)
             hex(s);
             ImGui::EndTabItem();
         }
-        std::string bp_label = util::fmt("Breakpoints (%zu)###bps", s.db ? s.db->breakpoints.size() : (size_t)0);
+        size_t n_bps = (s.db ? s.db->breakpoints.size() : 0) + s.dbg.watches().size();
+        std::string bp_label = util::fmt("Breakpoints (%zu)###bps", n_bps);
         if (tab(bp_label.c_str(), 2)) {
             breakpoints(s);
             ImGui::EndTabItem();

@@ -1,6 +1,8 @@
-// the parts of the debugger every backend shares: recording steps so they can be undone
+// the parts of the debugger every backend shares: recording steps so they can be undone, and
+// the watch list
 #include "core/debugger.h"
 #include "core/disasm.h"
+#include "core/util.h"
 #include <deque>
 
 struct step_history {
@@ -225,4 +227,99 @@ bool debugger::about_to_return() const
     disassembler dis;
     insn in;
     return n && dis.open(is64() ? bin_arch::x64 : bin_arch::x86) && dis.decode(buf, n, pc(), in) && in.kind == flow::ret;
+}
+
+// ---- watchpoints (the list; the backends write it into the debug registers) ----
+
+std::vector<debugger::watch> debugger::active_watches() const
+{
+    return watch_pid_ == pid() && state() != dbg_state::none ? watch_list_ : std::vector<watch>();
+}
+
+std::vector<debugger::watch> debugger::watches() const { return active_watches(); }
+
+std::string debugger::watch_text(const watch& w)
+{
+    return std::string("watchpoint: ") + (w.access ? "read or write at " : "write to ") + util::hex(w.addr);
+}
+
+// dr7 for up to 4 watches: local enable, the condition (01 write, 11 read / write), the length
+uint64_t debugger::watch_dr7(const std::vector<watch>& w)
+{
+    uint64_t dr7 = 0;
+    for (size_t i = 0; i < w.size() && i < 4; i++) {
+        uint64_t len = w[i].size == 1 ? 0 : w[i].size == 2 ? 1 : w[i].size == 8 ? 2 : 3;
+        uint64_t rw = w[i].access ? 3 : 1;
+        dr7 |= 1ull << (i * 2);
+        dr7 |= rw << (16 + i * 4);
+        dr7 |= len << (18 + i * 4);
+    }
+    return dr7;
+}
+
+bool debugger::add_watch(uint64_t addr, int size, bool access, std::string& err)
+{
+    if (state() != dbg_state::stopped) {
+        err = "stop the program first";
+        return false;
+    }
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        err = "a watch covers 1, 2, 4 or 8 bytes";
+        return false;
+    }
+    if (size == 8 && !is64()) {
+        err = "8 byte watches need a 64-bit program";
+        return false;
+    }
+    if (addr % (uint64_t)size) {
+        err = "a " + std::to_string(size) + " byte watch has to start at a multiple of " + std::to_string(size);
+        return false;
+    }
+    if (addr + (uint64_t)size > (is64() ? 0x800000000000ull : 0x100000000ull)) {
+        err = util::hex(addr) + " isn't in the program's memory";
+        return false;
+    }
+    if (watch_pid_ != pid()) {
+        watch_list_.clear();
+        watch_pid_ = pid();
+    }
+    std::vector<watch> before = watch_list_;
+    bool found = false;
+    for (watch& w : watch_list_)
+        if (w.addr == addr) {
+            w.size = size;
+            w.access = access;
+            found = true;
+        }
+    if (!found) {
+        if (watch_list_.size() >= 4) {
+            err = "the cpu has room for 4 watches";
+            return false;
+        }
+        watch_list_.push_back({addr, size, access});
+    }
+    if (!apply_watches(err)) {
+        watch_list_ = before; // and back into the registers
+        std::string ignore;
+        apply_watches(ignore);
+        return false;
+    }
+    return true;
+}
+
+bool debugger::del_watch(uint64_t addr)
+{
+    if (watch_pid_ != pid())
+        return false;
+    size_t n = watch_list_.size();
+    for (size_t i = 0; i < watch_list_.size(); i++)
+        if (watch_list_[i].addr == addr) {
+            watch_list_.erase(watch_list_.begin() + (long)i);
+            break;
+        }
+    if (watch_list_.size() == n)
+        return false;
+    std::string err;
+    apply_watches(err);
+    return true;
 }
