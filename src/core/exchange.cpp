@@ -83,7 +83,7 @@ bool automatic(const std::string& n)
 std::string export_ida(const database& db)
 {
     std::string s = "# -*- coding: utf-8 -*-\n" + header(db, "ida", "File > Script file... runs it");
-    s += "import idc\nimport ida_nalt\n\nbase = ida_nalt.get_imagebase()\n\nnames = [\n";
+    s += "import idc\nimport ida_nalt\n\nbase = ida_nalt.get_imagebase()\n\ntypes = " + py(db.types.all_text()) + "\nnames = [\n";
     for (const auto& n : db.user_names)
         s += "    (" + rva(db, n.first) + ", " + py(n.second) + "),\n";
     s += "]\ncomments = [\n";
@@ -96,6 +96,8 @@ std::string export_ida(const database& db)
     for (uint64_t b : db.breakpoints)
         s += rva(db, b) + ", ";
     s += "]\n\n"
+         "if types:\n"
+         "    idc.parse_decls(types, 0)\n"
          "for off, name in names:\n"
          "    idc.set_name(base + off, name, idc.SN_NOWARN | idc.SN_NOCHECK)\n"
          "for off, text in comments:\n"
@@ -116,7 +118,7 @@ std::string export_ghidra(const database& db)
     std::string s = "# -*- coding: utf-8 -*-\n" + header(db, "ghidra", "Window > Script Manager, add this folder, run it") +
                     "# @category ceasta\n"
                     "from ghidra.program.model.symbol import SourceType\n\n"
-                    "base = currentProgram.getImageBase()\n\nnames = [\n";
+                    "base = currentProgram.getImageBase()\n\ntypes = " + py(db.types.all_text()) + "\nnames = [\n";
     for (const auto& n : db.user_names)
         s += "    (" + rva(db, n.first) + ", " + py(n.second) + "),\n";
     s += "]\ncomments = [\n";
@@ -145,6 +147,12 @@ std::string export_ghidra(const database& db)
          "    setEOLComment(base.add(off), text)\n"
          "for off, note in bookmarks:\n"
          "    createBookmark(base.add(off), \"ceasta\", note or \"bookmark\")\n"
+         "if types:\n"
+         "    try:\n"
+         "        from ghidra.app.util.cparser.C import CParser\n"
+         "        CParser(currentProgram.getDataTypeManager(), True, None).parse(types)\n"
+         "    except Exception as e:\n"
+         "        print(\"ceasta: can't read the types: %s\" % e)\n"
          "typed = 0\n"
          "try:\n"
          "    from ghidra.app.util.cparser.C import CParserUtils\n"
@@ -239,6 +247,7 @@ std::string import_result::summary() const
         if (n)
             parts += (parts.empty() ? "" : ", ") + util::fmt("%d %s", n, what);
     };
+    add(types, "types");
     add(names, "names");
     add(comments, "comments");
     add(prototypes, "prototypes");
@@ -247,6 +256,8 @@ std::string import_result::summary() const
     s += parts.empty() ? "nothing new" : parts;
     if (skipped)
         s += util::fmt(" (%d skipped: automatic names, or ones that don't fit)", skipped);
+    if (!note.empty())
+        s += "; " + note;
     return s;
 }
 
@@ -452,6 +463,19 @@ import_result import_names(database& db, const std::string& path)
         return r;
     }
     std::string text(bytes.begin(), bytes.end());
+    // a c header: its structs, unions, enums and typedefs
+    size_t dot = path.find_last_of('.');
+    std::string ext = dot == std::string::npos ? std::string() : util::lower(path.substr(dot + 1));
+    if (ext == "h" || ext == "hpp" || ext == "hh" || ext == "hxx") {
+        std::vector<std::string> defined;
+        r.format = "c header";
+        if (!db.add_types(text, err, &defined, true))
+            r.error = path + ": " + err;
+        else
+            r.note = err; // what it skipped
+        r.types = (int)defined.size();
+        return r;
+    }
     size_t first = text.find_first_not_of(" \t\r\n");
     if (first != std::string::npos && text[first] == '{') {
         json::value root;
@@ -470,7 +494,7 @@ import_result import_names(database& db, const std::string& path)
     }
     import_map(db, text, r);
     if (!r.names && !r.skipped)
-        r.error = "no names found: ceasta reads x64dbg databases (.dd64 / .dd32), .map files, and the json of "
-                  "scripts/ida_to_ceasta.py and scripts/ghidra_to_ceasta.py";
+        r.error = "no names found: ceasta reads x64dbg databases (.dd64 / .dd32), .map files, the json of "
+                  "scripts/ida_to_ceasta.py and scripts/ghidra_to_ceasta.py, and c headers (.h: their types)";
     return r;
 }

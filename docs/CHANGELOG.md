@@ -16,6 +16,25 @@
 - **go**: every function's name from the go runtime's own table, stripped programs too - go 1.2
   to today, linux / windows / macos, x86 / x64 / arm64. go's panics and exits are known not to
   return, and its switch tables are read
+- **structs**: declare c types - structs, unions, enums, typedefs - and a variable typed as a
+  pointer to one reads `p->next`, `p->items[i].name`, `&p->hdr`, not `*(long long*)(p + 8)`.
+  - **C types** (shift+f1, edit menu): the list and an editor; offsets as comments. laid out the
+    way the file's compiler does it - pointer size, windows or not, `#pragma pack`, bit fields,
+    `__attribute__((packed, aligned))` (checked against clang on eight targets)
+  - **make a struct from how it's used** (right-click a variable in the pseudocode): a field at
+    every offset the code reads or writes through it, sized by the access, and a field it
+    follows to the next one points to the struct (a list's `next`). name the fields and the
+    pseudocode follows
+  - **a c header's types** (file > import, or `ceasta-cli import <file> x.h`): real headers
+    work - `#define` constants, inline functions and `extern "C"` are skipped over, and what
+    can't be read is left out and counted. all of windows.h (9,983 types) takes a third of a
+    second; preprocess a header that includes others (`gcc -E -P`, `cl /EP`)
+  - a stack variable of a struct type reads `d.x`; registers set from a typed pointer get its
+    type (`rbx = inv` is a `struct inventory*` too)
+  - saved with the project, one `type` line each; `ceasta-cli types <file>` lists them; the ida
+    and ghidra exports declare them before the prototypes that use them
+  - for the ai: `define_types`, `list_types`, `create_struct_from_usage`; in lua:
+    `ceasta.types()`, `add_types`, `set_var_type`, `struct_from_uses`
 - **analysis**
   - c++ and rust cleanup code (exception landing pads) in linux programs belongs to its
     function; it used to show up as hundreds of made-up functions
@@ -28,6 +47,7 @@
 - pseudocode calls an import by its name: `memcmp(...)`, not `j_memcmp(...)`
 - signatures keep the mangled name, so a stripped program gets the readable one back
 - search finds a file's data names too (`selRef_init`, a global), not only the ones you renamed
+- esc that closes a right-click menu doesn't also go back to where you were
 
 ## v0.12.0 - 2026-09-25
 

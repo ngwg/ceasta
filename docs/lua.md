@@ -122,6 +122,21 @@ addresses; while debugging, translate with `ceasta.dbg.to_static` /
 `flow` is one of `"normal"`, `"jump"`, `"cond"`, `"call"`, `"ret"`, `"stop"`.
 `target` is set for a direct branch or call.
 
+### c types
+
+| call | returns |
+|------|---------|
+| `types()` | every declared struct, union, enum and typedef, as c |
+| `add_types(text)` | `true, names` (what the c text defined; one with a name already there is replaced), or `false, err` |
+| `set_var_type(addr, var, type)` | `true`, or `false, err` — a variable of the function at `addr`, by the name the pseudocode shows (`"struct item*"`) |
+| `struct_from_uses(addr, var [,apply])` | `name, decl`: a struct with a field at every offset the function reads or writes through `var`; with `apply`, declared and `var` typed as a pointer to it. `nil, err` when nothing goes through it |
+
+```lua
+local f = ceasta.resolve("parse_packet")
+local name = ceasta.struct_from_uses(f, "rdi", true)   -- rdi->field_8, rdi->field_10, ...
+ceasta.add_types("struct " .. name .. " { int len; int kind; char* data; };")  -- rdi->data
+```
+
 ### listings of things
 
 each returns an array of tables (use with `ipairs`):

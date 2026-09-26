@@ -174,6 +174,385 @@ const char* mem_type(int width)
 
 std::string print(const ep& e, int parent_prec);
 
+// ------------------------------------------------------------------ your types in the printout
+//
+//   *(long long*)(rdi + 8)        rdi->next       (rdi a struct node*)
+//   *(int*)(rsi + rcx * 4)        rsi[rcx]        (rsi an int*)
+//   local_50                      pt.y            (local_58 a struct point, y at 8)
+
+struct frame_struct {
+    std::string key;     // local_58
+    int64_t off = 0;     // its frame offset
+    const ctype_def* def = nullptr;
+};
+
+struct type_view {
+    const ctypes* lib = nullptr;
+    const database* db = nullptr;
+    int64_t ptr = 8;
+    std::map<std::string, std::string> vars; // a variable (register, frame slot) -> its type
+    std::vector<frame_struct> frame;         // struct variables of the frame
+};
+
+thread_local const type_view* g_types = nullptr;
+// while learning: what each register is set to, "?" when the values' types differ or are unknown
+thread_local std::map<std::string, std::string>* g_learn = nullptr;
+
+// while making a struct from how a variable is used: every read or write through it
+struct use_collector {
+    std::string key;                      // the variable: rdi, local_20
+    std::map<uint64_t, uint32_t> fields;  // offset -> the widest access there
+    std::set<uint64_t> self;              // fields put back in the variable: a list's next
+};
+thread_local use_collector* g_uses = nullptr;
+
+// the variable plus a constant: rdi + 0x18, or the frame slot holding it: *(&local_20) + 8
+bool use_offset(const ep& a, int64_t& off)
+{
+    std::vector<std::pair<ep, int>> todo{{a, 1}};
+    off = 0;
+    bool base = false;
+    while (!todo.empty()) {
+        ep e = todo.back().first;
+        int sign = todo.back().second;
+        todo.pop_back();
+        if (!e || todo.size() > 16)
+            return false;
+        if (e->kind == expr::k::num) {
+            off += sign * (int64_t)e->num;
+            continue;
+        }
+        if (e->kind == expr::k::bin && (e->text == "+" || e->text == "-")) {
+            todo.push_back({e->kids[0], sign});
+            todo.push_back({e->kids[1], e->text == "-" ? -sign : sign});
+            continue;
+        }
+        bool is_var = ((e->kind == expr::k::reg || e->kind == expr::k::sym) && e->text == g_uses->key) ||
+                      (e->kind == expr::k::mem && e->kids[0]->kind == expr::k::un && e->kids[0]->text == "&" &&
+                       e->kids[0]->kids[0]->kind == expr::k::sym && e->kids[0]->kids[0]->text == g_uses->key);
+        if (!is_var || sign < 0 || base)
+            return false;
+        base = true;
+    }
+    return base && off >= 0 && off <= 0x100000;
+}
+
+void note_use(const ep& a, int width)
+{
+    int64_t off;
+    if (!g_uses || width <= 0 || width > 64 || !use_offset(a, off))
+        return;
+    uint32_t& w = g_uses->fields[(uint64_t)off];
+    w = std::max(w, (uint32_t)width);
+}
+
+// the variable is set to v: when that's one of its own fields (p = p->next), the field points
+// to another one of these
+void note_self(const ep& v, int ptr)
+{
+    int64_t off;
+    if (g_uses && v && v->kind == expr::k::mem && v->width == ptr && use_offset(v->kids[0], off))
+        g_uses->self.insert((uint64_t)off);
+}
+
+// a frame slot's offset from its name: local_1c is -0x1c, arg_4 is 4 above the return address
+bool slot_offset(const std::string& n, int64_t ptr, int64_t& off)
+{
+    const char* p = nullptr;
+    int64_t base = 0, sign = 1;
+    if (n.compare(0, 6, "local_") == 0) {
+        p = n.c_str() + 6;
+        sign = -1;
+    } else if (n.compare(0, 4, "arg_") == 0) {
+        p = n.c_str() + 4;
+        base = ptr;
+    } else {
+        return false;
+    }
+    char* end = nullptr;
+    unsigned long long v = strtoull(p, &end, 16);
+    if (!end || *end || end == p)
+        return false;
+    off = base + sign * (int64_t)v;
+    return true;
+}
+
+// the struct variable of the frame a slot is inside of (not its first byte), and where in it
+const frame_struct* slot_inside(const std::string& n, int64_t& rel)
+{
+    int64_t off;
+    if (!g_types || g_types->frame.empty() || !slot_offset(n, g_types->ptr, off))
+        return nullptr;
+    for (const frame_struct& f : g_types->frame)
+        if (off > f.off && off < f.off + (int64_t)f.def->size) {
+            rel = off - f.off;
+            return &f;
+        }
+    return nullptr;
+}
+
+std::string type_of(const ep& e);
+
+// e as coef * var for one variable
+bool linear(const ep& e, ep& var, int64_t& coef, int depth)
+{
+    if (!e || depth > 8)
+        return false;
+    if (e->kind == expr::k::bin && (e->text == "*" || e->text == "<<")) {
+        const ep& a = e->kids[0];
+        const ep& b = e->kids[1];
+        if (b->kind == expr::k::num || (e->text == "*" && a->kind == expr::k::num)) {
+            uint64_t k = b->kind == expr::k::num ? b->num : a->num;
+            if (e->text == "<<")
+                k = k < 16 ? 1ull << k : 0;
+            if (!k || k > 0x10000 || !linear(b->kind == expr::k::num ? a : b, var, coef, depth + 1))
+                return false;
+            coef *= (int64_t)k;
+            return true;
+        }
+        return false;
+    }
+    if (e->kind == expr::k::bin && (e->text == "+" || e->text == "-")) {
+        ep v1, v2;
+        int64_t c1 = 0, c2 = 0;
+        if (!linear(e->kids[0], v1, c1, depth + 1) || !linear(e->kids[1], v2, c2, depth + 1) || print(v1, 0) != print(v2, 0))
+            return false;
+        var = v1;
+        coef = e->text == "+" ? c1 + c2 : c1 - c2;
+        return true;
+    }
+    if (e->kind == expr::k::num || e->kind == expr::k::bin || e->kind == expr::k::tern)
+        return false;
+    var = e;
+    coef = 1;
+    return true;
+}
+
+// base + off + index * scale
+struct addr_parts {
+    ep base, index;
+    int64_t off = 0;
+    uint32_t scale = 0;
+};
+
+bool split_addr(const ep& a, addr_parts& p)
+{
+    std::vector<ep> terms;
+    std::vector<std::pair<const ep, int>> todo{{a, 1}};
+    while (!todo.empty()) {
+        ep e = todo.back().first;
+        int sign = todo.back().second;
+        todo.pop_back();
+        if (!e || todo.size() > 16)
+            return false;
+        if (e->kind == expr::k::num) {
+            p.off += sign * (int64_t)e->num;
+        } else if (e->kind == expr::k::bin && (e->text == "+" || e->text == "-")) {
+            todo.push_back({e->kids[0], sign});
+            todo.push_back({e->kids[1], e->text == "-" ? -sign : sign});
+        } else if (sign < 0) {
+            return false;
+        } else {
+            terms.push_back(e);
+        }
+    }
+    // the base is the term with a pointer type (or the address of a struct variable of the
+    // frame); the other one, if any, the index
+    const ctypes& lib = *g_types->lib;
+    for (const ep& t : terms) {
+        if (p.base)
+            break;
+        if (t->kind == expr::k::un && t->text == "&" && t->kids[0]->kind == expr::k::sym) {
+            auto v = g_types->vars.find(t->kids[0]->text);
+            if (v != g_types->vars.end() && lib.aggregate(v->second))
+                p.base = t;
+        } else if (t->kind != expr::k::bin) {
+            std::string ty = type_of(t);
+            if (!ty.empty() && (lib.pointee(ty) || lib.scalar_pointee(ty)))
+                p.base = t;
+        }
+    }
+    // the rest is one variable times a constant, however the compiler spelled the product:
+    // (i * 4 + i) * 8 is i * 40
+    int64_t scale = 0;
+    std::string ix;
+    for (const ep& t : terms) {
+        if (t == p.base)
+            continue;
+        ep v;
+        int64_t c = 0;
+        if (!linear(t, v, c, 0))
+            return false;
+        std::string pv = print(v, 0);
+        if (p.index && pv != ix)
+            return false;
+        p.index = v;
+        ix = pv;
+        scale += c;
+    }
+    if (p.index) {
+        if (scale < 1 || scale > 0x100000)
+            return false;
+        p.scale = (uint32_t)scale;
+    }
+    return p.base != nullptr;
+}
+
+// what a memory read of width bytes at a is through your types: base->path, var.path, p[i]
+bool typed_read(const ep& a, int width, std::string& text, std::string& type)
+{
+    const ctypes& lib = *g_types->lib;
+    // a frame variable, or a slot inside a struct one
+    if (a->kind == expr::k::un && a->text == "&" && a->kids[0]->kind == expr::k::sym) {
+        const std::string& n = a->kids[0]->text;
+        int64_t rel = 0;
+        std::string path;
+        if (const frame_struct* f = slot_inside(n, rel)) {
+            if (!lib.member_at(*f->def, (uint64_t)rel, width, path, type))
+                return false;
+            text = f->key + "." + path;
+            return true;
+        }
+        auto v = g_types->vars.find(n);
+        const ctype_def* d = v == g_types->vars.end() ? nullptr : lib.aggregate(v->second);
+        if (d && (uint32_t)width != d->size && lib.member_at(*d, 0, width, path, type)) {
+            text = n + "." + path;
+            return true;
+        }
+        return false;
+    }
+    addr_parts p;
+    if (!split_addr(a, p) || p.off < 0)
+        return false;
+    std::string bt = type_of(p.base), idx = p.index ? print(p.index, 0) : std::string();
+    const ctype_def* s = bt.empty() ? nullptr : lib.pointee(bt);
+    if (s) {
+        std::string path;
+        if (!lib.member_at(*s, (uint64_t)p.off, width, path, type, idx, p.scale))
+            return false;
+        text = print(p.base, 100) + "->" + path;
+        return true;
+    }
+    // &local_58 + 8: a field of a struct variable of the frame
+    if (p.base->kind == expr::k::un && p.base->text == "&" && p.base->kids[0]->kind == expr::k::sym) {
+        const std::string& n = p.base->kids[0]->text;
+        auto v = g_types->vars.find(n);
+        const ctype_def* d = v == g_types->vars.end() ? nullptr : lib.aggregate(v->second);
+        std::string path;
+        if (!d || !lib.member_at(*d, (uint64_t)p.off, width, path, type, idx, p.scale))
+            return false;
+        text = n + "." + path;
+        return true;
+    }
+    // a pointer to a scalar: p[i]
+    uint32_t es = bt.empty() ? 0 : lib.scalar_pointee(bt);
+    if (!es || (uint32_t)width != es || p.off % es || (p.index && p.scale != es))
+        return false;
+    std::string at = std::to_string(p.off / es);
+    if (p.index)
+        at = p.off ? idx + " + " + at : idx;
+    text = !p.index && p.off == 0 ? "*" + print(p.base, 90) : print(p.base, 100) + "[" + at + "]";
+    type = ctypes::normalize(bt);
+    type = type.substr(0, type.rfind('*'));
+    return true;
+}
+
+// the type of an expression as far as your types say, "" when they don't
+std::string type_of(const ep& e)
+{
+    if (!g_types || !e)
+        return std::string();
+    if (e->kind == expr::k::reg || e->kind == expr::k::sym) {
+        auto it = g_types->vars.find(e->text);
+        return it == g_types->vars.end() ? std::string() : it->second;
+    }
+    if (e->kind == expr::k::call && !e->indirect && e->ref && g_types->db) {
+        const prototype* p = g_types->db->callee_proto(e->ref);
+        return p && p->ret != "void" && p->ret != "int" ? p->ret : std::string();
+    }
+    if (e->kind == expr::k::un && e->text == "&" && e->kids[0]->kind == expr::k::sym) {
+        auto it = g_types->vars.find(e->kids[0]->text);
+        return it == g_types->vars.end() ? std::string() : ctypes::normalize(it->second) + "*";
+    }
+    if (e->kind == expr::k::bin && (e->text == "+" || e->text == "-")) {
+        // pointer arithmetic keeps the type; the address of a member is a pointer to it
+        addr_parts p;
+        if (!split_addr(e, p) || p.base->kind == expr::k::un)
+            return std::string();
+        std::string bt = type_of(p.base), path, type;
+        const ctypes& lib = *g_types->lib;
+        const ctype_def* s = lib.pointee(bt);
+        if (s && s->size && p.off % s->size == 0 && (!p.index || p.scale == s->size))
+            return bt;
+        if (s && p.off >= 0 && lib.member_at(*s, (uint64_t)p.off, 0, path, type, p.index ? print(p.index, 0) : std::string(), p.scale)) {
+            size_t br = type.find('[');
+            return (br == std::string::npos ? type : type.substr(0, br)) + "*";
+        }
+        return lib.scalar_pointee(bt) ? bt : std::string();
+    }
+    if (e->kind == expr::k::mem) {
+        const ep& a = e->kids[0];
+        if (a->kind == expr::k::un && a->text == "&" && a->kids[0]->kind == expr::k::sym) {
+            auto it = g_types->vars.find(a->kids[0]->text);
+            if (it != g_types->vars.end() && !g_types->lib->aggregate(it->second))
+                return it->second; // a frame variable's value
+        }
+        std::string text, type;
+        if (typed_read(a, e->width, text, type))
+            return type;
+    }
+    return std::string();
+}
+
+// base + off as an address through your types: &p->field, &p[2], &pt.y, (char*)p + 3
+bool typed_address(const ep& e, std::string& text)
+{
+    addr_parts p;
+    if (!split_addr(e, p))
+        return false;
+    const ctypes& lib = *g_types->lib;
+    std::string path, type, idx = p.index ? print(p.index, 0) : std::string();
+    if (p.base->kind == expr::k::un) { // &local_58 + 8
+        const std::string& n = p.base->kids[0]->text;
+        const ctype_def* d = lib.aggregate(g_types->vars.at(n));
+        if (!d || p.off < 0 || !lib.member_at(*d, (uint64_t)p.off, 0, path, type, idx, p.scale))
+            return false;
+        text = "&" + n + "." + path;
+        return true;
+    }
+    std::string bt = type_of(p.base);
+    const ctype_def* s = lib.pointee(bt);
+    uint32_t es = s ? 0 : lib.scalar_pointee(bt);
+    if (!s && !es)
+        return false;
+    if (s && p.off >= 0 && lib.member_at(*s, (uint64_t)p.off, 0, path, type, idx, p.scale)) {
+        // the start of an array member is the array: p->name, not &p->name[0]
+        if (path.size() > 3 && path.compare(path.size() - 3, 3, "[0]") == 0)
+            text = print(p.base, 100) + "->" + path.substr(0, path.size() - 3);
+        else
+            text = "&" + print(p.base, 100) + "->" + path;
+        return true;
+    }
+    // pointer arithmetic counts in elements: p + 1 is the next one
+    uint32_t step = s ? s->size : es;
+    if (step && p.off % step == 0 && (!p.index || p.scale == step) && (p.index || p.off)) {
+        int64_t k = p.off / (int64_t)step;
+        std::string at = p.index ? idx : std::string();
+        if (k)
+            at += (at.empty() ? std::string() : k < 0 ? " - " : " + ") + (at.empty() && k < 0 ? "-" : "") +
+                  std::to_string(k < 0 ? -k : k);
+        text = print(p.base, 100) + (at[0] == '-' ? " - " + at.substr(1) : " + " + at);
+        return true;
+    }
+    // no member starts there: count in bytes, the way the machine does
+    text = "(char*)" + print(p.base, 100);
+    if (p.index)
+        text += " + " + print(p.index, 12) + (p.scale > 1 ? " * " + hex_num(p.scale, false) : std::string());
+    if (p.off)
+        text += (p.off < 0 ? " - " : " + ") + hex_num((uint64_t)(p.off < 0 ? -p.off : p.off), false);
+    return true;
+}
+
 // logical negation, flipping comparisons instead of wrapping in !()
 ep negate(const ep& e)
 {
@@ -201,13 +580,36 @@ std::string print(const ep& e, int parent_prec = 0)
         return e->text;
     case expr::k::mem: {
         const ep& a = e->kids[0];
+        if (g_uses)
+            note_use(a, e->width);
+        if (g_types) {
+            std::string text, type;
+            if (typed_read(a, e->width, text, type))
+                return text;
+            // through a typed pointer, but not a whole member: *(char*)&p->flags, or counted in bytes
+            std::string at;
+            if (a->kind != expr::k::un && typed_address(a, at) && at.compare(0, 2, "&*") != 0)
+                return std::string("*(") + mem_type(e->width) + "*)" + (at[0] == '(' ? "(" + at + ")" : at);
+        }
         if (a->kind == expr::k::un && a->text == "&")
             return print(a->kids[0], 100); // *(&sym) -> sym
         return std::string("*(") + mem_type(e->width) + "*)" + print(a, 100);
     }
     case expr::k::un:
+        if (g_types && e->text == "&" && e->kids[0]->kind == expr::k::sym) {
+            int64_t rel = 0;
+            std::string path, type;
+            const frame_struct* f = slot_inside(e->kids[0]->text, rel);
+            if (f && g_types->lib->member_at(*f->def, (uint64_t)rel, 0, path, type))
+                return "&" + f->key + "." + path;
+        }
         return e->text + print(e->kids[0], 90);
     case expr::k::bin: {
+        if (g_types && (e->text == "+" || e->text == "-")) {
+            std::string text;
+            if (typed_address(e, text))
+                return 100 < parent_prec && text[0] == '(' ? "(" + text + ")" : text;
+        }
         int p = prec(*e);
         std::string s = print(e->kids[0], p) + " " + e->text + " " + print(e->kids[1], p + 1);
         return p < parent_prec ? "(" + s + ")" : s;
@@ -1559,6 +1961,21 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             auto commit = [&](asg a) {
                 std::string nm = disp(a.fam);
                 line(at, nm + " = " + print(a.val) + ";");
+                if (g_uses && nm == g_uses->key)
+                    note_self(a.val, is64_ ? 8 : 4);
+                if (g_learn) {
+                    std::string t = type_of(a.val);
+                    // p = p + 4 moves a pointer: it doesn't say what p is
+                    bool moves = t.empty() && a.val->kind == expr::k::bin && (a.val->text == "+" || a.val->text == "-") &&
+                                 a.val->kids[0]->kind == expr::k::reg && a.val->kids[0]->text == nm;
+                    auto it = g_learn->find(nm);
+                    if (moves)
+                        ;
+                    else if (it == g_learn->end())
+                        (*g_learn)[nm] = t.empty() ? "?" : t;
+                    else if (it->second != t)
+                        it->second = "?";
+                }
                 done.push_back(a.fam);
                 // dead values that read the old register can't be named any more
                 spare.erase(std::remove_if(spare.begin(), spare.end(),
@@ -1739,6 +2156,23 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         auto store = [&](size_t k, ep dst, const std::string& op, ep src) {
             barrier(k, {&dst, &src});
             line(cb.insns[k], print(dst) + " " + op + " " + print(src) + ";");
+            if (g_uses && op == "=" && dst->kind == expr::k::mem && dst->kids[0]->kind == expr::k::un &&
+                dst->kids[0]->text == "&" && dst->kids[0]->kids[0]->kind == expr::k::sym &&
+                dst->kids[0]->kids[0]->text == g_uses->key)
+                note_self(src, is64_ ? 8 : 4);
+            // a frame variable holds what's stored in it: local_20 = a makes it a's type
+            if (g_learn && op == "=" && dst->kind == expr::k::mem && dst->kids[0]->kind == expr::k::un &&
+                dst->kids[0]->text == "&" && dst->kids[0]->kids[0]->kind == expr::k::sym) {
+                std::string nm = dst->kids[0]->kids[0]->text, t = type_of(src);
+                int64_t off;
+                if (slot_offset(nm, is64_ ? 8 : 4, off)) {
+                    auto it = g_learn->find(nm);
+                    if (it == g_learn->end())
+                        (*g_learn)[nm] = t.empty() ? "?" : t;
+                    else if (it->second != t)
+                        it->second = "?";
+                }
+            }
             return dst;
         };
 
@@ -2982,25 +3416,8 @@ decompiled decompile(database& db, uint64_t func_start)
     }
     cs_option(cs, CS_OPT_DETAIL, CS_OPT_ON);
 
-    std::vector<block_ir> ir;
-    std::vector<std::string> params;
-    bool returns_value = false;
-    lifter lf(db, cs);
-    bool ok = lf.run(start, ir, params, returns_value);
-    if (!ok || ir.empty()) {
-        cs_close(&cs);
-        r.error = "could not decode the function";
-        return r;
-    }
-
-    structurer st(db, ir, returns_value);
-    int entry = st.at(start);
-    if (entry < 0)
-        entry = 0;
-    st.run(entry < 0 ? 0 : entry);
-
-    // ---- the variables: parameters, the stack frame, registers used as variables. your names
-    // and types (db.lvars) and your prototype (db.protos) go over the decompiler's own
+    // ---- your names and types (db.lvars) and your prototype (db.protos) go over the
+    // decompiler's own; the types also decide how memory reads print (p->next)
     const bool is64 = db.bin.is64();
     const int64_t ptr = is64 ? 8 : 4;
     const std::map<std::string, database::lvar>* user = nullptr;
@@ -3020,8 +3437,81 @@ decompiled decompile(database& db, uint64_t func_start)
     int nregs = 0;
     while (arg_reg_at(nregs, is64, db.bin.format))
         nregs++;
-    std::vector<std::string> pkeys = params; // register display names
     int64_t stack_from = !is64 ? ptr : ptr + (db.bin.format == bin_format::pe ? 0x20 : 0);
+    auto param_key = [&](int i) {
+        if (i < nregs)
+            return reg_display(arg_reg_at(i, is64, db.bin.format), is64);
+        return util::fmt("arg_%llx", (unsigned long long)(stack_from - ptr + (i - (is64 ? nregs : 0)) * ptr));
+    };
+
+    type_view tv;
+    tv.lib = &db.types;
+    tv.ptr = ptr;
+    if (proto)
+        for (size_t i = 0; i < proto->params.size(); i++)
+            if (!proto->params[i].type.empty())
+                tv.vars[param_key((int)i)] = proto->params[i].type;
+    if (user)
+        for (const auto& v : *user)
+            if (!v.second.type.empty())
+                tv.vars[v.first] = v.second.type;
+    // making a struct from how a variable is used (struct_from_uses): it reads the plain way
+    if (g_uses)
+        tv.vars.erase(g_uses->key);
+    for (const auto& v : tv.vars) {
+        int64_t off;
+        const ctype_def* d = db.types.aggregate(v.second);
+        if (d && d->size && slot_offset(v.first, ptr, off))
+            tv.frame.push_back({v.first, off, d});
+    }
+    tv.db = &db;
+    struct view_guard {
+        explicit view_guard(const type_view* v) { g_types = v; }
+        ~view_guard() {
+            g_types = nullptr;
+            g_learn = nullptr;
+        }
+    } guard(tv.vars.empty() ? nullptr : &tv);
+    // registers set only to values of one pointer type get it: rbx = inv is a struct
+    // inventory* too. a pass per step of the chain (rdx = &rbx->slots[i] needs rbx's)
+    for (int pass = 0; pass < 3 && g_types; pass++) {
+        std::map<std::string, std::string> learned;
+        g_learn = &learned;
+        std::vector<block_ir> ir0;
+        std::vector<std::string> params0;
+        bool rv0 = false;
+        lifter lf0(db, cs);
+        lf0.run(start, ir0, params0, rv0);
+        g_learn = nullptr;
+        bool more = false;
+        for (const auto& l : learned)
+            if (l.second != "?" && !tv.vars.count(l.first) && (!g_uses || l.first != g_uses->key) &&
+                (db.types.pointee(l.second) || db.types.scalar_pointee(l.second))) {
+                tv.vars[l.first] = l.second;
+                more = true;
+            }
+        if (!more)
+            break;
+    }
+
+    std::vector<block_ir> ir;
+    std::vector<std::string> params;
+    bool returns_value = false;
+    lifter lf(db, cs);
+    bool ok = lf.run(start, ir, params, returns_value);
+    if (!ok || ir.empty()) {
+        cs_close(&cs);
+        r.error = "could not decode the function";
+        return r;
+    }
+
+    structurer st(db, ir, returns_value);
+    int entry = st.at(start);
+    if (entry < 0)
+        entry = 0;
+    st.run(entry < 0 ? 0 : entry);
+
+    std::vector<std::string> pkeys = params; // register display names
     int64_t max_arg = -1;
     for (const auto& f : lf.frame)
         if (f.first >= stack_from && f.first < stack_from + 64 * ptr)
@@ -3033,12 +3523,8 @@ decompiled decompile(database& db, uint64_t func_start)
             pkeys.push_back(lf.frame.count(off) ? lf.frame[off].name : util::fmt("arg_%llx", (unsigned long long)(off - ptr)));
     if (want >= 0) { // the prototype says how many
         pkeys.resize(std::min<size_t>(pkeys.size(), (size_t)want));
-        for (int i = (int)pkeys.size(); i < want; i++) {
-            if (i < nregs)
-                pkeys.push_back(reg_display(arg_reg_at(i, is64, db.bin.format), is64));
-            else
-                pkeys.push_back(util::fmt("arg_%llx", (unsigned long long)(stack_from - ptr + (i - (is64 ? nregs : 0)) * ptr)));
-        }
+        for (int i = (int)pkeys.size(); i < want; i++)
+            pkeys.push_back(param_key(i));
     }
     std::set<std::string> is_param(pkeys.begin(), pkeys.end());
     std::map<std::string, std::string> names; // key -> the name shown, where they differ
@@ -3081,6 +3567,9 @@ decompiled decompile(database& db, uint64_t func_start)
     for (auto it = lf.frame.begin(); it != lf.frame.end(); ++it) {
         if (is_param.count(it->second.name))
             continue;
+        int64_t rel;
+        if (slot_inside(it->second.name, rel))
+            continue; // a field of a struct variable: pt.y, declared with pt
         std::string ty;
         if (it->second.width > 0) {
             ty = mem_type(it->second.width);
@@ -3091,6 +3580,9 @@ decompiled decompile(database& db, uint64_t func_start)
             int64_t gap = limit - it->first;
             ty = gap > 0 && gap <= 0x10000 ? util::fmt("char[0x%llx]", (unsigned long long)gap) : "char[]";
         }
+        auto learned = tv.vars.find(it->second.name); // what's stored in it says what it is
+        if (learned != tv.vars.end())
+            ty = learned->second;
         add_var(it->second.name, false, true, ty, -1);
         decls.push_back({it->first, it->second.name});
     }
@@ -3119,8 +3611,10 @@ decompiled decompile(database& db, uint64_t func_start)
             }
         }
     }
-    for (const std::string& rg : regs)
-        add_var(rg, false, false, std::string(), -1);
+    for (const std::string& rg : regs) {
+        auto learned = tv.vars.find(rg); // a type the pointer it holds says it has
+        add_var(rg, false, false, learned != tv.vars.end() ? learned->second : std::string(), -1);
+    }
     r.vars.erase(std::remove_if(r.vars.begin(), r.vars.end(),
                                 [&](const decomp_var& v) { return !v.param && v.stack && !used.count(v.key); }),
                  r.vars.end());
@@ -3169,6 +3663,97 @@ decompiled decompile(database& db, uint64_t func_start)
 
     cs_close(&cs);
     return r;
+}
+
+bool struct_from_uses(database& db, uint64_t func, const std::string& var, std::string& name, std::string& decl,
+                      std::string& err, bool apply)
+{
+    const function* fn = db.an.func_containing(func);
+    if (!fn) {
+        err = "no function there";
+        return false;
+    }
+    // the decompiler's key for the variable: shown as its own name, yours or the prototype's
+    decompiled d = decompile(db, fn->start);
+    use_collector uses;
+    for (const decomp_var& v : d.vars)
+        if (v.name == var || (uses.key.empty() && v.key == var))
+            uses.key = v.key;
+    if (uses.key.empty()) {
+        err = d.ok ? "no variable " + var + " in this function" : d.error;
+        return false;
+    }
+    g_uses = &uses;
+    d = decompile(db, fn->start);
+    g_uses = nullptr;
+    if (!d.ok) {
+        err = d.error.empty() ? "can't decompile the function" : d.error;
+        return false;
+    }
+    if (uses.fields.empty()) {
+        err = "nothing is read or written through " + var + " in this function";
+        return false;
+    }
+    // the name: yours, or function_variable made a c name and not one taken
+    if (!name.empty()) {
+        bool ok = std::isalpha((unsigned char)name[0]) || name[0] == '_';
+        for (char c : name)
+            ok = ok && (std::isalnum((unsigned char)c) || c == '_');
+        if (!ok) {
+            err = "a struct's name is letters, digits and _";
+            return false;
+        }
+    }
+    std::string base;
+    for (char c : db.call_name(fn->start) + "_" + var)
+        base += std::isalnum((unsigned char)c) ? c : '_';
+    while (base.find("__") != std::string::npos)
+        base.erase(base.find("__"), 1);
+    if (base.size() > 48)
+        base = base.substr(base.size() - 48);
+    if (base.empty() || !std::isalpha((unsigned char)base[0]))
+        base = "s_" + base;
+    if (name.empty()) {
+        name = base;
+        for (int k = 2; db.types.find(name); k++)
+            name = base + "_" + std::to_string(k);
+    }
+    // the fields, one per offset (the widest access), gaps between them as bytes
+    std::string body;
+    uint64_t at = 0;
+    bool aligned = true;
+    for (auto it = uses.fields.begin(); it != uses.fields.end(); ++it) {
+        uint64_t off = it->first;
+        uint32_t w = it->second;
+        auto next = std::next(it);
+        if (off < at)
+            continue; // inside the one before
+        if (next != uses.fields.end() && off + w > next->first)
+            w = (uint32_t)(next->first - off); // overlaps the next: only up to it
+        if (off > at)
+            body += util::fmt("    char gap_%llx[0x%llx];\n", (unsigned long long)at, (unsigned long long)(off - at));
+        const char* ty = w == 1 ? "char" : w == 2 ? "short" : w == 4 ? "int" : w == 8 ? "long long" : nullptr;
+        if (ty && uses.self.count(off) && w == (uint32_t)db.bin.ptr_size()) {
+            body += util::fmt("    struct %s* field_%llx;\n", name.c_str(), (unsigned long long)off);
+            aligned = aligned && off % w == 0;
+        } else if (ty) {
+            body += util::fmt("    %s field_%llx;\n", ty, (unsigned long long)off);
+            aligned = aligned && off % w == 0;
+        } else {
+            body += util::fmt("    char field_%llx[%u];\n", (unsigned long long)off, w);
+        }
+        at = off + w;
+    }
+    decl = std::string(aligned ? "" : "#pragma pack(push, 1)\n") + "struct " + name + " {\n" + body + "};" +
+           (aligned ? "" : "\n#pragma pack(pop)");
+    if (!apply)
+        return true;
+    // declared, and the variable points to it (one undo step with the app's per-frame groups)
+    if (!db.add_types(decl, err))
+        return false;
+    auto uv = db.lvars.find(fn->start);
+    std::string shown = uv != db.lvars.end() && uv->second.count(uses.key) ? uv->second.at(uses.key).name : std::string();
+    return db.set_lvar(fn->start, uses.key, shown, "struct " + name + "*", err);
 }
 
 std::string decompile_text(database& db, uint64_t func_start)

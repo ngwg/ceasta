@@ -423,6 +423,30 @@ void add_query_tools(std::vector<tool>& t)
         t.push_back(std::move(x));
     };
 
+    add("list_types",
+        "The C types declared for this file (define_types, create_struct_from_usage, the user's): structs, unions, "
+        "enums and typedefs with each field's offset and size. With a name, just that one.",
+        schema({{"name", prop("string", "one type: node, struct node, a typedef's name")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            database* db = need_db(s, out);
+            if (!db)
+                return false;
+            std::string n = util::trim(arg_str(args, "name"));
+            if (!n.empty()) {
+                const ctype_def* d = db->types.find(n);
+                if (!d) {
+                    out = "no type " + n;
+                    return false;
+                }
+                out = db->types.text(*d);
+                return true;
+            }
+            out = db->types.all_text(true);
+            if (out.empty())
+                out = "no types are declared (define_types adds them)";
+            return true;
+        });
+
     add("get_xrefs_to",
         "Who references an address: calls, jumps, data reads / writes and pointers to it, each with the function "
         "it comes from. Use it to find the callers of a function or the users of a string or global.",
@@ -818,7 +842,8 @@ void add_edit_tools(std::vector<tool>& t)
     vt.name = "set_variable_type";
     vt.description =
         "Give a variable of a function's pseudocode a type (int, char*, DWORD, struct header*, char[16]). The "
-        "declaration and the signature show it. Empty goes back to the automatic type.";
+        "declaration and the signature show it, and a pointer to a struct you declared (define_types) reads as "
+        "p->field. Empty goes back to the automatic type.";
     vt.schema = schema({{"function", prop("string", "the function: name or address")},
                         {"variable", prop("string", "the variable as the pseudocode shows it")},
                         {"type", prop("string", "the c type")}},
@@ -875,6 +900,69 @@ void add_edit_tools(std::vector<tool>& t)
         return true;
     };
     t.push_back(std::move(fp));
+
+    // c types: structs, unions, enums, typedefs
+    tool dt;
+    dt.name = "define_types";
+    dt.description =
+        "Declare C types - structs, unions, enums, typedefs - in C: \"struct node { int value; struct node* "
+        "next; };\". They're laid out the way this file's compiler would (pointer size, windows or not, "
+        "#pragma pack, bit fields), saved with the project, and a variable typed as a pointer to a struct "
+        "(set_variable_type) reads as p->field in the pseudocode. A definition with a name already there replaces "
+        "it: use it to rename the fields of a struct you made with create_struct_from_usage.";
+    dt.schema = schema({{"declarations", prop("string", "c declarations")}}, {"declarations"});
+    dt.writes = true;
+    dt.run = [](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        std::string err;
+        std::vector<std::string> names;
+        if (!db)
+            return false;
+        if (!db->add_types(arg_str(args, "declarations"), err, &names)) {
+            out = "can't declare them: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        out = names.empty() ? "nothing was defined (declarations of types only: struct, union, enum, typedef)\n" : "";
+        for (const std::string& n : names)
+            if (const ctype_def* d = db->types.find(n))
+                out += db->types.text(*d) + "\n";
+        return true;
+    };
+    t.push_back(std::move(dt));
+
+    tool cs;
+    cs.name = "create_struct_from_usage";
+    cs.description =
+        "Make a struct from how a variable of a function is used: a field at every offset the code reads or "
+        "writes through it (field_18, sized by the access; a field it follows to the next one points to the "
+        "struct), bytes for the gaps. The struct is declared and the variable typed as a pointer to it, so the "
+        "pseudocode reads p->field_18. Rename the fields with define_types when you know what they are.";
+    cs.schema = schema({{"function", prop("string", "the function: name or address")},
+                        {"variable", prop("string", "the variable as the pseudocode shows it (a pointer)")},
+                        {"name", prop("string", "the struct's name (optional, one is made up)")}},
+                       {"function", "variable"});
+    cs.writes = true;
+    cs.run = [func_of](mcp_server& s, const json::value& args, std::string& out) {
+        database* db = need_db(s, out);
+        uint64_t f = 0;
+        if (!db || !func_of(*db, args, f, out))
+            return false;
+        std::string name = util::trim(arg_str(args, "name")), decl, err;
+        if (!struct_from_uses(*db, f, util::trim(arg_str(args, "variable")), name, decl, err, true)) {
+            out = "can't make it: " + err;
+            return false;
+        }
+        autosave(s, *db);
+        if (s.on_changed)
+            s.on_changed();
+        const ctype_def* d = db->types.find(name);
+        out = (d ? db->types.text(*d) : decl) + "\n" + arg_str(args, "variable") + " is a struct " + name + "* now";
+        return true;
+    };
+    t.push_back(std::move(cs));
 
     // names for the user to review, instead of renaming right away
     tool sg;

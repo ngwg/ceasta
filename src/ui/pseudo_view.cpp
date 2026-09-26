@@ -226,6 +226,18 @@ bool retype_selected(app_state& s)
     return true;
 }
 
+bool show_type_selected(app_state& s)
+{
+    if (!s.db || g_cache.func == 0 || g_showing_kuna)
+        return false;
+    const decomp_var* v = var_named(s.pseudo_word);
+    const ctype_def* st = v ? s.db->types.pointee(v->type) : s.db->types.find(s.pseudo_word);
+    if (!st)
+        return false;
+    dialogs::show_type(s, st->name);
+    return true;
+}
+
 bool follow_selected(app_state& s)
 {
     uint64_t a = s.db ? address_of(s, s.pseudo_word) : 0;
@@ -260,6 +272,22 @@ static void word_menu(app_state& s)
         retype_selected(s);
     if (ImGui::MenuItem("Jump to it", "Enter", false, a != 0))
         follow_selected(s);
+    // structs: one made from how the variable is used, or the one it points to / you clicked
+    const ctype_def* st = v ? s.db->types.pointee(v->type) : s.db->types.find(s.pseudo_word);
+    if (v && ImGui::MenuItem("Make a struct from how it's used")) {
+        std::string name, decl, err;
+        if (struct_from_uses(*s.db, g_cache.func, v->name, name, decl, err, true)) {
+            app_names_changed(s);
+            app_log(s, "made struct " + name + " from how " + v->name + " is used; name its fields in C types (Shift+F1)");
+            dialogs::show_type(s, name);
+        } else {
+            app_log(s, "can't make a struct from " + v->name + ": " + err, 1);
+        }
+    }
+    if (v)
+        ImGui::SetItemTooltip("a field at every offset the code reads or writes through it, and %s becomes a pointer to it", v->name.c_str());
+    if (st && st->k != ctype_def::kind::typedef_ && ImGui::MenuItem(("Edit " + std::string(st->k == ctype_def::kind::union_ ? "union " : st->k == ctype_def::kind::enum_ ? "enum " : "struct ") + st->name + "...").c_str(), "Shift+F1"))
+        dialogs::show_type(s, st->name);
     if (ImGui::MenuItem("Copy", nullptr, false, !s.pseudo_word.empty()))
         ImGui::SetClipboardText(s.pseudo_word.c_str());
     ImGui::Separator();

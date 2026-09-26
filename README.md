@@ -84,6 +84,7 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 - ida-style listing: names instead of addresses, labels, xref and string comments, the arguments each instruction passes to a known api
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
 - decompiler (f5, x86 / x64): c-like pseudocode — if / else, loops, switch, stack variables, calls with their arguments (~350 known api prototypes). click a name: `n` renames it, `y` sets a type or a prototype. shift+f5 shows it next to the listing
+- structs: declare c types (shift+f1, or import a header — all of windows.h works) and a variable typed as a pointer to one reads `p->next`, `p->items[i].name`. right-click a variable: *make a struct from how it's used* — a field at every offset the code touches — then name the fields
 - a second decompiler if you want one: with [kuna](https://github.com/Noelo-Lab/kuna) installed (a decompiler ported from ghidra's), the pseudocode view gets a `kuna` switch — its output for the same function, lines linked to the listing, arm64 too. [more below](#second-decompiler-kuna)
 - file info: headers, security flags (aslr, dep, cfg / pie, nx, relro, canary / hardened runtime), md5 / sha256 / imphash, section entropy, resources, version info, a mac program's code signature and entitlements, and warnings when it looks packed
 - search everything (ctrl+f): functions, names, imports, exports, strings, comments and segments in one box, and the strings say where they're used
@@ -132,6 +133,7 @@ the decompiler (f5), here next to the listing (shift+f5) — a click in one move
 | alt+m / ctrl+m | bookmark / bookmarks | f12 | pause |
 | ctrl+z / ctrl+y | undo / redo | ctrl+s | save |
 | ctrl+shift+p | every action | f1 | all shortcuts |
+| shift+f1 | c types (structs, unions, enums) | | |
 
 ## plugins
 
@@ -167,6 +169,8 @@ ceasta-cli sigmake libc.a lib.sig   make signatures from a file with symbols
 ceasta-cli sigapply stripped lib.sig  name matching functions
 ceasta-cli export file.exe --ida out.py   your names for ida (--ghidra, --x64dbg too)
 ceasta-cli import file.exe names.json     names from x64dbg, a .map, ida or ghidra
+ceasta-cli import file.exe structs.h      a c header's structs, unions, enums, typedefs
+ceasta-cli types file.exe           the project's c types, with every field's offset
 ceasta-cli mcp file.exe             serve the file to an AI over MCP
 ```
 

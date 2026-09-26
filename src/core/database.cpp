@@ -105,6 +105,7 @@ const char* perm_text(uint32_t p)
 
 void database::build()
 {
+    types.set_abi(bin.ptr_size(), bin.format == bin_format::pe, bin.arch == bin_arch::arm64, bin.format == bin_format::macho);
     dis_.open(bin.arch);
     digits_ = bin.max_addr() > 0x100000000ull ? 16 : 8;
     crc = util::crc32(bin.file.data(), bin.file.size());
@@ -764,8 +765,94 @@ std::string database::apply(const edit& e, bool forward)
     case edit_kind::proto:
         set_proto(e.addr, v, err);
         return "prototype of " + location(e.addr);
+    case edit_kind::types: { // "drop a b\n<c of the definitions to put in>"
+        size_t nl = v.find('\n');
+        ctypes t = types;
+        for (const std::string& n : util::split(v.substr(4, nl == std::string::npos ? std::string::npos : nl - 4), " "))
+            t.remove(n);
+        if (nl != std::string::npos && nl + 1 < v.size())
+            t.add(v.substr(nl + 1), err, nullptr, true);
+        types = t;
+        return "types";
+    }
     }
     return std::string();
+}
+
+// what turns one set of types into another: "drop <names>" on the first line, then the c of the
+// definitions to put in, in the order they need (only what differs: a big header stays cheap)
+static std::string types_patch(const ctypes& from, const ctypes& to)
+{
+    std::string drop = "drop", ahead, put;
+    for (const std::string& n : from.names())
+        if (n.compare(0, 7, "__anon_") != 0 && !to.find(n))
+            drop += " " + n;
+    for (const std::string& n : to.order()) {
+        const ctype_def *a = from.find(n), *b = to.find(n);
+        if (!b || (a && *a == *b))
+            continue;
+        if (a && b->incomplete) // struct x; doesn't undefine x: it has to go first
+            drop += " " + n;
+        // declared ahead, so they can point to each other whatever the order
+        if (!b->incomplete && (b->k == ctype_def::kind::struct_ || b->k == ctype_def::kind::union_))
+            ahead += std::string(b->k == ctype_def::kind::union_ ? "union " : "struct ") + n + ";\n";
+        put += to.text(*b, false) + "\n";
+    }
+    return drop + "\n" + ahead + put;
+}
+
+void database::set_types(ctypes t)
+{
+    std::string before = types_patch(t, types), after = types_patch(types, t);
+    if (after.size() <= 5) // "drop\n": the same
+        return;
+    record(edit_kind::types, 0, before, after);
+    types = std::move(t);
+    dirty = true;
+}
+
+bool database::add_types(const std::string& text, std::string& err, std::vector<std::string>* names, bool lenient)
+{
+    ctypes t = types;
+    if (!t.add(text, err, names, lenient))
+        return false;
+    set_types(std::move(t));
+    return true;
+}
+
+bool database::remove_type(const std::string& name, std::string& err)
+{
+    const ctype_def* d = types.find(name);
+    if (!d) {
+        err = "no type " + name;
+        return false;
+    }
+    std::string n = d->name;
+    // what holds it, or names it without struct (a typedef's name, c++ style), can't do without
+    // it; a struct x* can
+    for (const std::string& other : types.names()) {
+        const ctype_def* o = types.find(other);
+        if (!o || other == n)
+            continue;
+        std::vector<std::pair<std::string, std::string>> uses; // (what, its type)
+        for (const ctype_field& f : o->fields)
+            uses.push_back({f.name, f.type});
+        if (o->k == ctype_def::kind::typedef_)
+            uses.push_back({std::string(), o->target});
+        for (const auto& u : uses) {
+            bool pointer = false;
+            std::string b = types.base_of(u.second, pointer);
+            if (b != n && (pointer || (b != "struct " + n && b != "union " + n && b != "enum " + n)))
+                continue;
+            std::string who = other.compare(0, 7, "__anon_") == 0 ? std::string("a struct") : other;
+            err = who + (u.first.empty() ? std::string() : " (" + u.first + ")") + " uses " + n + ": change it first";
+            return false;
+        }
+    }
+    ctypes t = types;
+    t.remove(n);
+    set_types(std::move(t));
+    return true;
 }
 
 std::string database::undo()
@@ -1311,6 +1398,8 @@ std::string database::serialize(bool with_program) const
         s += "bookmark " + util::hex(b.first) + (b.second.empty() ? std::string() : " " + escape_line(b.second)) + "\n";
     for (const xref& x : extra_xrefs)
         s += "xref " + util::hex(x.from) + " " + util::hex(x.to) + " " + std::to_string((int)x.type) + "\n";
+    for (const std::string& t : types.texts()) // "type <c definition>", in the order they depend on each other
+        s += "type " + escape_line(t) + "\n";
     for (const auto& p : protos)
         s += "proto " + util::hex(p.first) + " " + format_prototype(p.second) + "\n";
     for (const auto& f : lvars)
@@ -1371,7 +1460,7 @@ bool database::load_annotations(std::string& err)
     std::vector<uint8_t> bytes;
     if (!os::read_file(path, bytes, err))
         return false;
-    std::string text(bytes.begin(), bytes.end());
+    std::string text(bytes.begin(), bytes.end()), type_text;
     size_t pos = 0;
     int line_no = 0;
     while (pos < text.size()) {
@@ -1405,6 +1494,10 @@ bool database::load_annotations(std::string& err)
         if (sp1 == std::string::npos)
             continue;
         std::string kind = line.substr(0, sp1);
+        if (kind == "type") { // "type <c definition>": read all at once at the end
+            type_text += unescape_line(line.substr(sp1 + 1)) + "\n";
+            continue;
+        }
         if (kind == "view") { // "view <cursor> <mode>"
             uint64_t c = 0;
             size_t sp = line.find(' ', sp1 + 1);
@@ -1455,6 +1548,10 @@ bool database::load_annotations(std::string& err)
                     add_xref(a, to, (xref_type)k);
             }
         }
+    }
+    if (!type_text.empty()) {
+        std::string e; // one that doesn't read any more (hand edited) is left out, not the rest
+        types.add(type_text, e, nullptr, true);
     }
     dirty = false;
     return true;

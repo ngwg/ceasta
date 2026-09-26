@@ -44,9 +44,10 @@ static void file_menu(app_state& s)
         ImGui::EndMenu();
     }
     ImGui::SetItemTooltip("your names, comments, prototypes and breakpoints, as a script / database that tool reads");
-    if (ImGui::MenuItem("Import names (IDA, Ghidra, x64dbg)...", nullptr, false, s.db && s.platform.open_file_dialog))
+    if (ImGui::MenuItem("Import names or types...", nullptr, false, s.db && s.platform.open_file_dialog))
         app_import_names(s);
-    ImGui::SetItemTooltip("an x64dbg database, a .map file, or the .json of scripts/ida_to_ceasta.py or ghidra_to_ceasta.py");
+    ImGui::SetItemTooltip("an x64dbg database, a .map file, the .json of scripts/ida_to_ceasta.py or ghidra_to_ceasta.py,\n"
+                          "or a c header (.h): its structs, unions, enums and typedefs");
     ImGui::Separator();
     if (ImGui::MenuItem("Exit", theme::keys("Alt+F4")))
         app_quit(s);
@@ -79,6 +80,10 @@ static void edit_menu(app_state& s)
         app_toggle_bookmark(s, s.cursor);
     if (ImGui::MenuItem("Bookmarks...", theme::keys("Ctrl+M"), false, has))
         dialogs::open(s, dialog_kind::bookmarks, s.cursor);
+    ImGui::Separator();
+    if (ImGui::MenuItem("C types...", "Shift+F1", false, has))
+        dialogs::open(s, dialog_kind::types, s.cursor);
+    ImGui::SetItemTooltip("structs, unions, enums and typedefs; a variable typed as a pointer to a struct reads as p->field");
     ImGui::EndMenu();
 }
 

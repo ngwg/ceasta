@@ -72,6 +72,8 @@ Always on (read and annotate):
 | `diff_binary` | compare with another file, function by function |
 | `rename` / `set_comment` | record what it learns (saved with the project) |
 | `rename_variable` / `set_variable_type` / `set_function_prototype` | name and type a function's variables, give it a prototype (`int check_key(const char* key)`) — the pseudocode and the callers use them |
+| `define_types` / `list_types` | declare structs, unions, enums and typedefs in c, and read them back with each field's offset — a variable typed as a pointer to a struct reads `p->field` |
+| `create_struct_from_usage` | a struct from how a variable is used (a field at every offset read or written through it), declared and applied; rename its fields with `define_types` |
 | `suggest_name` / `suggest_variable_name` | propose a name with a reason instead of applying it: it waits for you in **AI > Review suggested names** |
 | `save_project` | write a committable `<file>.ceasta` |
 

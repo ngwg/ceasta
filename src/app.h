@@ -41,7 +41,7 @@ struct load_job {
 enum class center_view { listing, graph, pseudo, split }; // split: listing and pseudocode side by side
 
 enum class dialog_kind { none, jump, rename, comment, xrefs, search, find, open_raw, attach, run_args, about, shortcuts,
-    save_changes, ai, palette, bookmarks, bp_condition, watch, lvar_name, lvar_type, proto, review, kuna };
+    save_changes, ai, palette, bookmarks, bp_condition, watch, lvar_name, lvar_type, proto, review, kuna, types };
 
 struct app_mcp; // the built-in mcp server, when it's running (app_mcp.cpp)
 
@@ -68,7 +68,9 @@ struct dialog_state {
     int run_action = -1;  // palette: the action to run once it has closed
     int watch_size = 4;   // watch: bytes, and whether reads stop too
     bool watch_access = false;
-    std::string key;      // lvar_name / lvar_type: the variable (its decompiler name), addr the function
+    std::string key;      // lvar_name / lvar_type: the variable (its decompiler name), addr the function;
+                          // types: the type being edited ("" for a new one)
+    std::string text;     // types: the c text in the editor
 };
 
 struct app_state {

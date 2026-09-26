@@ -36,6 +36,7 @@ static const char* title(dialog_kind k)
     case dialog_kind::proto: return "Function prototype###dlg";
     case dialog_kind::review: return "Suggested names###dlg";
     case dialog_kind::kuna: return "Second decompiler: kuna###dlg";
+    case dialog_kind::types: return "C types###dlg";
     default: return "###dlg";
     }
 }
@@ -45,7 +46,23 @@ static bool needs_file(dialog_kind k)
     return k == dialog_kind::jump || k == dialog_kind::rename || k == dialog_kind::comment || k == dialog_kind::xrefs ||
            k == dialog_kind::search || k == dialog_kind::find || k == dialog_kind::bookmarks ||
            k == dialog_kind::bp_condition || k == dialog_kind::watch || k == dialog_kind::lvar_name ||
-           k == dialog_kind::lvar_type || k == dialog_kind::proto || k == dialog_kind::review;
+           k == dialog_kind::lvar_type || k == dialog_kind::proto || k == dialog_kind::review || k == dialog_kind::types;
+}
+
+// types: the one the editor shows ("" a new one), as c with its offsets
+static void pick_type(dialog_state& d, const database& db, const std::string& name)
+{
+    const ctype_def* t = name.empty() ? nullptr : db.types.find(name);
+    d.key = t ? t->name : std::string();
+    d.text = t ? db.types.text(*t) + "\n" : "struct name {\n    int field;\n};\n";
+    d.error.clear();
+}
+
+void show_type(app_state& s, const std::string& name)
+{
+    open(s, dialog_kind::types, s.cursor);
+    if (s.db && s.dialog.kind == dialog_kind::types)
+        pick_type(s.dialog, *s.db, name);
 }
 
 void open(app_state& s, dialog_kind kind, uint64_t addr)
@@ -117,6 +134,12 @@ void open(app_state& s, dialog_kind kind, uint64_t addr)
         snprintf(d.buf, sizeof(d.buf), "%s", s.kuna_path.c_str());
     } else if (kind == dialog_kind::attach) {
         d.procs = list_processes();
+    } else if (kind == dialog_kind::types) {
+        std::string first;
+        for (const std::string& n : db.types.names())
+            if (first.empty() && n.compare(0, 7, "__anon_") != 0)
+                first = n;
+        pick_type(d, db, first);
     }
 }
 
@@ -797,6 +820,93 @@ static void review(app_state& s, dialog_state& d)
 }
 
 // the bookmarks: pick one to jump there; a note per bookmark; delete removes it
+// a std::string that grows as you type in it
+static int text_grows(ImGuiInputTextCallbackData* cb)
+{
+    if (cb->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        std::string* str = (std::string*)cb->UserData;
+        str->resize((size_t)cb->BufTextLen);
+        cb->Buf = &(*str)[0];
+    }
+    return 0;
+}
+
+// your c types: the list (filter it, pick one) and the one you picked as c. apply replaces it
+// with what you wrote (a definition of another name is added), new starts one, delete removes it
+static void types(app_state& s, dialog_state& d)
+{
+    database& db = *s.db;
+    float fs = ImGui::GetFontSize();
+    ImGui::TextDisabled("structs, unions, enums and typedefs, in c (#pragma pack, bit fields, a header's too). a variable");
+    ImGui::TextDisabled("%s", theme::keys("typed as a pointer to a struct (Y in the pseudocode) reads as p->field. ctrl+z takes a change back"));
+    ImGui::BeginGroup();
+    if (ImGui::IsWindowAppearing())
+        ImGui::SetKeyboardFocusHere();
+    ImGui::SetNextItemWidth(fs * 15);
+    ImGui::InputTextWithHint("##tf", "filter", d.filter, sizeof(d.filter));
+    ImGui::Dummy(ImVec2(0, 2)); // room for the focus frame
+    std::string f = util::lower(d.filter);
+    std::vector<const ctype_def*> shown;
+    for (const std::string& n : db.types.names())
+        if (n.compare(0, 7, "__anon_") != 0 && (f.empty() || util::lower(n).find(f) != std::string::npos))
+            if (const ctype_def* t = db.types.find(n))
+                shown.push_back(t);
+    ImGui::BeginChild("##tl", ImVec2(fs * 15, fs * 22), ImGuiChildFlags_Borders);
+    if (shown.empty())
+        ImGui::TextDisabled(db.types.empty() ? "none yet" : "no match");
+    ImGuiListClipper clip;
+    clip.Begin((int)shown.size());
+    while (clip.Step())
+        for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+            const ctype_def* t = shown[(size_t)i];
+            static const char* const kinds[] = {"struct", "union", "enum", "typedef"};
+            ImGui::PushID(i);
+            if (ImGui::Selectable(t->name.c_str(), t->name == d.key))
+                pick_type(d, db, t->name);
+            ImGui::SetItemTooltip("%s %s, 0x%x bytes", kinds[(int)t->k], t->name.c_str(), t->size);
+            ImGui::PopID();
+        }
+    ImGui::EndChild();
+    if (ImGui::Button("New", ImVec2(fs * 7, 0)))
+        pick_type(d, db, std::string());
+    ImGui::SameLine();
+    ImGui::BeginDisabled(d.key.empty());
+    if (ImGui::Button("Delete", ImVec2(fs * 7, 0))) {
+        std::string err;
+        if (db.remove_type(d.key, err)) {
+            app_names_changed(s);
+            pick_type(d, db, std::string());
+        } else {
+            d.error = err;
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::EndGroup();
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::InputTextMultiline("##tt", &d.text[0], d.text.capacity() + 1, ImVec2(fs * 34, fs * 22 + ImGui::GetFrameHeightWithSpacing()),
+                              ImGuiInputTextFlags_CallbackResize | ImGuiInputTextFlags_AllowTabInput, text_grows, &d.text);
+    if (!d.error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::log_error), "%s", d.error.c_str());
+    bool apply = ImGui::Button("Apply", ImVec2(fs * 7, 0)) || ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Enter);
+    ImGui::SetItemTooltip("%s", theme::keys("Ctrl+Enter"));
+    ImGui::SameLine();
+    if (ImGui::Button("Close", ImVec2(fs * 7, 0)))
+        ImGui::CloseCurrentPopup();
+    ImGui::EndGroup();
+    if (apply) {
+        std::string err;
+        std::vector<std::string> names;
+        if (db.add_types(d.text, err, &names)) {
+            app_names_changed(s);
+            bool same = std::find(names.begin(), names.end(), d.key) != names.end();
+            pick_type(d, db, same || names.empty() ? d.key : names.front()); // the offsets, worked out again
+        } else {
+            d.error = err;
+        }
+    }
+}
+
 static void bookmarks(app_state& s, dialog_state& d)
 {
     database& db = *s.db;
@@ -953,6 +1063,7 @@ static void shortcuts(app_state&, dialog_state&)
         {"X", "references to here"},        {"Space", "listing / graph"},
         {"F5", "pseudocode (decompiler)"},  {"Shift+F5", "listing and pseudocode side by side"},
         {"N (pseudocode)", "rename the name you clicked"}, {"Y (pseudocode)", "its type / the function's prototype"},
+        {"Shift+F1", "c types: structs, unions, enums"},
         {"Ctrl+F", "search names, imports, strings, ..."},
         {"Alt+B", "search bytes"},
         {"Up / Down / PgUp / PgDn", "move in the listing"},
@@ -1034,6 +1145,7 @@ void draw(app_state& s)
         case dialog_kind::proto: proto(s, d); break;
         case dialog_kind::review: review(s, d); break;
         case dialog_kind::kuna: kuna(s, d); break;
+        case dialog_kind::types: types(s, d); break;
         default: ImGui::CloseCurrentPopup(); break;
         }
     }

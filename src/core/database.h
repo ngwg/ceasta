@@ -3,6 +3,7 @@
 #include "core/binary.h"
 #include "core/disasm.h"
 #include "core/fileinfo.h"
+#include "core/ctypes.h"
 #include "core/protos.h"
 #include <map>
 #include <memory>
@@ -144,6 +145,15 @@ public:
     // function's name
     std::map<uint64_t, prototype> protos;
     bool set_proto(uint64_t func, const std::string& text, std::string& err); // "" removes it
+    // your c types - structs, unions, enums, typedefs - laid out for this file's abi. a variable
+    // typed as a pointer to a struct reads as p->field in the pseudocode
+    ctypes types;
+    // more of them from c text (a definition with a name already there replaces it); undoable.
+    // names gets what the text defined. lenient (a header): what doesn't read is left out, err
+    // says how much. remove_type: one of them, unless another holds it by value
+    bool add_types(const std::string& text, std::string& err, std::vector<std::string>* names = nullptr,
+                   bool lenient = false);
+    bool remove_type(const std::string& name, std::string& err);
     // what a call to target takes: your prototype of a function here (through a thunk), or a
     // well-known one by name (imports like CreateFileW, printf). null when there's neither
     const prototype* callee_proto(uint64_t target) const;
@@ -169,7 +179,8 @@ public:
 
     // undo / redo of your edits: names, comments, bookmarks. edits in the same group (the app
     // uses one per frame, so a plugin or the ai renaming many things is one step) go together
-    enum class edit_kind : uint8_t { name, comment, bookmark, lvar, proto };
+    enum class edit_kind : uint8_t { name, comment, bookmark, lvar, proto, types };
+    void set_types(ctypes t); // records what changed (only that: a big header stays cheap to undo)
     struct edit {
         edit_kind kind;
         uint64_t addr;

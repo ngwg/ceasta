@@ -292,6 +292,76 @@ int api_decompile(lua_State* L)
     return 1;
 }
 
+// c types: all of them as c text; add more (true, names or false, err)
+int api_types(lua_State* L)
+{
+    lua_pushstring(L, need_db(L)->types.all_text().c_str());
+    return 1;
+}
+
+int api_add_types(lua_State* L)
+{
+    database* db = need_db(L);
+    std::string err;
+    std::vector<std::string> names;
+    if (!db->add_types(luaL_checkstring(L, 1), err, &names)) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, true);
+    lua_newtable(L);
+    for (size_t i = 0; i < names.size(); i++) {
+        lua_pushstring(L, names[i].c_str());
+        lua_rawseti(L, -2, (lua_Integer)i + 1);
+    }
+    return 2;
+}
+
+// the decompiler's key for a variable of the function at addr, by the name it shows
+bool var_key(database& db, uint64_t func, const std::string& var, std::string& key)
+{
+    for (const decomp_var& v : decompile(db, func).vars)
+        if (v.name == var || (key.empty() && v.key == var))
+            key = v.key;
+    return !key.empty();
+}
+
+int api_set_var_type(lua_State* L)
+{
+    database* db = need_db(L);
+    const function* f = db->an.func_containing(check_addr(L, 1));
+    std::string var = luaL_checkstring(L, 2), type = luaL_checkstring(L, 3), key, err;
+    if (!f || !var_key(*db, f->start, var, key)) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, f ? ("no variable " + var + " there").c_str() : "no function there");
+        return 2;
+    }
+    auto it = db->lvars.find(f->start);
+    std::string name = it != db->lvars.end() && it->second.count(key) ? it->second.at(key).name : std::string();
+    if (!db->set_lvar(f->start, key, name, type, err)) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+int api_struct_from_uses(lua_State* L)
+{
+    database* db = need_db(L);
+    std::string name, decl, err;
+    if (!struct_from_uses(*db, check_addr(L, 1), luaL_checkstring(L, 2), name, decl, err, lua_toboolean(L, 3))) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    lua_pushstring(L, name.c_str());
+    lua_pushstring(L, decl.c_str());
+    return 2;
+}
+
 // iterators return a plain array of tables, easy to use with ipairs
 void begin_array(lua_State* L) { lua_newtable(L); }
 void array_push(lua_State* L, int& i) { lua_rawseti(L, -2, ++i); }
@@ -780,6 +850,8 @@ static const luaL_Reg api_funcs[] = {
     {"name", api_name}, {"location", api_location}, {"set_name", api_set_name}, {"resolve", api_resolve},
     {"comment", api_comment}, {"set_comment", api_set_comment},
     {"disasm", api_disasm}, {"next_addr", api_next_addr}, {"decompile", api_decompile},
+    {"types", api_types}, {"add_types", api_add_types}, {"set_var_type", api_set_var_type},
+    {"struct_from_uses", api_struct_from_uses},
     {"functions", api_functions}, {"imports", api_imports}, {"exports", api_exports},
     {"strings", api_strings}, {"xrefs_to", api_xrefs_to}, {"find", api_find},
     {"here", api_here}, {"goto_addr", api_goto},

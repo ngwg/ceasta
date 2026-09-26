@@ -44,7 +44,9 @@ static void usage()
            "    --ida out.py / --ghidra out.py / --x64dbg out.dd64\n"
            "                                your names, comments and prototypes for those tools instead\n"
            "  import <file> <names>         take names from an x64dbg database, a .map file, or the json\n"
-           "                                of scripts/ida_to_ceasta.py / ghidra_to_ceasta.py\n"
+           "                                of scripts/ida_to_ceasta.py / ghidra_to_ceasta.py; or the\n"
+           "                                structs, unions, enums and typedefs of a c header (.h)\n"
+           "  types <file>                  the project's c types, with every field's offset\n"
            "  sigmake <file> [out.sig]      make library signatures from a file that has symbols\n"
            "  sigapply <file> <in.sig>      name matching functions (--save to keep them)\n"
            "  run <file> <script.lua>       run a lua script against the file (ceasta.* api)\n"
@@ -63,6 +65,12 @@ static void usage()
            "  --kuna / --kuna-path <file>   decompile with kuna (github.com/Noelo-Lab/kuna) instead\n"
            "\"where\" is a hex address or any name (sub_401000, start, main, ...)\n",
         CEASTA_VERSION);
+}
+
+// the types an export carries (the x64dbg one has none)
+static size_t tool_types(const database& db, const std::string& opt)
+{
+    return opt == "--x64dbg" ? 0 : db.types.texts().size();
 }
 
 static std::string line_for(database& db, const row& r)
@@ -529,8 +537,8 @@ int main(int argc, char** argv)
                 fprintf(stderr, "can't write %s: %s\n", args[i + 1].c_str(), e.c_str());
                 return 1;
             }
-            printf("wrote %s (%zu names, %zu comments, %zu prototypes)\n", args[i + 1].c_str(), db.user_names.size(),
-                db.user_comments.size(), db.protos.size());
+            printf("wrote %s (%zu names, %zu comments, %zu prototypes, %zu types)\n", args[i + 1].c_str(), db.user_names.size(),
+                db.user_comments.size(), db.protos.size(), tool_types(db, o));
             i++;
         }
         if (other)
@@ -544,7 +552,7 @@ int main(int argc, char** argv)
     }
     if (cmd == "import") {
         if (args.size() < 3) {
-            fprintf(stderr, "usage: ceasta-cli import <file> <x64dbg .dd64 | .map | names .json>\n");
+            fprintf(stderr, "usage: ceasta-cli import <file> <x64dbg .dd64 | .map | names .json | header .h>\n");
             return 2;
         }
         import_result r = import_names(db, args[2]);
@@ -558,6 +566,11 @@ int main(int argc, char** argv)
             return 1;
         }
         printf("%s\nsaved to %s\n", r.summary().c_str(), db.project_path().c_str());
+        return 0;
+    }
+    if (cmd == "types") {
+        std::string t = db.types.all_text(true);
+        printf("%s", t.empty() ? "no types (ceasta-cli import <file> header.h adds a header's)\n" : t.c_str());
         return 0;
     }
     if (cmd == "sigmake") {

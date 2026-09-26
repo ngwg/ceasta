@@ -48,6 +48,44 @@ jobs:
           ../$cli funcs hello | grep -E ' (main\.triple|main\.main)$'
           test "$(../$cli funcs hello | grep -c -E ' (main\.triple|main\.main)$')" -eq 2
 
+      - name: try the structs
+        run: |
+          cli=$PWD/build/ceasta-cli
+          mkdir sttest && cd sttest
+          cat > st.c <<'EOF'
+          struct item { int id; short flags; char name[16]; struct item* next; };
+          __attribute__((noinline)) int total_ids(struct item* it)
+          {
+              int t = 0;
+              for (; it; it = it->next)
+                  if (it->flags & 1)
+                      t += it->id;
+              return t;
+          }
+          int main(int argc, char** argv) { struct item a = {1, 1, "a", 0}; return total_ids(argc > 5 ? 0 : &a); }
+          EOF
+          gcc -O2 -o st st.c
+          # a struct made from how the parameter is used reads p->field_18; named fields, p->next
+          cat > st.lua <<'EOF'
+          local f = ceasta.resolve("total_ids")
+          local v = ceasta.decompile(f):match("total_ids%(.-(%w+)%)")
+          local name, decl = ceasta.struct_from_uses(f, v, true)
+          assert(name, decl)
+          print(decl)
+          local code = ceasta.decompile(f)
+          print(code)
+          assert(code:find("->field_18", 1, true), "no p->field_18")
+          assert(ceasta.add_types("struct " .. name .. " { int id; short flags; char name[16]; struct " .. name .. "* next; };"))
+          code = ceasta.decompile(f)
+          print(code)
+          assert(code:find("->next", 1, true) and code:find("->flags", 1, true), "no p->next")
+          EOF
+          $cli run st st.lua
+          # a c header's types, laid out
+          $cli import st /usr/include/elf.h
+          $cli types st | grep -A3 'struct Elf64_Ehdr\|^typedef struct {' | head -20
+          $cli types st | grep -q 'e_shstrndx;.*// 0x3e'
+
       - name: package the command line tool
         run: |
           version=$(sed -n 's/^#define CEASTA_VERSION "\(.*\)"/\1/p' src/version.h)

@@ -41,6 +41,13 @@ struct decompiled {
 // uses the database's analysis and its disassembler.
 decompiled decompile(database& db, uint64_t func_start);
 
+// a struct made from how a variable of a function is used: a field for every offset something
+// reads or writes through it (field_18), bytes for the gaps. var is the name the pseudocode
+// shows. name: the struct's name (empty: one is made up, and returned); decl gets its c
+// declaration. with apply it's declared and the variable typed as a pointer to it
+bool struct_from_uses(database& db, uint64_t func, const std::string& var, std::string& name, std::string& decl,
+                      std::string& err, bool apply = false);
+
 // the whole thing as plain text (used by the cli and the clipboard)
 std::string decompile_text(database& db, uint64_t func_start);
 

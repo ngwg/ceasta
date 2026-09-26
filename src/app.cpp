@@ -688,7 +688,7 @@ void app_import_names(app_state& s)
 {
     if (!s.db || !s.platform.open_file_dialog)
         return;
-    std::string path = s.platform.open_file_dialog("Import names (x64dbg .dd64 / .dd32, .map, ida / ghidra .json)");
+    std::string path = s.platform.open_file_dialog("Import names (x64dbg .dd64 / .dd32, .map, ida / ghidra .json) or types (a c header)");
     if (path.empty())
         return;
     import_result r = import_names(*s.db, path); // one frame: one undo step
@@ -1108,9 +1108,13 @@ static bool plain_key(ImGuiKey k)
 static void shortcuts(app_state& s)
 {
     ImGuiIO& io = ImGui::GetIO();
-    // a dialog (even one closing this frame) or a context menu owns the keyboard
+    // a dialog (even one closing this frame) or a context menu owns the keyboard. esc closes a
+    // menu before this runs, so one open the frame before still has it (esc isn't back then)
+    static bool popup_before = false;
     bool popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-    if (popup || s.dialog.kind != dialog_kind::none)
+    bool had = popup_before;
+    popup_before = popup;
+    if (popup || had || s.dialog.kind != dialog_kind::none)
         return;
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O))
         app_open_dialog(s);
@@ -1131,7 +1135,11 @@ static void shortcuts(app_state& s)
         app_set_font_size(s, s.font_size - 1);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_0))
         app_set_font_size(s, 15);
-    if (ImGui::IsKeyPressed(ImGuiKey_F1, false))
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_F1)) {
+        if (!(s.pseudo_focus && pseudo_view::show_type_selected(s)))
+            dialogs::open(s, dialog_kind::types, s.cursor);
+    }
+    else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F1, false))
         dialogs::open(s, dialog_kind::shortcuts, 0);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_P))
         dialogs::open(s, dialog_kind::palette, s.cursor);
