@@ -512,7 +512,7 @@ void draw(app_state& s)
     }
     if (!c.result.ok) {
         ImGui::TextColored(err_col, "  %s", c.result.error.c_str());
-        // ceasta's can't (arm64): kuna may
+        // ceasta's can't: kuna may
         if (have_kuna && kuna_unsupported(db.bin).empty()) {
             ImGui::Spacing();
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetFontSize());

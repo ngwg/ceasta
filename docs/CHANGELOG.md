@@ -35,6 +35,21 @@
     and ghidra exports declare them before the prototypes that use them
   - for the ai: `define_types`, `list_types`, `create_struct_from_usage`; in lua:
     `ceasta.types()`, `add_types`, `set_var_type`, `struct_from_uses`
+- **arm64 decompiler**: f5 on arm64 code - linux, windows on arm, macos and ios programs - with
+  the same pseudocode as x86 / x64: conditions (`cmp`, `ccmp` chains, `cbz`, `tbz`), loops,
+  switch tables, calls with their arguments, stack variables, structs, renames and types
+  - globals by name, also when their page (`adrp`) is loaded before a branch or a loop
+  - the arguments are `a0`, `a1`, ...: x0 is the result too, so a name or type you give the
+    first argument stays with it
+  - floating point compares read `if (s0 < s1)`, the carry and overflow checks of an add read
+    as conditions, and a struct cleared with vector stores is a `memset`. other floating point
+    and vector code shows as `__asm` lines
+  - checked by compiling 55 c functions for arm64 at -O0, -O1, -O2 and -Os, decompiling them
+    and running the pseudocode against the originals: 8,120 calls, the same results
+- **decompiler**, x86 / x64 too: a compare tested by two branches reads `if (x < 1) ...
+  if (x != 1)`, where the second one used to say `flags`; the stack canary reads
+  `__readfsqword(0x28)` (it read as the number 0x28); a pointer into a string that shares its
+  end with another reads `&aGNUCoreutils + 4`, and one to the shared end `""`
 - **analysis**
   - c++ and rust cleanup code (exception landing pads) in linux programs belongs to its
     function; it used to show up as hundreds of made-up functions

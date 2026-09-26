@@ -254,6 +254,25 @@ jobs:
           done
           test -n "$found"
 
+      - name: try the arm64 decompiler
+        run: |
+          cli=$PWD/build/ceasta-cli
+          mkdir a64test && cd a64test
+          cat > a.c <<'EOF'
+          struct node { int val; struct node* next; };
+          int g_total;
+          __attribute__((noinline)) int list_sum(struct node* n) { int s = 0; for (; n; n = n->next) s += n->val; g_total += s; return s; }
+          __attribute__((noinline)) int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+          int main(int argc, char** argv) { struct node b = {argc, 0}, a = {2, &b}; return clampi(list_sum(&a), 1, 3); }
+          EOF
+          clang -O2 -arch arm64 -o a a.c
+          # the argument is a0, the global has its name, and nothing is left as raw asm or flags
+          $cli decompile a list_sum | tee list_sum.txt
+          $cli decompile a clampi | tee clampi.txt
+          grep -q '^int list_sum(int a0)' list_sum.txt
+          grep -q 'g_total' list_sum.txt
+          ! grep -E '__asm|flags|cond' list_sum.txt clampi.txt
+
       - name: package (the app in a dmg, the cli in a tarball)
         run: |
           version=$(sed -n 's/^#define CEASTA_VERSION "\(.*\)"/\1/p' src/version.h)

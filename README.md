@@ -61,7 +61,7 @@ unsigned checksum(const char* s)
 }
 ```
 
-the decompiler is best-effort (x86 / x64, no structs yet) — great for getting a routine quickly, while the listing stays the source of truth.
+the decompiler is best-effort (x86, x64 and arm64) — great for getting a routine quickly, while the listing stays the source of truth.
 
 ## download
 
@@ -83,9 +83,9 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 - readable names, stripped files too: c++ (gcc / clang and msvc) and rust names demangled, with the library's types spelled short (`std::map<std::string, int>::find(std::string const&)`, not `_ZNSt3mapINSt7__cxx11...`); objective-c methods from a mac program's metadata (`-[AppDelegate applicationDidFinishLaunching:]`, `objc_msgSend$alloc`); go functions from the go runtime's own table (`main.(*Cart).Add`)
 - ida-style listing: names instead of addresses, labels, xref and string comments, the arguments each instruction passes to a known api
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
-- decompiler (f5, x86 / x64): c-like pseudocode — if / else, loops, switch, stack variables, calls with their arguments (~350 known api prototypes). click a name: `n` renames it, `y` sets a type or a prototype. shift+f5 shows it next to the listing
+- decompiler (f5, x86 / x64 / arm64): c-like pseudocode — if / else, loops, switch, stack variables, calls with their arguments (~350 known api prototypes), globals by name. click a name: `n` renames it, `y` sets a type or a prototype. shift+f5 shows it next to the listing
 - structs: declare c types (shift+f1, or import a header — all of windows.h works) and a variable typed as a pointer to one reads `p->next`, `p->items[i].name`. right-click a variable: *make a struct from how it's used* — a field at every offset the code touches — then name the fields
-- a second decompiler if you want one: with [kuna](https://github.com/Noelo-Lab/kuna) installed (a decompiler ported from ghidra's), the pseudocode view gets a `kuna` switch — its output for the same function, lines linked to the listing, arm64 too. [more below](#second-decompiler-kuna)
+- a second decompiler if you want one: with [kuna](https://github.com/Noelo-Lab/kuna) installed (a decompiler ported from ghidra's), the pseudocode view gets a `kuna` switch — its output for the same function, lines linked to the listing. [more below](#second-decompiler-kuna)
 - file info: headers, security flags (aslr, dep, cfg / pie, nx, relro, canary / hardened runtime), md5 / sha256 / imphash, section entropy, resources, version info, a mac program's code signature and entitlements, and warnings when it looks packed
 - search everything (ctrl+f): functions, names, imports, exports, strings, comments and segments in one box, and the strings say where they're used
 - debugger (x86 / x64, windows and linux): start or attach, breakpoints (with conditions: `rdi == 3`), watchpoints on variables, step into / over / out, step back, run to cursor, pause, registers, stack, call stack, memory map, live memory
@@ -182,7 +182,7 @@ ceasta-cli mcp file.exe             serve the file to an AI over MCP
 
 - install kuna the way its readme says and put `kuna` on your PATH, or point ceasta at it: view > second decompiler (kuna)...
 - the pseudocode view then has a `ceasta | kuna` switch. kuna's output is read-only and uses its own names (`sub_401000`, `dat_404010`), but its lines are linked to the listing like ceasta's, and a click on `sub_...` jumps there
-- it reads arm64 too, where ceasta's own decompiler stops
+- it often reads heavily optimized code better, so it's a good second opinion
 - `ceasta-cli decompile file main --kuna` (or `--kuna-path /path/to/kuna`), and the AI gets a `decompile_with_kuna` tool
 
 ## connect an AI
@@ -260,7 +260,7 @@ xattr -dr com.apple.quarantine /Applications/ceasta.app
 
 the shortcuts use cmd where the others use ctrl (cmd+s, cmd+z, cmd+shift+p, ...). plugins you add go in `~/Library/Application Support/ceasta/plugins`.
 
-it reads mach-o files: programs, libraries, bundles and `.o` files, x86_64 and arm64 (arm64e too, apple's own). names show without the underscore mach-o puts in front (`main`, `printf`), like on the other systems. a universal file opens its x86_64 part (the decompiler reads it) and the arm64 part is one cmd+shift+p away ("part"), or `--arch arm64` on the command line. the file tab shows what a mac program says about itself: the minimum macos and sdk, the libraries and rpaths, the code signature (who signed it, hardened runtime, library validation) and its entitlements, with a warning for the ones that let code in (`get-task-allow`, `disable-library-validation`, dyld environment variables, jit). to read an app, open the program inside it: the open panel goes into `.app` bundles (Contents/MacOS/...).
+it reads mach-o files: programs, libraries, bundles and `.o` files, x86_64 and arm64 (arm64e too, apple's own). names show without the underscore mach-o puts in front (`main`, `printf`), like on the other systems. a universal file opens its x86_64 part, and the arm64 part is one cmd+shift+p away ("part"), or `--arch arm64` on the command line. the file tab shows what a mac program says about itself: the minimum macos and sdk, the libraries and rpaths, the code signature (who signed it, hardened runtime, library validation) and its entitlements, with a warning for the ones that let code in (`get-task-allow`, `disable-library-validation`, dyld environment variables, jit). to read an app, open the program inside it: the open panel goes into `.app` bundles (Contents/MacOS/...).
 
 ```
 ./ceasta-cli info /bin/ls                        universal, arm64e, signed by apple

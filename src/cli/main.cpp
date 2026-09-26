@@ -61,7 +61,7 @@ static void usage()
            "  --raw-arm64                   load the file as raw arm64 code\n"
            "  --base <hex>                  base address for raw files\n"
            "  --arch x64|arm64              which part of a universal (fat) mach-o file to open\n"
-           "                                (default: x64 when it has one, the decompiler reads it)\n"
+           "                                (default: x64 when it has one)\n"
            "  --kuna / --kuna-path <file>   decompile with kuna (github.com/Noelo-Lab/kuna) instead\n"
            "\"where\" is a hex address or any name (sub_401000, start, main, ...)\n",
         CEASTA_VERSION);

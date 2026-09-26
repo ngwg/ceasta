@@ -289,7 +289,8 @@ void add_read_tools(std::vector<tool>& t)
     add("decompile_function",
         "C-like pseudocode for the function at or containing an address or name. Stack variables are local_1c "
         "(0x1c below the return address) and arg_0, arg_4 (stack arguments); registers stand in for the other "
-        "values (rdi, rsi, ... are the arguments on system v; rcx, rdx, r8, r9 on windows). Calls to well-known "
+        "values (rdi, rsi, ... are the arguments on system v; rcx, rdx, r8, r9 on windows; on arm64 the arguments "
+        "are a0, a1, ... and x0 is the result). Calls to well-known "
         "functions (windows api, libc) get their real arguments. rename_variable, set_variable_type and "
         "set_function_prototype make it read better. Check the disassembly when something looks off.",
         schema({{"function", prop("string", "name or address of the function, or any address inside it")}},
@@ -311,7 +312,7 @@ void add_read_tools(std::vector<tool>& t)
 
     add("decompile_with_kuna",
         "The same function decompiled by kuna, a decompiler ported from Ghidra's that the user has installed. It is "
-        "often better than decompile_function on optimized code, and it also reads arm64. It names things itself "
+        "often better than decompile_function on optimized code. It names things itself "
         "(sub_401000, dat_404010, a0 for arguments), so renames and types set in ceasta don't show up here; its "
         "addresses are the same as ceasta's. Use it for a second opinion on a hard function.",
         schema({{"function", prop("string", "name or address of the function, or any address inside it")}},

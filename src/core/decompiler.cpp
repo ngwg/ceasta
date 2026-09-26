@@ -8,6 +8,7 @@
 #include <capstone/capstone.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,10 @@
 
 namespace {
 
+// the machine the function is for: x86 / x64, or arm64. the register helpers and the lifter
+// follow it (decompile sets it)
+thread_local bool g_arm = false;
+
 // ------------------------------------------------------------------ expressions
 
 struct expr;
@@ -33,6 +38,7 @@ struct expr {
     uint64_t num = 0;
     bool sgn = false;
     bool indirect = false; // call through a pointer: kids[0] is the target
+    bool fp = false;       // a floating point comparison: a nan makes it and its opposite false
     int width = 0;       // mem access width in bytes
     std::string text;    // sym/reg identifier, un/bin operator, call name
     uint64_t ref = 0;    // address a sym/call names, 0 = none
@@ -256,6 +262,7 @@ void note_self(const ep& v, int ptr)
 }
 
 // a frame slot's offset from its name: local_1c is -0x1c, arg_4 is 4 above the return address
+// (arm64: 4 above the stack pointer at the entry)
 bool slot_offset(const std::string& n, int64_t ptr, int64_t& off)
 {
     const char* p = nullptr;
@@ -265,7 +272,7 @@ bool slot_offset(const std::string& n, int64_t ptr, int64_t& off)
         sign = -1;
     } else if (n.compare(0, 4, "arg_") == 0) {
         p = n.c_str() + 4;
-        base = ptr;
+        base = g_arm ? 0 : ptr; // arm64: no return address on the stack
     } else {
         return false;
     }
@@ -556,6 +563,8 @@ bool typed_address(const ep& e, std::string& text)
 // logical negation, flipping comparisons instead of wrapping in !()
 ep negate(const ep& e)
 {
+    if (e && e->fp)
+        return e_un("!", e);
     if (e && e->kind == expr::k::bin) {
         static const std::map<std::string, std::string> flip = {
             {"==", "!="}, {"!=", "=="}, {"<", ">="}, {">=", "<"}, {">", "<="}, {"<=", ">"}};
@@ -582,6 +591,9 @@ std::string print(const ep& e, int parent_prec = 0)
         const ep& a = e->kids[0];
         if (g_uses)
             note_use(a, e->width);
+        // "u": a byte or two read zero extended (arm64's ldrb / ldrh)
+        bool zext = e->text == "u" && e->width < 4;
+        std::string ty = zext ? std::string("unsigned ") + mem_type(e->width) : std::string(mem_type(e->width));
         if (g_types) {
             std::string text, type;
             if (typed_read(a, e->width, text, type))
@@ -589,11 +601,13 @@ std::string print(const ep& e, int parent_prec = 0)
             // through a typed pointer, but not a whole member: *(char*)&p->flags, or counted in bytes
             std::string at;
             if (a->kind != expr::k::un && typed_address(a, at) && at.compare(0, 2, "&*") != 0)
-                return std::string("*(") + mem_type(e->width) + "*)" + (at[0] == '(' ? "(" + at + ")" : at);
+                return "*(" + ty + "*)" + (at[0] == '(' ? "(" + at + ")" : at);
         }
-        if (a->kind == expr::k::un && a->text == "&")
-            return print(a->kids[0], 100); // *(&sym) -> sym
-        return std::string("*(") + mem_type(e->width) + "*)" + print(a, 100);
+        if (a->kind == expr::k::un && a->text == "&" && a->kids[0]->kind == expr::k::num) // no name there
+            return "*(" + ty + "*)" + print(a->kids[0], 100);
+        if (a->kind == expr::k::un && a->text == "&") // *(&sym) -> sym
+            return zext ? "(" + ty + ")" + print(a->kids[0], 100) : print(a->kids[0], 100);
+        return "*(" + ty + "*)" + print(a, 100);
     }
     case expr::k::un:
         if (g_types && e->text == "&" && e->kids[0]->kind == expr::k::sym) {
@@ -603,6 +617,8 @@ std::string print(const ep& e, int parent_prec = 0)
             if (f && g_types->lib->member_at(*f->def, (uint64_t)rel, 0, path, type))
                 return "&" + f->key + "." + path;
         }
+        if (e->text == "&" && e->kids[0]->kind == expr::k::num) // an address without a name
+            return print(e->kids[0], parent_prec);
         return e->text + print(e->kids[0], 90);
     case expr::k::bin: {
         if (g_types && (e->text == "+" || e->text == "-")) {
@@ -664,6 +680,8 @@ bool has_mem(const ep& e)
         return false;
     if (e->kind == expr::k::mem)
         return true;
+    if (e->kind == expr::k::call && (e->text.compare(0, 8, "__readfs") == 0 || e->text.compare(0, 8, "__readgs") == 0))
+        return true; // thread data
     for (const ep& k : e->kids)
         if (has_mem(k))
             return true;
@@ -732,6 +750,20 @@ std::string reg_family(const char* raw)
     std::string n = raw;
     for (char& c : n)
         c = (char)std::tolower((unsigned char)c);
+    if (g_arm) {
+        // x0 - x30 and their w halves (fp and lr are x29 and x30), and sp. the zero register
+        // is a number, not a variable
+        if (n == "fp")
+            return "x29";
+        if (n == "lr")
+            return "x30";
+        if (n == "sp" || n == "wsp")
+            return "sp";
+        if ((n.size() == 2 || n.size() == 3) && (n[0] == 'x' || n[0] == 'w') && std::isdigit((unsigned char)n[1]) &&
+            (n.size() == 2 || std::isdigit((unsigned char)n[2])) && std::atoi(n.c_str() + 1) <= 30)
+            return "x" + n.substr(1);
+        return "";
+    }
     struct row {
         const char* fam;
         const char* names[6];
@@ -764,7 +796,7 @@ std::string reg_family(const char* raw)
 
 std::string reg_display(const std::string& fam, bool is64)
 {
-    if (is64 || fam.empty())
+    if (g_arm || is64 || fam.empty())
         return fam;
     static const std::map<std::string, std::string> m = {
         {"rax", "eax"}, {"rbx", "ebx"}, {"rcx", "ecx"}, {"rdx", "edx"},
@@ -775,6 +807,13 @@ std::string reg_display(const std::string& fam, bool is64)
 
 int reg_bit(const std::string& fam)
 {
+    if (g_arm) { // x0 - x30, sp 31
+        if (fam == "sp")
+            return 31;
+        if (fam.size() >= 2 && fam[0] == 'x' && std::isdigit((unsigned char)fam[1]))
+            return std::atoi(fam.c_str() + 1) <= 30 ? std::atoi(fam.c_str() + 1) : -1;
+        return -1;
+    }
     static const std::map<std::string, int> m = {
         {"rax", 0}, {"rcx", 1}, {"rdx", 2}, {"rbx", 3}, {"rsp", 4}, {"rbp", 5},
         {"rsi", 6}, {"rdi", 7}, {"r8", 8}, {"r9", 9}, {"r10", 10}, {"r11", 11},
@@ -787,6 +826,9 @@ const char* arg_reg_at(int index, bool is64, bin_format fmt)
 {
     static const char* win64[] = {"rcx", "rdx", "r8", "r9"};
     static const char* sysv[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    static const char* aapcs[] = {"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"};
+    if (g_arm)
+        return index >= 0 && index < 8 ? aapcs[index] : nullptr;
     if (!is64)
         return nullptr;
     if (fmt == bin_format::pe)
@@ -799,6 +841,11 @@ const char* fam_name(int b)
 {
     static const char* names[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                                     "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+    static const char* arm[32] = {"x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",  "x8",  "x9",  "x10",
+                                  "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21",
+                                  "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30", "sp"};
+    if (g_arm)
+        return b >= 0 && b < 32 ? arm[b] : "";
     return b >= 0 && b < 16 ? names[b] : "";
 }
 
@@ -870,12 +917,21 @@ struct block_ir {
 struct flag_state {
     bool valid = false, is_cmp = false, is_test = false;
     ep a, b, res;
+    // arm64 ccmp: the flags are pre ? these : the constant nzcv
+    ep pre;
+    uint8_t nzcv = 0;
+    bool fp = false;  // arm64 fcmp: a and b are floating point registers
+    bool sum = false; // arm64 adds: res is a + b (the carry: it wrapped around)
+    bool wide = false; // arm64: of x registers (unsigned is unsigned long long)
 };
 
 // what one instruction reads and writes: register families as reg_bit masks, and
 // whether it tests or changes the status flags
 struct insn_rw {
     uint32_t rd = 0, wr = 0;
+    uint32_t rd_known = 0; // arm64: reads of an address known on every way in (not in rd)
+    uint32_t vwr = 0;      // arm64: vector registers written (by number)
+    int vzero = -1;        // arm64: the vector register it sets to zero
     bool flags_rd = false, flags_wr = false;
     bool call = false, ret = false;
     bool tail = false;   // a jump out of the function (a tail call)
@@ -883,11 +939,232 @@ struct insn_rw {
     int proto_args = -1; // a call whose prototype says how many arguments it takes
 };
 
+// ------------------------------------------------------------------ arm64 instructions
+
+// the zero register reads as 0 and writes nowhere
+bool arm_zr(csh cs, unsigned r)
+{
+    const char* n = cs_reg_name(cs, r);
+    return n && (!strcmp(n, "xzr") || !strcmp(n, "wzr"));
+}
+
+// bytes in a register: w 4, x (and sp, fp, lr) 8, the vector views b h s d q
+int arm_reg_size(csh cs, unsigned r)
+{
+    const char* n = cs_reg_name(cs, r);
+    if (!n)
+        return 8;
+    switch (n[0]) {
+    case 'w': return 4;
+    case 'b': return 1;
+    case 'h': return 2;
+    case 's': return strcmp(n, "sp") ? 4 : 8;
+    case 'q':
+    case 'v':
+    case 'z': return 16;
+    default: return 8;
+    }
+}
+
+bool arm_is_load(unsigned id)
+{
+    switch (id) {
+    case ARM64_INS_LDR: case ARM64_INS_LDUR: case ARM64_INS_LDRB: case ARM64_INS_LDURB: case ARM64_INS_LDRH:
+    case ARM64_INS_LDURH: case ARM64_INS_LDRSB: case ARM64_INS_LDURSB: case ARM64_INS_LDRSH: case ARM64_INS_LDURSH:
+    case ARM64_INS_LDRSW: case ARM64_INS_LDURSW: case ARM64_INS_LDAR: case ARM64_INS_LDARB: case ARM64_INS_LDARH:
+    case ARM64_INS_LDAPR: case ARM64_INS_LDAPRB: case ARM64_INS_LDAPRH: case ARM64_INS_LDAXR: case ARM64_INS_LDXR:
+    case ARM64_INS_LDAXRB: case ARM64_INS_LDXRB: case ARM64_INS_LDAXRH: case ARM64_INS_LDXRH:
+    case ARM64_INS_LDP: case ARM64_INS_LDPSW: case ARM64_INS_LDNP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool arm_is_store(unsigned id)
+{
+    switch (id) {
+    case ARM64_INS_STR: case ARM64_INS_STUR: case ARM64_INS_STRB: case ARM64_INS_STURB: case ARM64_INS_STRH:
+    case ARM64_INS_STURH: case ARM64_INS_STLR: case ARM64_INS_STLRB: case ARM64_INS_STLRH: case ARM64_INS_STP:
+    case ARM64_INS_STNP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// bytes one register of a load / store moves
+int arm_mem_width(csh cs, cs_insn* in)
+{
+    switch (in->id) {
+    case ARM64_INS_LDRB: case ARM64_INS_LDURB: case ARM64_INS_LDRSB: case ARM64_INS_LDURSB: case ARM64_INS_STRB:
+    case ARM64_INS_STURB: case ARM64_INS_LDARB: case ARM64_INS_STLRB: case ARM64_INS_LDAPRB: case ARM64_INS_LDAXRB:
+    case ARM64_INS_LDXRB:
+        return 1;
+    case ARM64_INS_LDRH: case ARM64_INS_LDURH: case ARM64_INS_LDRSH: case ARM64_INS_LDURSH: case ARM64_INS_STRH:
+    case ARM64_INS_STURH: case ARM64_INS_LDARH: case ARM64_INS_STLRH: case ARM64_INS_LDAPRH: case ARM64_INS_LDAXRH:
+    case ARM64_INS_LDXRH:
+        return 2;
+    case ARM64_INS_LDRSW: case ARM64_INS_LDURSW: case ARM64_INS_LDPSW:
+        return 4;
+    default: {
+        const cs_arm64& x = in->detail->arm64;
+        return x.op_count >= 1 && x.operands[0].type == ARM64_OP_REG ? arm_reg_size(cs, x.operands[0].reg) : 8;
+    }
+    }
+}
+
+// ldrb / ldrh: the byte or two zero extended
+bool arm_zext_load(unsigned id)
+{
+    switch (id) {
+    case ARM64_INS_LDRB: case ARM64_INS_LDURB: case ARM64_INS_LDARB: case ARM64_INS_LDAPRB: case ARM64_INS_LDAXRB:
+    case ARM64_INS_LDXRB: case ARM64_INS_LDRH: case ARM64_INS_LDURH: case ARM64_INS_LDARH: case ARM64_INS_LDAPRH:
+    case ARM64_INS_LDAXRH: case ARM64_INS_LDXRH:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool arm_is_call(unsigned id)
+{
+    return id == ARM64_INS_BL || id == ARM64_INS_BLR || id == ARM64_INS_BLRAA || id == ARM64_INS_BLRAAZ ||
+           id == ARM64_INS_BLRAB || id == ARM64_INS_BLRABZ;
+}
+
+bool arm_is_ret(unsigned id) { return id == ARM64_INS_RET || id == ARM64_INS_RETAA || id == ARM64_INS_RETAB; }
+
+bool arm_is_br(unsigned id)
+{
+    return id == ARM64_INS_BR || id == ARM64_INS_BRAA || id == ARM64_INS_BRAAZ || id == ARM64_INS_BRAB ||
+           id == ARM64_INS_BRABZ;
+}
+
+// b.cond (not b, which capstone gives the same id)
+bool arm_conditional(const cs_arm64& x)
+{
+    return x.cc != ARM64_CC_INVALID && x.cc != ARM64_CC_AL && x.cc != ARM64_CC_NV;
+}
+
+// floating point and vector instructions (an operand in one of those registers): the lifter
+// shows them as they are
+bool arm_vector(csh cs, cs_insn* in)
+{
+    const cs_arm64& x = in->detail->arm64;
+    for (uint8_t i = 0; i < x.op_count; i++) {
+        if (x.operands[i].type != ARM64_OP_REG)
+            continue;
+        const char* n = cs_reg_name(cs, x.operands[i].reg);
+        if (n && n[0] != 'x' && n[0] != 'w' && strcmp(n, "sp") && strcmp(n, "fp") && strcmp(n, "lr"))
+            return true;
+    }
+    return false;
+}
+
+// the number of a floating point / vector register (b0 h0 s0 d0 q0 v0 are one), else -1
+int arm_vreg(const char* n)
+{
+    if (!n || !n[0] || !strchr("bhsdqvz", n[0]) || !isdigit((unsigned char)n[1]))
+        return -1;
+    return atoi(n + 1);
+}
+
+// the vector registers an instruction writes, and the one it sets to zero (movi v0.2d, #0;
+// fmov d0, xzr; dup v0.4s, wzr), -1 when none
+void arm_vec_effect(csh cs, cs_insn* in, uint32_t& wr, int& zero)
+{
+    wr = 0;
+    zero = -1;
+    const cs_arm64& x = in->detail->arm64;
+    const char* mn = in->mnemonic;
+    if (mn[0] == 's' && mn[1] == 't')
+        return; // a store
+    bool ld = mn[0] == 'l' && mn[1] == 'd'; // a load: every register before the address
+    for (uint8_t i = 0; i < x.op_count && x.operands[i].type != ARM64_OP_MEM; i++) {
+        int n = x.operands[i].type == ARM64_OP_REG ? arm_vreg(cs_reg_name(cs, x.operands[i].reg)) : -1;
+        if (n >= 0)
+            wr |= 1u << n;
+        if (!ld)
+            break;
+    }
+    if (!wr || (wr & (wr - 1)) || x.op_count != 2)
+        return;
+    const cs_arm64_op& s = x.operands[1];
+    if ((in->id == ARM64_INS_MOVI && s.type == ARM64_OP_IMM && s.imm == 0) ||
+        ((in->id == ARM64_INS_DUP || in->id == ARM64_INS_FMOV) && s.type == ARM64_OP_REG && arm_zr(cs, s.reg)))
+        for (zero = 0; !(wr & (1u << zero)); zero++)
+            ;
+}
+
+// instructions with nothing to show: hints, barriers, pointer authentication, prefetches
+bool arm_nothing(unsigned id)
+{
+    switch (id) {
+    case ARM64_INS_NOP: case ARM64_INS_HINT: case ARM64_INS_BTI: case ARM64_INS_DMB: case ARM64_INS_DSB:
+    case ARM64_INS_ISB: case ARM64_INS_PRFM: case ARM64_INS_YIELD: case ARM64_INS_CSDB: case ARM64_INS_CLREX:
+    case ARM64_INS_PACIASP: case ARM64_INS_PACIBSP: case ARM64_INS_AUTIASP: case ARM64_INS_AUTIBSP:
+    case ARM64_INS_PACIAZ: case ARM64_INS_PACIBZ: case ARM64_INS_AUTIAZ: case ARM64_INS_AUTIBZ:
+    case ARM64_INS_XPACLRI:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// a + b with numbers worked out (adrp's page plus the low bits is an address)
+ep fold(const ep& e)
+{
+    if (!e || e->kind != expr::k::bin || e->kids[0]->kind != expr::k::num || e->kids[1]->kind != expr::k::num)
+        return e;
+    uint64_t a = e->kids[0]->num, b = e->kids[1]->num;
+    const std::string& o = e->text;
+    if (o == "+")
+        return e_num(a + b, true);
+    if (o == "-")
+        return e_num(a - b, true);
+    if (o == "*")
+        return e_num(a * b, true);
+    if (o == "&")
+        return e_num(a & b, true);
+    if (o == "|")
+        return e_num(a | b, true);
+    if (o == "^")
+        return e_num(a ^ b, true);
+    if (o == "<<" && b < 64)
+        return e_num(a << b, true);
+    return e;
+}
+
+// does condition cc hold for the flags nzcv (n in bit 3 .. v in bit 0)?
+bool nzcv_holds(uint8_t f, int cc)
+{
+    bool n = f & 8, z = f & 4, c = f & 2, v = f & 1;
+    switch (cc) {
+    case ARM64_CC_EQ: return z;
+    case ARM64_CC_NE: return !z;
+    case ARM64_CC_HS: return c;
+    case ARM64_CC_LO: return !c;
+    case ARM64_CC_MI: return n;
+    case ARM64_CC_PL: return !n;
+    case ARM64_CC_VS: return v;
+    case ARM64_CC_VC: return !v;
+    case ARM64_CC_HI: return c && !z;
+    case ARM64_CC_LS: return !c || z;
+    case ARM64_CC_GE: return n == v;
+    case ARM64_CC_LT: return n != v;
+    case ARM64_CC_GT: return !z && n == v;
+    case ARM64_CC_LE: return z || n != v;
+    default: return true;
+    }
+}
+
+
 // ------------------------------------------------------------------ lifter
 
 class lifter {
 public:
-    lifter(database& db, csh cs) : db_(db), cs_(cs), is64_(db.bin.is64()) {}
+    lifter(database& db, csh cs) : db_(db), cs_(cs), is64_(db.bin.is64()), arm_(db.bin.arch == bin_arch::arm64) {}
     bool run(uint64_t func_start, std::vector<block_ir>& out, std::vector<std::string>& params,
              bool& returns_value);
 
@@ -903,6 +1180,9 @@ private:
     database& db_;
     csh cs_;
     bool is64_;
+    bool arm_;
+    // the stack pointer, the frame pointer and the register a result comes back in
+    std::string sp_ = arm_ ? "sp" : "rsp", fp_ = arm_ ? "x29" : "rbp", ret_ = arm_ ? "x0" : "rax";
     std::set<std::string> params_;
 
     // what a call to a function of this binary does with registers
@@ -940,11 +1220,27 @@ private:
     ep mem_address(const x86_op_mem& m, std::unordered_map<std::string, ep>& cur, uint64_t rip, int width = 0);
     ep operand_expr(cs_insn* in, const cs_x86_op& op, std::unordered_map<std::string, ep>& cur);
     ep build_cond(const flag_state& fs, unsigned cc_id, bool& ok);
+
+    // arm64
+    std::set<uint64_t> arm_skip_; // prologue saves, epilogue restores, the frame pointer's setup
+    void frame_pass_arm(const cfg& g, int entry);
+    void find_saves_arm(const cfg& g, int entry);
+    void access_arm(cs_insn* in, uint32_t& rd, uint32_t& wr, bool& flags_rd, bool& flags_wr);
+    bool slot_of_arm(const arm64_op_mem& m, int64_t& off) const;
+    ep mem_address_arm(const cs_arm64_op& op, std::unordered_map<std::string, ep>& cur, int width);
+    ep operand_arm(const cs_arm64_op& op, std::unordered_map<std::string, ep>& cur);
+    ep addr_value(uint64_t v);
+    ep place(uint64_t a);
+    ep inside_item(uint64_t a);
+    ep named_sum(const ep& e, bool access);
+    ep build_cond_arm(const flag_state& fs, int cc, bool& ok);
 };
 
 // registers a call may change: rax (the result) and the other scratch registers
 uint32_t lifter::scratch() const
 {
+    if (arm_)
+        return 0x7ffffu; // x0 - x18 (x0 the result; x16 - x18 the linker's and the platform's)
     uint32_t m = (1u << reg_bit("rax")) | (1u << reg_bit("rcx")) | (1u << reg_bit("rdx"));
     if (is64_) {
         for (const char* r : {"r8", "r9", "r10", "r11"})
@@ -960,6 +1256,13 @@ uint32_t lifter::access(cs_insn* in, uint32_t& wr)
 {
     uint32_t rd = 0;
     wr = 0;
+    if (arm_) {
+        bool frd = false, fwr = false;
+        access_arm(in, rd, wr, frd, fwr);
+        if (arm_is_call(in->id))
+            wr |= scratch();
+        return rd;
+    }
     cs_regs r, w;
     uint8_t nr = 0, nw = 0;
     if (cs_regs_access(cs_, in, r, &nr, w, &nw) == CS_ERR_OK) {
@@ -1044,8 +1347,9 @@ const lifter::callee_info& lifter::callee_of(uint64_t target)
             }
             uint32_t wr = 0, rd = access(in, wr); // a call in there changes all scratch
             const cs_x86& x = in->detail->x86;
-            if (in->id == X86_INS_JMP && !(x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) &&
-                !db_.an.tables.count(a))
+            if (arm_ ? arm_is_br(in->id) && !db_.an.tables.count(a)
+                     : in->id == X86_INS_JMP && !(x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) &&
+                           !db_.an.tables.count(a))
                 wr |= all; // an indirect jump could go anywhere
             use[bi] |= rd & ~def[bi];
             def[bi] |= wr;
@@ -1071,7 +1375,7 @@ const lifter::callee_info& lifter::callee_of(uint64_t target)
     }
     // variadic (system v): al holds the number of vector registers and every argument
     // register gets spilled, so the count says nothing
-    if (!is64_ || (db_.bin.format != bin_format::pe && (live[entry] & 1u)))
+    if (!is64_ || (!arm_ && db_.bin.format != bin_format::pe && (live[entry] & 1u)))
         return ci;
     // the last argument register it reads sets the count (an unused first one still exists)
     ci.arity = 0;
@@ -1123,13 +1427,24 @@ int lifter::result_used(uint64_t func)
                 continue;
             }
             uint32_t wr = 0, rd = access(in, wr);
+            if (arm_ && arm_is_call(in->id)) {
+                // arm64: x0 goes on to the next call as its first argument, unless it takes none
+                const cs_arm64& x = in->detail->arm64;
+                int ar = in->id == ARM64_INS_BL && x.op_count >= 1 && x.operands[0].type == ARM64_OP_IMM
+                             ? callee_of((uint64_t)x.operands[0].imm).arity : -1;
+                if (ar != 0)
+                    rd |= 1u;
+            }
             if (rd & 1u) {
                 used = true;
                 break;
             }
             if (wr & 1u)
                 break; // overwritten, or clobbered by the next call
-            if (cs_insn_group(cs_, in, X86_GRP_JUMP) || cs_insn_group(cs_, in, X86_GRP_RET)) {
+            bool leaves = arm_ ? in->id == ARM64_INS_B || in->id == ARM64_INS_CBZ || in->id == ARM64_INS_CBNZ ||
+                                     in->id == ARM64_INS_TBZ || in->id == ARM64_INS_TBNZ || arm_is_br(in->id) || arm_is_ret(in->id)
+                               : cs_insn_group(cs_, in, X86_GRP_JUMP) || cs_insn_group(cs_, in, X86_GRP_RET);
+            if (leaves) {
                 used = true; // it leaves the block: assume it's used
                 break;
             }
@@ -1170,7 +1485,7 @@ bool lifter::slot_of(const x86_op_mem& m, int64_t& off) const
 // local_1c for a slot 0x1c below the return address, arg_4 for one 4 above the first argument
 std::string lifter::frame_var(int64_t off, int width)
 {
-    int64_t ptr = is64_ ? 8 : 4;
+    int64_t ptr = arm_ ? 0 : is64_ ? 8 : 4; // arm64 keeps the return address in x30
     char buf[48];
     if (off < 0)
         std::snprintf(buf, sizeof(buf), "local_%llx", (unsigned long long)(-off));
@@ -1196,6 +1511,17 @@ std::string lifter::callee_text(uint64_t t)
 
 const prototype* lifter::call_proto(cs_insn* in, std::string* name, uint64_t* ref)
 {
+    if (arm_) { // bl f; blr / br through a register are named from what the register holds
+        const cs_arm64& a = in->detail->arm64;
+        if ((in->id != ARM64_INS_BL && in->id != ARM64_INS_B) || a.op_count < 1 || a.operands[0].type != ARM64_OP_IMM)
+            return nullptr;
+        uint64_t t = (uint64_t)a.operands[0].imm;
+        if (ref)
+            *ref = t;
+        if (name)
+            *name = callee_text(t);
+        return db_.callee_proto(t);
+    }
     const cs_x86& x = in->detail->x86;
     if (x.op_count < 1)
         return nullptr;
@@ -1240,7 +1566,7 @@ const prototype* lifter::call_proto(cs_insn* in, std::string* name, uint64_t* re
 // what a 32-bit callee takes off the stack itself (stdcall: ret n)
 int lifter::callee_pops(cs_insn* call)
 {
-    if (is64_)
+    if (is64_ || arm_)
         return 0;
     uint64_t ref = 0;
     const prototype* p = call_proto(call, nullptr, &ref);
@@ -1470,12 +1796,30 @@ ep lifter::sym_for(uint64_t a)
     return e_num(a);
 }
 
+// a place in memory at a known address: &name, &item + k inside a string or data item with a
+// name (a merged string's tail), else &number
+ep lifter::place(uint64_t a)
+{
+    if (!db_.name_at(a).empty())
+        return e_un("&", sym_for(a));
+    ep in = inside_item(a);
+    return in ? in : e_un("&", e_num(a, true));
+}
+
+ep lifter::inside_item(uint64_t a)
+{
+    if (!db_.bin.is_mapped(a))
+        return nullptr;
+    uint64_t h = db_.an.item_head(a);
+    if (h >= a || !(db_.an.flags_at(h) & (fl_str | fl_data)) || db_.name_at(h).empty())
+        return nullptr;
+    return e_bin("+", e_un("&", sym_for(h)), e_num(a - h));
+}
+
 ep lifter::mem_address(const x86_op_mem& m, std::unordered_map<std::string, ep>& cur, uint64_t rip, int width)
 {
-    if (m.base == X86_REG_RIP) {
-        uint64_t ea = rip + (uint64_t)m.disp;
-        return e_un("&", sym_for(ea));
-    }
+    if (m.base == X86_REG_RIP)
+        return place(rip + (uint64_t)m.disp);
     int64_t off = 0;
     if (slot_of(m, off)) { // a variable in the stack frame
         std::string nm = frame_var(off, width);
@@ -1495,7 +1839,7 @@ ep lifter::mem_address(const x86_op_mem& m, std::unordered_map<std::string, ep>&
         e = e ? e_bin("+", e, idx) : idx;
     }
     if (!e)
-        return e_un("&", sym_for((uint64_t)m.disp));
+        return place((uint64_t)m.disp);
     if (m.disp > 0)
         e = e_bin("+", e, e_num((uint64_t)m.disp));
     else if (m.disp < 0)
@@ -1514,13 +1858,20 @@ ep lifter::operand_expr(cs_insn* in, const cs_x86_op& op, std::unordered_map<std
         uint64_t v = (uint64_t)op.imm;
         if (!is64_)
             v &= 0xffffffffull;
-        if (v >= 0x10000 && db_.bin.is_mapped(v) && (db_.an.flags_at(v) & (fl_str | fl_data | fl_label | fl_func)) &&
-            !db_.name_at(v).empty())
-            return e_un("&", sym_for(v));
-        return e_num((uint64_t)op.imm, true);
+        ep a = addr_value(v);
+        return a->kind == expr::k::num ? e_num((uint64_t)op.imm, true) : a;
     }
     if (op.type == X86_OP_MEM) {
         uint64_t rip = in->address + in->size;
+        if (op.mem.segment == X86_REG_FS || op.mem.segment == X86_REG_GS) {
+            // thread data: fs:[0x28] is the stack canary on linux, gs:[0x60] the peb on windows
+            x86_op_mem m = op.mem;
+            m.segment = X86_REG_INVALID;
+            ep at = m.base == X86_REG_INVALID && m.index == X86_REG_INVALID ? e_num((uint64_t)m.disp, true)
+                                                                         : mem_address(m, cur, rip, op.size);
+            const char* sz = op.size == 1 ? "byte" : op.size == 2 ? "word" : op.size == 4 ? "dword" : "qword";
+            return e_intr(std::string(op.mem.segment == X86_REG_FS ? "__readfs" : "__readgs") + sz, {at});
+        }
         return e_mem(mem_address(op.mem, cur, rip, op.size), op.size);
     }
     return e_sym("?");
@@ -1557,6 +1908,545 @@ ep lifter::build_cond(const flag_state& fs, unsigned cc_id, bool& ok)
     case X86_INS_JBE: return uns("<=");
     case X86_INS_JS: return fs.res ? e_bin("<", fs.res, e_num(0)) : cmp("<");
     case X86_INS_JNS: return fs.res ? e_bin(">=", fs.res, e_num(0)) : cmp(">=");
+    default:
+        ok = false;
+        return e_sym("cond");
+    }
+}
+
+// ------------------------------------------------------------------ arm64 lifting
+
+// registers read and written as reg_bit masks (x30, the link register, is left out: calls and
+// returns use it, the code doesn't), and whether the flags are tested / set. capstone's own
+// lists are off for aliases (cmp writes nothing, cbz doesn't test the flags)
+void lifter::access_arm(cs_insn* in, uint32_t& rd, uint32_t& wr, bool& flags_rd, bool& flags_wr)
+{
+    rd = wr = 0;
+    flags_rd = flags_wr = false;
+    const cs_arm64& x = in->detail->arm64;
+    unsigned id = in->id;
+    auto bit = [&](unsigned r) -> uint32_t {
+        int b = reg_bit(reg_family(cs_reg_name(cs_, r)));
+        return b >= 0 && b != 30 ? 1u << b : 0u;
+    };
+    int mi = -1;
+    for (int k = 0; k < x.op_count; k++)
+        if (x.operands[k].type == ARM64_OP_MEM) {
+            mi = k;
+            if (x.operands[k].mem.base != ARM64_REG_INVALID)
+                rd |= bit(x.operands[k].mem.base);
+            if (x.operands[k].mem.index != ARM64_REG_INVALID)
+                rd |= bit(x.operands[k].mem.index);
+        }
+    auto regs = [&](int from, int to) {
+        uint32_t m = 0;
+        for (int k = from; k < to && k < x.op_count; k++)
+            if (x.operands[k].type == ARM64_OP_REG)
+                m |= bit(x.operands[k].reg);
+        return m;
+    };
+    switch (id) {
+    case ARM64_INS_CMP:
+    case ARM64_INS_CMN:
+    case ARM64_INS_TST:
+        rd |= regs(0, x.op_count);
+        flags_wr = true;
+        break;
+    case ARM64_INS_CCMP:
+    case ARM64_INS_CCMN:
+        rd |= regs(0, x.op_count);
+        flags_rd = flags_wr = true;
+        break;
+    case ARM64_INS_B:
+        flags_rd = arm_conditional(x);
+        break;
+    case ARM64_INS_CBZ:
+    case ARM64_INS_CBNZ:
+    case ARM64_INS_TBZ:
+    case ARM64_INS_TBNZ:
+        rd |= regs(0, 1);
+        break;
+    case ARM64_INS_SVC: // a system call: the number in x8 (x16 on apple), arguments from x0, result in x0
+        rd |= 0x3fu | (1u << (db_.bin.format == bin_format::macho ? 16 : 8));
+        wr |= 1u;
+        break;
+    default:
+        if (arm_is_call(id) || arm_is_br(id) || arm_is_ret(id)) {
+            rd |= regs(0, 1);
+        } else if (arm_is_store(id)) {
+            rd |= regs(0, mi < 0 ? x.op_count : mi);
+        } else if (arm_is_load(id)) {
+            wr |= regs(0, mi < 0 ? x.op_count : mi);
+        } else if (x.op_count >= 1 && x.operands[0].type == ARM64_OP_REG) {
+            wr |= bit(x.operands[0].reg);
+            rd |= regs(1, x.op_count);
+            if (id == ARM64_INS_MOVK || id == ARM64_INS_BFI || id == ARM64_INS_BFXIL || id == ARM64_INS_BFM)
+                rd |= bit(x.operands[0].reg); // they keep the rest of it
+        }
+        switch (id) {
+        case ARM64_INS_CSEL: case ARM64_INS_CSET: case ARM64_INS_CSETM: case ARM64_INS_CSINC: case ARM64_INS_CSINV:
+        case ARM64_INS_CSNEG: case ARM64_INS_CINC: case ARM64_INS_CINV: case ARM64_INS_CNEG: case ARM64_INS_ADC:
+        case ARM64_INS_ADCS: case ARM64_INS_SBC: case ARM64_INS_SBCS: case ARM64_INS_NGC: case ARM64_INS_NGCS:
+            flags_rd = true;
+            break;
+        default:
+            break;
+        }
+        flags_wr = x.update_flags;
+        break;
+    }
+    if (mi >= 0 && x.writeback && x.operands[mi].mem.base != ARM64_REG_INVALID)
+        wr |= bit(x.operands[mi].mem.base);
+}
+
+// where sp is before each instruction, from the entry, and whether x29 is a frame pointer
+// (mov x29, sp / add x29, sp, #16 after the prologue's stp x29, x30, [sp, #-32]!)
+void lifter::frame_pass_arm(const cfg& g, int entry)
+{
+    const int64_t unknown = INT64_MIN;
+    size_t nb = g.blocks.size();
+    sp_at_.clear();
+    rbp_frame_ = false;
+    bool fp_bad = false;
+    std::vector<int64_t> in(nb, unknown);
+    std::vector<char> seen(nb, 0);
+    std::vector<int> work;
+    if (entry < 0 || (size_t)entry >= nb)
+        return;
+    in[(size_t)entry] = 0;
+    seen[(size_t)entry] = 1;
+    work.push_back(entry);
+    cs_insn* insn = cs_malloc(cs_);
+    if (!insn)
+        return;
+    auto fam_of = [&](const cs_arm64_op& op) {
+        return op.type == ARM64_OP_REG ? reg_family(cs_reg_name(cs_, op.reg)) : std::string();
+    };
+    int guard = 0;
+    while (!work.empty() && guard++ < 200000) {
+        int b = work.back();
+        work.pop_back();
+        int64_t sp = in[(size_t)b];
+        for (uint64_t a : g.blocks[(size_t)b].insns) {
+            if (sp != unknown)
+                sp_at_[a] = sp;
+            else
+                sp_at_.erase(a);
+            uint8_t code[4];
+            const uint8_t* p = code;
+            size_t left = db_.bin.read(a, code, sizeof(code));
+            uint64_t addr = a;
+            if (!cs_disasm_iter(cs_, &p, &left, &addr, insn)) {
+                sp = unknown;
+                continue;
+            }
+            const cs_arm64& x = insn->detail->arm64;
+            unsigned id = insn->id;
+            auto known = [&](int64_t v) { return sp == unknown ? unknown : v; };
+            std::string d0 = x.op_count >= 1 ? fam_of(x.operands[0]) : std::string();
+            std::string s1 = x.op_count >= 2 ? fam_of(x.operands[1]) : std::string();
+            bool imm2 = x.op_count >= 3 && x.operands[2].type == ARM64_OP_IMM;
+            int64_t k2 = imm2 ? x.operands[2].imm << (x.operands[2].shift.type == ARM64_SFT_LSL ? x.operands[2].shift.value : 0) : 0;
+            // a load / store that moves its base register: [sp, #-32]! and [sp], #32
+            for (int k = 0; k < x.op_count; k++) {
+                const cs_arm64_op& op = x.operands[k];
+                if (op.type != ARM64_OP_MEM || !x.writeback || reg_family(cs_reg_name(cs_, op.mem.base)) != "sp")
+                    continue;
+                if (x.post_index)
+                    sp = k + 1 < x.op_count && x.operands[k + 1].type == ARM64_OP_IMM ? known(sp + x.operands[k + 1].imm) : unknown;
+                else
+                    sp = known(sp + op.mem.disp);
+            }
+            bool writes0 = x.op_count >= 1 && x.operands[0].type == ARM64_OP_REG && id != ARM64_INS_CMP &&
+                           id != ARM64_INS_CMN && id != ARM64_INS_TST && id != ARM64_INS_CCMP && id != ARM64_INS_CCMN &&
+                           !arm_is_store(id) && !arm_is_call(id) && !arm_is_br(id) && id != ARM64_INS_CBZ &&
+                           id != ARM64_INS_CBNZ && id != ARM64_INS_TBZ && id != ARM64_INS_TBNZ;
+            if (!writes0)
+                continue;
+            bool add = id == ARM64_INS_ADD, sub = id == ARM64_INS_SUB;
+            if (d0 == "sp") {
+                if ((add || sub) && s1 == "sp" && imm2)
+                    sp = known(sp + (add ? k2 : -k2));
+                else if ((add || sub) && s1 == "x29" && imm2 && rbp_frame_)
+                    sp = rbp_off_ + (add ? k2 : -k2);
+                else if (id == ARM64_INS_MOV && s1 == "x29" && rbp_frame_)
+                    sp = rbp_off_;
+                else
+                    sp = unknown;
+            } else if (d0 == "x29" || (arm_is_load(id) && x.op_count >= 2 && fam_of(x.operands[1]) == "x29")) {
+                // mov x29, sp / add x29, sp, #k sets up the frame pointer; a load into it is the
+                // epilogue putting the caller's back
+                if (id == ARM64_INS_MOV && s1 == "sp" && sp != unknown) {
+                    if (rbp_frame_ && rbp_off_ != sp)
+                        fp_bad = true;
+                    rbp_frame_ = true;
+                    rbp_off_ = sp;
+                } else if (add && s1 == "sp" && imm2 && sp != unknown) {
+                    if (rbp_frame_ && rbp_off_ != sp + k2)
+                        fp_bad = true;
+                    rbp_frame_ = true;
+                    rbp_off_ = sp + k2;
+                } else if (!arm_is_load(id)) {
+                    fp_bad = true;
+                }
+            }
+        }
+        for (const cfg_edge& e : g.blocks[(size_t)b].succ) {
+            size_t t = e.to;
+            if (!seen[t]) {
+                seen[t] = 1;
+                in[t] = sp;
+                work.push_back((int)t);
+            } else if (in[t] != sp && in[t] != unknown) {
+                in[t] = unknown;
+                work.push_back((int)t);
+            }
+        }
+    }
+    cs_free(insn, 1);
+    if (fp_bad)
+        rbp_frame_ = false;
+}
+
+bool lifter::slot_of_arm(const arm64_op_mem& m, int64_t& off) const
+{
+    if (m.index != ARM64_REG_INVALID || m.base == ARM64_REG_INVALID)
+        return false;
+    std::string fam = reg_family(cs_reg_name(cs_, m.base));
+    if (fam == "sp" && cur_sp_known_) {
+        off = cur_sp_ + m.disp;
+        return true;
+    }
+    if (fam == "x29" && rbp_frame_) {
+        off = rbp_off_ + m.disp;
+        return true;
+    }
+    return false;
+}
+
+// the registers the prologue saves (stp x29, x30, [sp, #-32]!, str x19, [sp, #16]) and the
+// epilogue loads back, and the frame pointer's setup: bookkeeping, not statements. a save is a
+// store of a callee-saved register nothing has changed yet on any way there (the prologue can
+// be in a branch: shrink wrapping); the link register's store always is one
+void lifter::find_saves_arm(const cfg& g, int entry)
+{
+    arm_skip_.clear();
+    size_t nb = g.blocks.size();
+    if (entry < 0 || (size_t)entry >= nb)
+        return;
+    cs_insn* insn = cs_malloc(cs_);
+    if (!insn)
+        return;
+    auto decode = [&](uint64_t a) {
+        uint8_t code[4];
+        const uint8_t* p = code;
+        size_t left = db_.bin.read(a, code, sizeof(code));
+        uint64_t addr = a;
+        return cs_disasm_iter(cs_, &p, &left, &addr, insn);
+    };
+    auto saved_reg = [&](unsigned r) {
+        std::string n = cs_reg_name(cs_, r);
+        if (n == "fp" || n == "lr")
+            return true;
+        int v = n.size() >= 2 && (n[0] == 'x' || n[0] == 'd') ? std::atoi(n.c_str() + 1) : -1;
+        return n[0] == 'x' ? v >= 19 && v <= 28 : v >= 8 && v <= 15; // d8 - d15 keep their low halves
+    };
+    auto set_sp = [&](uint64_t a) {
+        auto it = sp_at_.find(a);
+        cur_sp_known_ = it != sp_at_.end();
+        cur_sp_ = cur_sp_known_ ? it->second : 0;
+    };
+    // registers written in each block, and on some way into it
+    std::vector<uint32_t> gen(nb, 0), in(nb, 0);
+    for (size_t b = 0; b < nb; b++)
+        for (uint64_t a : g.blocks[b].insns)
+            if (decode(a)) {
+                uint32_t rd = 0, wr = 0;
+                bool frd = false, fwr = false;
+                access_arm(insn, rd, wr, frd, fwr);
+                if (arm_is_call(insn->id))
+                    wr |= scratch();
+                gen[b] |= wr;
+            }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t b = 0; b < nb; b++)
+            for (const cfg_edge& e : g.blocks[b].succ) {
+                uint32_t v = in[e.to] | in[b] | gen[b];
+                if (v != in[e.to]) {
+                    in[e.to] = v;
+                    changed = true;
+                }
+            }
+    }
+    std::map<int64_t, std::string> slots; // frame offset -> the register saved there
+    for (size_t b = 0; b < nb; b++) {
+        uint32_t written = in[b];
+        for (uint64_t a : g.blocks[b].insns) {
+            if (!decode(a))
+                break;
+            const cs_arm64& x = insn->detail->arm64;
+            set_sp(a);
+            if (insn->id == ARM64_INS_STP || insn->id == ARM64_INS_STR || insn->id == ARM64_INS_STUR) {
+                int mi = x.op_count - 1;
+                while (mi > 0 && x.operands[mi].type != ARM64_OP_MEM)
+                    mi--;
+                int64_t off = 0;
+                bool save = mi >= 1 && x.operands[mi].type == ARM64_OP_MEM && slot_of_arm(x.operands[mi].mem, off);
+                for (int k = 0; save && k < mi; k++) {
+                    int bit = x.operands[k].type == ARM64_OP_REG ? reg_bit(reg_family(cs_reg_name(cs_, x.operands[k].reg))) : -1;
+                    save = x.operands[k].type == ARM64_OP_REG && saved_reg(x.operands[k].reg) && !(bit >= 0 && (written & (1u << bit)));
+                }
+                if (save) {
+                    int size = arm_reg_size(cs_, x.operands[0].reg);
+                    for (int k = 0; k < mi; k++)
+                        slots[off + k * size] = cs_reg_name(cs_, x.operands[k].reg);
+                    arm_skip_.insert(a);
+                    continue;
+                }
+            }
+            // mov x29, sp / add x29, sp, #k: the frame pointer
+            if ((insn->id == ARM64_INS_MOV || insn->id == ARM64_INS_ADD) && x.op_count >= 2 &&
+                x.operands[0].type == ARM64_OP_REG && x.operands[1].type == ARM64_OP_REG &&
+                reg_family(cs_reg_name(cs_, x.operands[0].reg)) == "x29" && reg_family(cs_reg_name(cs_, x.operands[1].reg)) == "sp" &&
+                rbp_frame_) {
+                arm_skip_.insert(a);
+                continue;
+            }
+            uint32_t rd = 0, wr = 0;
+            bool frd = false, fwr = false;
+            access_arm(insn, rd, wr, frd, fwr);
+            if (arm_is_call(insn->id))
+                wr |= scratch();
+            written |= wr;
+        }
+    }
+    // the loads that put them back
+    if (!slots.empty())
+        for (const cfg_block& b : g.blocks)
+            for (uint64_t a : b.insns) {
+                if (!decode(a) || (insn->id != ARM64_INS_LDP && insn->id != ARM64_INS_LDR && insn->id != ARM64_INS_LDUR))
+                    continue;
+                const cs_arm64& x = insn->detail->arm64;
+                set_sp(a);
+                int mi = 1;
+                while (mi < x.op_count && x.operands[mi].type != ARM64_OP_MEM)
+                    mi++;
+                int64_t off = 0;
+                if (mi >= x.op_count || !slot_of_arm(x.operands[mi].mem, off))
+                    continue;
+                int size = arm_reg_size(cs_, x.operands[0].reg);
+                bool restore = true;
+                for (int k = 0; restore && k < mi; k++) {
+                    auto s = slots.find(off + k * size);
+                    restore = x.operands[k].type == ARM64_OP_REG && s != slots.end() && s->second == cs_reg_name(cs_, x.operands[k].reg);
+                }
+                if (restore)
+                    arm_skip_.insert(a);
+            }
+    cs_free(insn, 1);
+}
+
+// a number, or &name when it's the address of something with a name (a string, a global)
+ep lifter::addr_value(uint64_t v)
+{
+    if (v >= 0x10000 && db_.bin.is_mapped(v) && (db_.an.flags_at(v) & (fl_str | fl_data | fl_label | fl_func)) &&
+        !db_.name_at(v).empty())
+        return e_un("&", sym_for(v));
+    ep in = v >= 0x10000 ? inside_item(v) : nullptr;
+    uint8_t c = 1;
+    if (in && (db_.an.flags_at(db_.an.item_head(v)) & fl_str) && db_.bin.read(v, &c, 1) == 1 && !c)
+        return e_sym("\"\""); // a string's end: the empty string
+    return in ? in : e_num(v, true);
+}
+
+// a sum worked out: a number that is an address with a name reads as &name, and &item + k as
+// what's at that address when it has a name of its own (else as &item + k, in one sum).
+// access: a place read or written (any name there will do)
+ep lifter::named_sum(const ep& e, bool access)
+{
+    ep f = fold(e), base = f;
+    uint64_t k = 0;
+    while (base->kind == expr::k::bin && (base->text == "+" || base->text == "-") && base->kids[1]->kind == expr::k::num) {
+        k = base->text == "+" ? k + base->kids[1]->num : k - base->kids[1]->num;
+        base = base->kids[0];
+    }
+    bool item = base->kind == expr::k::un && base->text == "&" && base->kids[0]->kind == expr::k::sym && base->kids[0]->ref;
+    if (base->kind != expr::k::num && !item)
+        return f;
+    uint64_t v = (item ? base->kids[0]->ref : base->num) + k;
+    ep n = access ? place(v) : addr_value(v);
+    if (n->kind != expr::k::num && !(n->kind == expr::k::un && n->kids[0]->kind == expr::k::num))
+        return n;
+    if (!item)
+        return access ? e_un("&", e_num(v, true)) : e_num(v, true);
+    if (!k)
+        return base;
+    return (int64_t)k < 0 ? e_bin("-", base, e_num(0 - k)) : e_bin("+", base, e_num(k));
+}
+
+ep lifter::mem_address_arm(const cs_arm64_op& op, std::unordered_map<std::string, ep>& cur, int width)
+{
+    const arm64_op_mem& m = op.mem;
+    int64_t off = 0;
+    if (slot_of_arm(m, off)) { // a variable in the stack frame
+        std::string nm = frame_var(off, width);
+        if (!nm.empty())
+            return e_un("&", e_sym(nm));
+    }
+    ep e;
+    if (m.base != ARM64_REG_INVALID) {
+        std::string fam = reg_family(cs_reg_name(cs_, m.base));
+        e = fam.empty() ? e_reg(cs_reg_name(cs_, m.base)) : reg_read(cur, fam);
+    }
+    if (m.index != ARM64_REG_INVALID) {
+        std::string fam = reg_family(cs_reg_name(cs_, m.index));
+        ep idx = arm_zr(cs_, m.index) ? e_num(0) : fam.empty() ? e_reg(cs_reg_name(cs_, m.index)) : reg_read(cur, fam);
+        if (op.ext == ARM64_EXT_SXTW)
+            idx = e_un("(int)", idx);
+        else if (op.ext == ARM64_EXT_UXTW)
+            idx = e_un("(unsigned int)", idx);
+        if (op.shift.type == ARM64_SFT_LSL && op.shift.value)
+            idx = e_bin("*", idx, e_num(1ull << op.shift.value));
+        e = e ? e_bin("+", e, idx) : idx;
+    }
+    if (!e)
+        e = e_num(0);
+    if (m.disp > 0)
+        e = e_bin("+", e, e_num((uint64_t)m.disp));
+    else if (m.disp < 0)
+        e = e_bin("-", e, e_num((uint64_t)(-(int64_t)m.disp)));
+    return named_sum(e, true); // a global: adrp's page plus the offset
+}
+
+ep lifter::operand_arm(const cs_arm64_op& op, std::unordered_map<std::string, ep>& cur)
+{
+    ep v;
+    if (op.type == ARM64_OP_REG) {
+        if (arm_zr(cs_, op.reg))
+            return e_num(0);
+        std::string fam = reg_family(cs_reg_name(cs_, op.reg));
+        v = fam.empty() ? e_reg(cs_reg_name(cs_, op.reg)) : reg_read(cur, fam);
+        switch (op.ext) { // w2, sxtw: the low part, sign or zero extended
+        case ARM64_EXT_SXTB: v = e_un("(char)", v); break;
+        case ARM64_EXT_SXTH: v = e_un("(short)", v); break;
+        case ARM64_EXT_SXTW: v = e_un("(int)", v); break;
+        case ARM64_EXT_UXTB: v = e_un("(unsigned char)", v); break;
+        case ARM64_EXT_UXTH: v = e_un("(unsigned short)", v); break;
+        case ARM64_EXT_UXTW: v = e_un("(unsigned int)", v); break;
+        default: break;
+        }
+    } else if (op.type == ARM64_OP_IMM || op.type == ARM64_OP_CIMM) {
+        v = e_num((uint64_t)op.imm, true);
+    } else if (op.type == ARM64_OP_MEM) {
+        return e_mem(mem_address_arm(op, cur, 8), 8);
+    } else {
+        return e_sym("?");
+    }
+    if (op.shift.type != ARM64_SFT_INVALID && op.shift.value) {
+        ep k = e_num(op.shift.value);
+        switch (op.shift.type) {
+        case ARM64_SFT_LSL: v = fold(e_bin("<<", v, k)); break;
+        case ARM64_SFT_LSR: v = e_bin(">>", e_un(arm_reg_size(cs_, op.reg) == 4 ? "(unsigned)" : "(unsigned long long)", v), k); break;
+        case ARM64_SFT_ASR: v = e_bin(">>", v, k); break;
+        case ARM64_SFT_ROR: v = e_intr("__ror", {v, k}); break;
+        default: break;
+        }
+    }
+    return v;
+}
+
+// the condition cc on the flags a cmp / tst / flag-setting instruction left, and after a ccmp:
+// pre ? cc(cmp) : cc(its constant)
+ep lifter::build_cond_arm(const flag_state& fs, int cc, bool& ok)
+{
+    ok = true;
+    if (cc == ARM64_CC_AL || cc == ARM64_CC_NV)
+        return e_num(1);
+    if (fs.pre) {
+        flag_state inner = fs;
+        inner.pre = nullptr;
+        ep c = build_cond_arm(inner, cc, ok);
+        return nzcv_holds(fs.nzcv, cc) ? e_bin("||", negate(fs.pre), c) : e_bin("&&", fs.pre, c);
+    }
+    if (fs.fp && fs.a && fs.b) {
+        // after fcmp: lt, le, hi, hs and pl also hold when a value is a nan (so does ne)
+        auto c = [&](const char* op) {
+            ep e = e_bin(op, fs.a, fs.b);
+            e->fp = true;
+            return e;
+        };
+        switch (cc) {
+        case ARM64_CC_EQ: return c("==");
+        case ARM64_CC_NE: return c("!=");
+        case ARM64_CC_MI:
+        case ARM64_CC_LO: return c("<");
+        case ARM64_CC_GT: return c(">");
+        case ARM64_CC_GE: return c(">=");
+        case ARM64_CC_LS: return c("<=");
+        case ARM64_CC_LT: return e_un("!", c(">="));
+        case ARM64_CC_LE: return e_un("!", c(">"));
+        case ARM64_CC_HI: return e_un("!", c("<="));
+        case ARM64_CC_HS:
+        case ARM64_CC_PL: return e_un("!", c("<"));
+        default:
+            ok = false; // vs / vc: unordered or not
+            return e_sym("cond");
+        }
+    }
+    auto cmp = [&](const char* op) -> ep {
+        if (fs.is_cmp && fs.a && fs.b)
+            return e_bin(op, fs.a, fs.b);
+        if (fs.is_test && fs.a && fs.b) {
+            if (print(fs.a) == print(fs.b))
+                return e_bin(op, fs.a, e_num(0));
+            return e_bin(op, e_bin("&", fs.a, fs.b), e_num(0));
+        }
+        return e_bin(op, fs.res ? fs.res : e_sym("flags"), e_num(0));
+    };
+    const char* u = fs.wide ? "(unsigned long long)" : "(unsigned)";
+    auto uns = [&](const char* op) -> ep {
+        if (fs.is_cmp && fs.a && fs.b)
+            return e_bin(op, e_un(u, fs.a), e_un(u, fs.b));
+        ok = false;
+        return e_sym("cond");
+    };
+    // zero or not: the result when there is one (x = x - 1; if (x != 0)), else a == b
+    auto zero = [&](const char* op) -> ep {
+        if (fs.res)
+            return e_bin(op, fs.res, e_num(0));
+        return cmp(op);
+    };
+    // the sign of the result
+    auto sign = [&](const char* op) -> ep {
+        if (fs.res)
+            return e_bin(op, fs.res, e_num(0));
+        if (fs.is_cmp && fs.a && fs.b)
+            return fs.b->kind == expr::k::num && fs.b->num == 0 ? e_bin(op, fs.a, e_num(0))
+                                                              : e_bin(op, e_bin("-", fs.a, fs.b), e_num(0));
+        return cmp(op);
+    };
+    if ((cc == ARM64_CC_VS || cc == ARM64_CC_VC) && fs.a && fs.b && (fs.sum || fs.is_cmp) && !fs.fp) {
+        // signed overflow: of a + b (adds), a - b (subs, cmp)
+        ep o = e_intr(fs.sum ? "__ofadd" : "__ofsub", {fs.a, fs.b});
+        return cc == ARM64_CC_VS ? o : e_un("!", o);
+    }
+    if (fs.sum && fs.res && fs.a && (cc == ARM64_CC_HS || cc == ARM64_CC_LO)) // adds: the carry
+        return e_bin(cc == ARM64_CC_HS ? "<" : ">=", e_un(u, fs.res), e_un(u, fs.a));
+    bool test = fs.is_test || (!fs.is_cmp && fs.res); // ands / tst / adds: c and v say nothing useful
+    switch (cc) {
+    case ARM64_CC_EQ: return zero("==");
+    case ARM64_CC_NE: return zero("!=");
+    case ARM64_CC_MI: return sign("<");
+    case ARM64_CC_PL: return sign(">=");
+    case ARM64_CC_GT: return test ? sign(">") : cmp(">");
+    case ARM64_CC_GE: return test ? sign(">=") : cmp(">=");
+    case ARM64_CC_LT: return test ? sign("<") : cmp("<");
+    case ARM64_CC_LE: return test ? sign("<=") : cmp("<=");
+    case ARM64_CC_HI: return uns(">");
+    case ARM64_CC_HS: return uns(">=");
+    case ARM64_CC_LO: return uns("<");
+    case ARM64_CC_LS: return uns("<=");
     default:
         ok = false;
         return e_sym("cond");
@@ -1614,7 +2504,12 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                x.operands[0].reg == x.operands[1].reg;
     };
 
-    frame_pass(g, entry);
+    if (arm_) {
+        frame_pass_arm(g, entry);
+        find_saves_arm(g, entry);
+    } else {
+        frame_pass(g, entry);
+    }
 
     // stack arguments: pushes (32-bit) and stores to the outgoing area ([rsp + 0x20 + 8n] on
     // win64) that a call in the same block takes: they become that call's arguments instead of
@@ -1627,7 +2522,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         std::vector<char>& is_arg = arg_mark[bi];
         std::unordered_map<size_t, std::vector<int64_t>>& call_stack = call_slots[bi];
         is_arg.assign(ni, 0);
-        {
+        if (!arm_) {
             const int64_t ptr = is64_ ? 8 : 4;
             const bool pe = db_.bin.format == bin_format::pe;
             const int64_t base = is64_ && pe ? 0x20 : 0;
@@ -1707,7 +2602,49 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             const uint8_t* p = code;
             size_t left = n;
             uint64_t addr = a;
-            if (cs_disasm_iter(cs_, &p, &left, &addr, insn)) {
+            bool decoded = cs_disasm_iter(cs_, &p, &left, &addr, insn);
+            if (decoded && arm_) {
+                // arm64: saves / restores / the frame pointer's setup and hints do nothing here
+                unsigned id = insn->id;
+                const cs_arm64& ax = insn->detail->arm64;
+                if (!arm_skip_.count(a) && !arm_nothing(id)) {
+                    access_arm(insn, r.rd, r.wr, r.flags_rd, r.flags_wr);
+                    arm_vec_effect(cs_, insn, r.vwr, r.vzero);
+                    if (arm_is_call(id)) {
+                        r.vwr = ~0u; // the callee may change them
+                        r.call = true;
+                        r.flags_wr = true;
+                        r.wr |= scratch;
+                        if (id == ARM64_INS_BL && ax.op_count >= 1 && ax.operands[0].type == ARM64_OP_IMM) {
+                            r.target = (uint64_t)ax.operands[0].imm;
+                            const callee_info& ci = callee_of(r.target);
+                            r.wr = (r.wr & ~scratch) | ci.clobbers;
+                            for (int i = 0; i < ci.arity && i < (int)arg_bits.size(); i++)
+                                r.rd |= arg_bits[i];
+                        }
+                        const prototype* pr = call_proto(insn);
+                        if (pr && !pr->variadic) {
+                            r.proto_args = (int)pr->params.size();
+                            for (int i = 0; i < r.proto_args && i < (int)arg_bits.size(); i++)
+                                r.rd |= arg_bits[i];
+                        }
+                        if (r.wr & 1u)
+                            call_sets_rax = true;
+                    } else if (id == ARM64_INS_B && !arm_conditional(ax) && ax.op_count >= 1 &&
+                               ax.operands[0].type == ARM64_OP_IMM && !block_of.count((uint64_t)ax.operands[0].imm)) {
+                        r.tail = true; // b to another function: a tail call
+                        r.target = (uint64_t)ax.operands[0].imm;
+                        const callee_info& ci = callee_of(r.target);
+                        for (int i = 0; i < ci.arity && i < (int)arg_bits.size(); i++)
+                            r.rd |= arg_bits[i];
+                        if (ci.clobbers & 1u)
+                            call_sets_rax = true;
+                    } else if (arm_is_br(id) && !db_.an.tables.count(a)) {
+                        r.tail = true; // br x16: a tail call through a register
+                    }
+                    r.ret = arm_is_ret(id);
+                }
+            } else if (decoded) {
                 r.rd = access(insn, r.wr);
                 const cs_x86& x = insn->detail->x86;
                 if (insn->id == X86_INS_PUSH && arg_mark[bi][rws[bi].size()] && x.op_count >= 1 && x.operands[0].type == X86_OP_REG) {
@@ -1759,6 +2696,39 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 r.ret = cs_insn_group(cs_, insn, X86_GRP_RET);
             }
             rws[bi].push_back(r);
+        }
+    }
+    if (arm_) {
+        // x0 is the first argument too: a result is x0 set by something other than a call on
+        // the way to a ret
+        std::vector<int> last_x0(nb, 0); // the block's last write of x0: 0 none, 1 a call, 2 anything else
+        std::vector<std::vector<int>> preds(nb);
+        std::vector<char> seen(nb, 0);
+        std::vector<int> work;
+        for (size_t bi = 0; bi < nb; bi++) {
+            for (size_t k = rws[bi].size(); k-- > 0;)
+                if (rws[bi][k].wr & 1u) {
+                    last_x0[bi] = rws[bi][k].call ? 1 : 2;
+                    break;
+                }
+            for (const cfg_edge& e : g.blocks[bi].succ)
+                preds[e.to].push_back((int)bi);
+            if (!rws[bi].empty() && rws[bi].back().ret) {
+                seen[bi] = 1;
+                work.push_back((int)bi);
+            }
+        }
+        while (!work.empty() && !returns_value) {
+            int b = work.back();
+            work.pop_back();
+            if (last_x0[b] == 2)
+                returns_value = true;
+            else if (!last_x0[b])
+                for (int q : preds[b])
+                    if (!seen[q]) {
+                        seen[q] = 1;
+                        work.push_back(q);
+                    }
         }
     }
     // callers settle whether there is a result: rax read after the call. without callers,
@@ -1814,9 +2784,13 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
     for (int i = 0; arg_reg_at(i, is64_, fmt); i++)
         if (out[entry].live_in & bit(arg_reg_at(i, is64_, fmt)))
             nparams = i + 1;
+    // arm64's are a0, a1, ...: x0 carries results too, so the argument is a variable of its own,
+    // read where x0 still holds it
+    std::map<std::string, std::string> arg_var;
     for (int i = 0; i < nparams; i++) {
         params_.insert(arg_reg_at(i, is64_, fmt));
-        params.push_back(disp(arg_reg_at(i, is64_, fmt)));
+        params.push_back(arm_ ? "a" + std::to_string(i) : disp(arg_reg_at(i, is64_, fmt)));
+        arg_var[arg_reg_at(i, is64_, fmt)] = params.back();
     }
 
     // call arguments: the argument registers something set since the last call (a
@@ -1864,13 +2838,230 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         liveness();
     }
 
+    // arm64: an address made before a branch (adrp x1, page; b.eq ...; then add x0, x1, #off)
+    // is a number where every way in agrees on it. reads of it there use the number, so the
+    // page doesn't have to be a variable
+    std::vector<uint32_t> known_in(nb, 0), known_pages(nb, 0); // pages: adrp's, not an address yet
+    std::vector<std::array<uint64_t, 32>> known_val(nb);
+    std::vector<uint32_t> intact_in(nb, 0); // arm64: parameters no way here has changed
+    if (arm_) {
+        uint32_t pmask = 0;
+        for (const std::string& pr : params_)
+            pmask |= bit(pr);
+        std::vector<uint32_t> intact_out(nb, 0);
+        std::vector<char> seen(nb, 0);
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t bi = 0; bi < nb; bi++) {
+                uint32_t in = (int)bi == entry ? pmask : ~0u;
+                bool any = (int)bi == entry;
+                for (int q : pred[bi])
+                    if (seen[q]) {
+                        in &= intact_out[q];
+                        any = true;
+                    }
+                if (!any)
+                    continue;
+                uint32_t o = in;
+                for (const insn_rw& r : rws[bi])
+                    o &= ~r.wr;
+                if (!seen[bi] || in != intact_in[bi] || o != intact_out[bi]) {
+                    seen[bi] = 1;
+                    intact_in[bi] = in;
+                    intact_out[bi] = o;
+                    changed = true;
+                }
+            }
+        }
+        // what each instruction does: kind 1 sets v (a page from adrp), 2 adds v to src, 3 copies src
+        struct kstep {
+            uint8_t kind = 0;
+            bool page = false;
+            int dst = -1, src = -1;
+            uint64_t v = 0;
+        };
+        std::vector<std::vector<kstep>> ks(nb);
+        for (size_t bi = 0; bi < nb; bi++)
+            for (uint64_t a : g.blocks[bi].insns) {
+                kstep st;
+                uint8_t code[4];
+                const uint8_t* p = code;
+                size_t left = db_.bin.read(a, code, sizeof(code));
+                uint64_t addr = a;
+                if (cs_disasm_iter(cs_, &p, &left, &addr, insn) && !arm_skip_.count(a)) {
+                    const cs_arm64& x = insn->detail->arm64;
+                    auto reg = [&](int i) {
+                        return i < x.op_count && x.operands[i].type == ARM64_OP_REG && arm_reg_size(cs_, x.operands[i].reg) == 8
+                            ? reg_bit(reg_family(cs_reg_name(cs_, x.operands[i].reg))) : -1;
+                    };
+                    st.dst = reg(0);
+                    if ((insn->id == ARM64_INS_ADRP || insn->id == ARM64_INS_ADR) && x.op_count >= 2) {
+                        st.kind = 1;
+                        st.page = insn->id == ARM64_INS_ADRP;
+                        st.v = (uint64_t)x.operands[1].imm;
+                    } else if (insn->id == ARM64_INS_ADD && x.op_count == 3 && x.operands[2].type == ARM64_OP_IMM) {
+                        const cs_arm64_op& o = x.operands[2];
+                        st.kind = 2;
+                        st.src = reg(1);
+                        st.v = (uint64_t)o.imm << (o.shift.type == ARM64_SFT_LSL ? o.shift.value : 0);
+                    } else if (insn->id == ARM64_INS_MOV && x.op_count == 2) {
+                        st.kind = 3;
+                        st.src = reg(1);
+                    }
+                    if (st.dst < 0 || st.dst >= 31)
+                        st.kind = 0; // only x0 - x30
+                }
+                ks[bi].push_back(st);
+            }
+        auto run_block = [&](size_t bi, uint32_t known, uint32_t& pages, std::array<uint64_t, 32>& val) {
+            for (size_t k = 0; k < ks[bi].size(); k++) {
+                const kstep& st = ks[bi][k];
+                bool have = st.kind == 1 || (st.kind > 1 && st.src >= 0 && (known & (1u << st.src)));
+                uint64_t v = st.kind == 1 ? st.v : have ? val[st.src] + (st.kind == 2 ? st.v : 0) : 0;
+                bool page = st.kind == 1 ? st.page : st.kind == 3 && have && (pages & (1u << st.src));
+                known &= ~rws[bi][k].wr;
+                pages &= ~rws[bi][k].wr;
+                if (have) {
+                    known |= 1u << st.dst;
+                    val[st.dst] = v;
+                    if (page)
+                        pages |= 1u << st.dst;
+                }
+            }
+            return known;
+        };
+        std::vector<uint32_t> known_out(nb, 0), pages_out(nb, 0);
+        std::vector<std::array<uint64_t, 32>> out_val(nb);
+        std::vector<char> done(nb, 0);
+        auto same = [](uint32_t m, const std::array<uint64_t, 32>& x, const std::array<uint64_t, 32>& y) {
+            for (int r = 0; r < 32; r++)
+                if ((m & (1u << r)) && x[r] != y[r])
+                    return false;
+            return true;
+        };
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t bi = 0; bi < nb; bi++) {
+                uint32_t in = 0, pg = 0;
+                std::array<uint64_t, 32> iv{};
+                bool any = (int)bi == entry;
+                for (int q : pred[bi]) {
+                    if ((int)bi == entry || !done[q])
+                        continue;
+                    if (!any) {
+                        in = known_out[q];
+                        pg = pages_out[q];
+                        iv = out_val[q];
+                        any = true;
+                        continue;
+                    }
+                    for (int r = 0; r < 32; r++)
+                        if ((in & (1u << r)) && (!(known_out[q] & (1u << r)) || out_val[q][r] != iv[r]))
+                            in &= ~(1u << r);
+                    pg &= pages_out[q];
+                }
+                if (!any)
+                    continue; // no way in worked out yet
+                pg &= in;
+                std::array<uint64_t, 32> ov = iv;
+                uint32_t opg = pg;
+                uint32_t o = run_block(bi, in, opg, ov);
+                if (!done[bi] || in != known_in[bi] || pg != known_pages[bi] || o != known_out[bi] ||
+                    opg != pages_out[bi] || !same(in, iv, known_val[bi]) || !same(o, ov, out_val[bi])) {
+                    done[bi] = 1;
+                    known_in[bi] = in;
+                    known_pages[bi] = pg;
+                    known_val[bi] = iv;
+                    known_out[bi] = o;
+                    pages_out[bi] = opg;
+                    out_val[bi] = ov;
+                    changed = true;
+                }
+            }
+        }
+        for (size_t bi = 0; bi < nb; bi++) {
+            uint32_t still = known_in[bi] | intact_in[bi];
+            for (insn_rw& r : rws[bi]) {
+                r.rd_known = r.rd & still;
+                r.rd &= ~still;
+                still &= ~r.wr;
+            }
+        }
+        liveness();
+    }
+    // arm64: vector registers that are zero on every way in (movi v0.2d, #0 before stores of it
+    // that zero a struct: memset)
+    std::vector<uint32_t> vzero_in(nb, 0);
+    if (arm_) {
+        std::vector<uint32_t> vzero_out(nb, 0);
+        std::vector<char> done(nb, 0);
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t bi = 0; bi < nb; bi++) {
+                uint32_t in = 0;
+                bool any = (int)bi == entry;
+                for (int q : pred[bi])
+                    if ((int)bi != entry && done[q]) {
+                        in = any ? in & vzero_out[q] : vzero_out[q];
+                        any = true;
+                    }
+                if (!any)
+                    continue;
+                uint32_t o = in;
+                for (const insn_rw& r : rws[bi])
+                    o = (o & ~r.vwr) | (r.vzero >= 0 ? 1u << r.vzero : 0u);
+                if (!done[bi] || in != vzero_in[bi] || o != vzero_out[bi]) {
+                    done[bi] = 1;
+                    vzero_in[bi] = in;
+                    vzero_out[bi] = o;
+                    changed = true;
+                }
+            }
+        }
+    }
+
     // pass 2: statements. a register's new value stays pending - an expression, not yet a
     // statement - until it has to be written out: a later block reads it, it grew big, a
     // call or store may change memory it reads, or its register is about to change while
     // another pending value still reads the old one. pending expressions always mean the
     // registers as the statements printed so far left them.
+    //
+    // a block whose only way in is from one block, and that tests the flags before setting
+    // them (cmp; b.lt ...; then b.ne in the next block), starts with the flags that block left:
+    // it's done after that block
+    std::vector<int> flags_from(nb, -1);
+    std::vector<char> flags_out(nb, 0);
+    for (size_t s = 0; s < nb; s++) {
+        int from = pred[s].empty() || (int)s == entry ? -1 : pred[s][0];
+        for (int p : pred[s])
+            from = p == from ? from : -1;
+        if (from < 0)
+            continue;
+        for (const insn_rw& r : rws[s]) {
+            if (r.flags_rd) {
+                flags_from[s] = from;
+                flags_out[from] = 1;
+            }
+            if (r.flags_rd || r.flags_wr)
+                break;
+        }
+    }
+    std::vector<int> order;
+    {
+        std::vector<char> placed(nb, 0);
+        for (size_t b = 0; b < nb; b++) {
+            std::vector<int> chain;
+            for (int c = (int)b; c >= 0 && !placed[c]; c = flags_from[c]) {
+                placed[c] = 1;
+                chain.push_back(c);
+            }
+            order.insert(order.end(), chain.rbegin(), chain.rend());
+        }
+    }
+    std::vector<flag_state> fs_end(nb);
+
     int temps = 0;
-    for (size_t bi = 0; bi < nb; bi++) {
+    for (int bi : order) {
         const cfg_block& cb = g.blocks[bi];
         block_ir& ir = out[bi];
         const std::vector<insn_rw>& rw = rws[bi];
@@ -1880,7 +3071,25 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         std::unordered_map<std::string, size_t> born; // instruction that set a pending value
         for (const std::string& pr : params_)
             cur[pr] = e_reg(disp(pr));
+        std::unordered_map<std::string, const expr*> known; // the known addresses it starts with
+        for (int r = 0; r < 31; r++)
+            if (known_in[bi] & (1u << r)) {
+                uint64_t n = known_val[bi][r];
+                ep v = known_pages[bi] & (1u << r) ? e_num(n, true) : addr_value(n);
+                cur[fam_name(r)] = v;
+                known[fam_name(r)] = v.get();
+            }
+        for (const auto& av : arg_var)
+            if (intact_in[bi] & bit(av.first)) {
+                ep v = e_reg(av.second); // x0 still holds the argument
+                cur[av.first] = v;
+                if (bi != entry) // the entry block is where x0 = a0 has to be written, if at all
+                    known[av.first] = v.get();
+            }
         flag_state fs;
+        if (flags_from[bi] >= 0)
+            fs = fs_end[flags_from[bi]];
+        uint32_t vzero = vzero_in[bi]; // vector registers that are zero
         uint32_t argset = set_in[bi];
 
         // this block's stack arguments (see the pass before pass 1)
@@ -1893,7 +3102,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         std::vector<char> flags_after(ni, 0);
         {
             uint32_t live = ir.live_out;
-            bool fl = false;
+            bool fl = flags_out[bi];
             for (size_t k = ni; k-- > 0;) {
                 live_after[k] = live;
                 flags_after[k] = fl;
@@ -1911,7 +3120,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         };
         auto line = [&](uint64_t at, const std::string& s) { ir.stmts.push_back({at, s}); };
         auto pending = [&](const std::string& fam) {
-            if (fam == "rsp")
+            if (fam == sp_)
                 return false;
             auto it = cur.find(fam);
             if (it == cur.end() || !it->second)
@@ -1981,6 +3190,10 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 spare.erase(std::remove_if(spare.begin(), spare.end(),
                                            [&](const asg& s) { return refs_name(s.val, nm, a.val.get()); }),
                             spare.end());
+                // what reads the value reads the register from here on - unless it's a number or
+                // a variable nothing assigns (a0): that reads better as it is
+                if (a.val->kind == expr::k::num || (a.val->kind == expr::k::reg && reg_family(a.val->text.c_str()).empty()))
+                    return;
                 ep named = e_reg(nm);
                 const expr* node = a.val.get();
                 rewrite([&](const ep& e, rewrite_memo& memo) { return replace_node(e, node, named, memo); });
@@ -2048,7 +3261,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             std::vector<asg> todo, spare;
             std::vector<ep*> readers = std::move(extra);
             if (flags_after[k])
-                for (ep* f : {&fs.a, &fs.b, &fs.res})
+                for (ep* f : {&fs.a, &fs.b, &fs.res, &fs.pre})
                     if (*f)
                         readers.push_back(f);
             for (auto& oa : out_args)
@@ -2086,7 +3299,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             if (!flags_after[k])
                 return;
             std::vector<std::pair<const expr*, ep>> made;
-            for (ep* f : {&fs.a, &fs.b, &fs.res}) {
+            for (ep* f : {&fs.a, &fs.b, &fs.res, &fs.pre}) {
                 if (!*f)
                     continue;
                 bool bad = mem && has_mem(*f);
@@ -2115,8 +3328,8 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 if (v.fam.empty() || !v.val)
                     continue;
                 // the stack pointer, and rbp as a frame pointer, are always shown by name
-                bool frame = v.fam == "rbp" && ((v.val->kind == expr::k::reg && v.val->text == disp("rsp")) || rbp_frame_);
-                if (v.fam == "rsp" || frame) {
+                bool frame = v.fam == fp_ && ((v.val->kind == expr::k::reg && v.val->text == disp(sp_)) || rbp_frame_);
+                if (v.fam == sp_ || frame) {
                     cur.erase(v.fam);
                     continue;
                 }
@@ -2155,6 +3368,12 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
         };
         auto store = [&](size_t k, ep dst, const std::string& op, ep src) {
             barrier(k, {&dst, &src});
+            if (dst->kind == expr::k::call && (dst->text.compare(0, 8, "__readfs") == 0 || dst->text.compare(0, 8, "__readgs") == 0)) {
+                // thread data: __writefsdword(-0x10, v)
+                ep v = op == "=" ? src : e_bin(op.substr(0, op.size() - 1), dst, src);
+                line(cb.insns[k], "__write" + dst->text.substr(6) + "(" + print(dst->kids[0]) + ", " + print(v) + ");");
+                return dst;
+            }
             line(cb.insns[k], print(dst) + " " + op + " " + print(src) + ";");
             if (g_uses && op == "=" && dst->kind == expr::k::mem && dst->kids[0]->kind == expr::k::un &&
                 dst->kids[0]->text == "&" && dst->kids[0]->kids[0]->kind == expr::k::sym &&
@@ -2182,23 +3401,31 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             flush_args();
             const insn_rw& r = rw[k];
             std::vector<std::string> reads, writes;
-            for (int b = 0; b < 16; b++) {
+            uint32_t rd = r.rd | r.rd_known;
+            for (int b = 0; b < (arm_ ? 32 : 16); b++) {
                 std::string fam = fam_name(b);
-                if (fam == "rsp")
+                if (fam == sp_)
                     continue;
-                if ((r.rd & (1u << b)) && pending(fam))
+                if ((rd & (1u << b)) && pending(fam))
                     reads.push_back(fam);
                 if (r.wr & (1u << b))
                     writes.push_back(fam);
             }
             for (const std::string& w : writes)
-                if (!(r.rd & bit(w)))
+                if (!(rd & bit(w)))
                     cur.erase(w); // overwritten without being read
             bool writes_mem = false;
-            const cs_x86& xx = in->detail->x86;
-            for (uint8_t i = 0; i < xx.op_count; i++)
-                if (xx.operands[i].type == X86_OP_MEM && (xx.operands[i].access & CS_AC_WRITE))
-                    writes_mem = true;
+            if (arm_) { // a store, an atomic, anything else with a memory operand that isn't a load
+                const cs_arm64& xa = in->detail->arm64;
+                for (uint8_t i = 0; i < xa.op_count; i++)
+                    if (xa.operands[i].type == ARM64_OP_MEM && !arm_is_load(in->id))
+                        writes_mem = true;
+            } else {
+                const cs_x86& xx = in->detail->x86;
+                for (uint8_t i = 0; i < xx.op_count; i++)
+                    if (xx.operands[i].type == X86_OP_MEM && (xx.operands[i].access & CS_AC_WRITE))
+                        writes_mem = true;
+            }
             if (writes_mem)
                 barrier(k, {});
             settle(k, reads, writes, {});
@@ -2272,6 +3499,563 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                     assign_all(k, {{"rax", e_bin("*", v, s)}, {"rdx", e_intr("__mulhi", {v, s})}});
             };
 
+            if (arm_) {
+                const cs_arm64& ax = insn->detail->arm64;
+                auto op = [&](int i) -> const cs_arm64_op& { return ax.operands[i]; };
+                // operand i's register family ("" for the zero register and vector registers)
+                auto fam = [&](int i) {
+                    return i < ax.op_count && ax.operands[i].type == ARM64_OP_REG && !arm_zr(cs_, ax.operands[i].reg)
+                        ? reg_family(cs_reg_name(cs_, ax.operands[i].reg)) : std::string();
+                };
+                auto v = [&](int i) { return i < ax.op_count ? operand_arm(ax.operands[i], cur) : e_num(0); };
+                auto put = [&](ep r) {
+                    std::string f = fam(0);
+                    if (!f.empty() && f != sp_)
+                        assign(k, f, std::move(r));
+                };
+                auto imm_of = [&](int i) -> int64_t {
+                    const cs_arm64_op& o = ax.operands[i];
+                    return o.imm << (o.shift.type == ARM64_SFT_LSL ? o.shift.value : 0);
+                };
+                // a number that's an address of something with a name reads as &name
+                auto named = [&](ep e) { return named_sum(e, false); };
+                // sp / x29 plus k: the address of a frame variable
+                auto frame_addr = [&](const std::string& base, int64_t k2, ep& out) {
+                    int64_t off = 0;
+                    if (base == "sp" && cur_sp_known_)
+                        off = cur_sp_ + k2;
+                    else if (base == "x29" && rbp_frame_)
+                        off = rbp_off_ + k2;
+                    else
+                        return false;
+                    std::string nm = frame_var(off, 0);
+                    if (nm.empty())
+                        return false;
+                    out = e_un("&", e_sym(nm));
+                    return true;
+                };
+                auto neg = [&](ep e) { return e->kind == expr::k::num ? e_num(0 - e->num, true) : e_un("-", e); };
+                bool wide = ax.op_count >= 1 && ax.operands[0].type == ARM64_OP_REG && arm_reg_size(cs_, ax.operands[0].reg) == 8;
+                auto flags_cmp = [&](ep a2, ep b2, ep res) {
+                    fs = {};
+                    fs.valid = true;
+                    fs.is_cmp = true;
+                    fs.wide = wide;
+                    fs.a = std::move(a2);
+                    fs.b = std::move(b2);
+                    fs.res = std::move(res);
+                    fs_set = true;
+                };
+                auto cond = [&](bool& ok) { return build_cond_arm(fs, ax.cc, ok); };
+                int mi = -1;
+                for (int i = 0; i < ax.op_count && mi < 0; i++)
+                    if (ax.operands[i].type == ARM64_OP_MEM)
+                        mi = i;
+                // bit fields: lsb and width in operands 2 and 3
+                int64_t lsb = ax.op_count >= 4 ? op(2).imm : 0, width = ax.op_count >= 4 ? op(3).imm : 0;
+                uint64_t fmask = width >= 64 ? ~0ull : (1ull << width) - 1;
+                bool bits32 = ax.op_count >= 1 && ax.operands[0].type == ARM64_OP_REG && arm_reg_size(cs_, ax.operands[0].reg) == 4;
+
+                if (arm_skip_.count(a) || arm_nothing(id)) {
+                    // the prologue's saves, the epilogue's restores, the frame pointer, hints
+                } else if ((id == ARM64_INS_FCMP || id == ARM64_INS_FCMPE) && ax.op_count >= 2) {
+                    // floating point: the registers by name (what sets them is shown as it is)
+                    auto fv = [&](int i) { return op(i).type == ARM64_OP_REG ? e_reg(cs_reg_name(cs_, op(i).reg)) : e_sym("0.0"); };
+                    flags_cmp(fv(0), fv(1), nullptr);
+                    fs.fp = true;
+                } else if (arm_vector(cs_, insn)) {
+                    // a compare's register changing: its flags can't be said with it any more
+                    const char* mn = insn->mnemonic;
+                    bool st = mn[0] == 's' && mn[1] == 't', ld = mn[0] == 'l' && mn[1] == 'd';
+                    for (int i = 0; fs.fp && !st && i < ax.op_count && op(i).type == ARM64_OP_REG && (i == 0 || ld); i++) {
+                        int n = arm_vreg(cs_reg_name(cs_, op(i).reg));
+                        for (const ep& e : {fs.a, fs.b})
+                            if (n >= 0 && e && e->kind == expr::k::reg && arm_vreg(e->text.c_str()) == n)
+                                fs = {};
+                    }
+                    // stores of registers that are zero: a struct or an array cleared
+                    bool zeros = arm_is_store(id) && mi >= 1;
+                    for (int r2 = 0; zeros && r2 < mi; r2++) {
+                        int n = op(r2).type == ARM64_OP_REG ? arm_vreg(cs_reg_name(cs_, op(r2).reg)) : -1;
+                        zeros = n >= 0 && (vzero & (1u << n));
+                    }
+                    if (rw[k].vzero >= 0) {
+                        line(a, "v" + std::to_string(rw[k].vzero) + " = 0;");
+                    } else if (zeros) {
+                        int w = arm_mem_width(cs_, insn);
+                        if (w > 8) {
+                            ep at = mem_address_arm(op(mi), cur, w);
+                            barrier(k, {&at});
+                            line(a, "memset(" + print(at) + ", 0, " + std::to_string(w * mi) + ");");
+                        } else {
+                            for (int r2 = 0; r2 < mi; r2++) {
+                                cs_arm64_op m2 = op(mi);
+                                m2.mem.disp += w * r2;
+                                store(k, e_mem(mem_address_arm(m2, cur, w), w), "=", e_num(0));
+                            }
+                        }
+                        std::string base = reg_family(cs_reg_name(cs_, op(mi).mem.base));
+                        if (ax.writeback && base != sp_ && !base.empty()) {
+                            int64_t step = ax.post_index ? (mi + 1 < ax.op_count && op(mi + 1).type == ARM64_OP_IMM ? op(mi + 1).imm : 0)
+                                                         : op(mi).mem.disp;
+                            assign(k, base, fold(e_bin("+", reg_read(cur, base), e_num((uint64_t)step, true))));
+                        }
+                    } else {
+                        opaque(k, insn);
+                    }
+                } else switch (id) {
+                case ARM64_INS_MOV:
+                case ARM64_INS_MOVZ:
+                case ARM64_INS_MOVN: {
+                    ep out;
+                    if (fam(1) == "sp" && frame_addr("sp", 0, out))
+                        put(out); // mov x0, sp: the frame's address
+                    else if (fam(0) != "x29" || !rbp_frame_)
+                        put(named(v(1)));
+                    break;
+                }
+                case ARM64_INS_MOVK: { // 16 bits of it: movk x0, #0x1234, lsl #16
+                    unsigned sh = op(1).shift.type == ARM64_SFT_LSL ? op(1).shift.value : 0;
+                    uint64_t mask = ~(0xffffull << sh), bits = ((uint64_t)op(1).imm & 0xffff) << sh;
+                    if (bits32)
+                        mask &= 0xffffffffull;
+                    ep old = v(0);
+                    put(named(old->kind == expr::k::num ? e_num((old->num & mask) | bits, true)
+                                                        : e_bin("|", e_bin("&", old, e_num(mask)), e_num(bits))));
+                    break;
+                }
+                case ARM64_INS_ADD:
+                case ARM64_INS_SUB:
+                case ARM64_INS_ADDS:
+                case ARM64_INS_SUBS: {
+                    bool plus = id == ARM64_INS_ADD || id == ARM64_INS_ADDS;
+                    std::string d = fam(0), b = fam(1);
+                    ep out;
+                    if ((b == "sp" || (b == "x29" && rbp_frame_)) && ax.op_count >= 3 && op(2).type == ARM64_OP_IMM &&
+                        frame_addr(b, plus ? imm_of(2) : -imm_of(2), out)) {
+                        put(out); // add x0, sp, #16: a frame variable's address
+                        break;
+                    }
+                    if (d == "sp" || (d == "x29" && rbp_frame_))
+                        break; // the stack moving: the frame pass follows it
+                    ep a2 = v(1), b2 = v(2);
+                    ep r = named(e_bin(plus ? "+" : "-", a2, b2));
+                    if (ax.update_flags) {
+                        if (plus) {
+                            result_flags(r);
+                            fs.a = a2;
+                            fs.b = b2;
+                            fs.sum = true;
+                            fs.wide = wide;
+                        } else
+                            flags_cmp(a2, b2, fam(0).empty() ? nullptr : r);
+                    }
+                    put(r);
+                    break;
+                }
+                case ARM64_INS_CMP:
+                    flags_cmp(v(0), v(1), nullptr);
+                    break;
+                case ARM64_INS_CMN: // cmn x0, #1 compares with -1
+                    flags_cmp(v(0), neg(v(1)), nullptr);
+                    break;
+                case ARM64_INS_TST:
+                    fs = {};
+                    fs.valid = true;
+                    fs.is_test = true;
+                    fs.a = v(0);
+                    fs.b = v(1);
+                    fs_set = true;
+                    break;
+                case ARM64_INS_CCMP:
+                case ARM64_INS_CCMN: { // cond ? cmp a, b : flags = #nzcv
+                    bool ok = false;
+                    ep pre = cond(ok);
+                    ep a2 = v(0), b2 = id == ARM64_INS_CCMP ? v(1) : neg(v(1));
+                    uint8_t nzcv = (uint8_t)(ax.op_count >= 3 ? op(2).imm : 0);
+                    flags_cmp(a2, b2, nullptr);
+                    if (ok) {
+                        fs.pre = pre;
+                        fs.nzcv = nzcv;
+                    } else {
+                        fs = {};
+                    }
+                    break;
+                }
+                case ARM64_INS_AND:
+                case ARM64_INS_ANDS:
+                case ARM64_INS_ORR:
+                case ARM64_INS_EOR:
+                case ARM64_INS_BIC:
+                case ARM64_INS_BICS:
+                case ARM64_INS_ORN:
+                case ARM64_INS_EON: {
+                    bool inv = id == ARM64_INS_BIC || id == ARM64_INS_BICS || id == ARM64_INS_ORN || id == ARM64_INS_EON;
+                    const char* o = id == ARM64_INS_ORR || id == ARM64_INS_ORN ? "|" : id == ARM64_INS_EOR || id == ARM64_INS_EON ? "^" : "&";
+                    ep a2 = v(1), b2 = v(2);
+                    if (inv)
+                        b2 = b2->kind == expr::k::num ? e_num(~b2->num, true) : e_un("~", b2);
+                    ep r = named(e_bin(o, a2, b2));
+                    if (ax.update_flags) {
+                        fs = {};
+                        fs.valid = true;
+                        fs.is_test = true;
+                        fs.a = a2;
+                        fs.b = b2;
+                        fs_set = true;
+                    }
+                    put(r);
+                    break;
+                }
+                case ARM64_INS_MVN:
+                    put(e_un("~", v(1)));
+                    break;
+                case ARM64_INS_NEG:
+                case ARM64_INS_NEGS: {
+                    ep r = neg(v(1));
+                    if (id == ARM64_INS_NEGS)
+                        flags_cmp(e_num(0), v(1), r);
+                    put(r);
+                    break;
+                }
+                case ARM64_INS_LSL: put(fold(e_bin("<<", v(1), v(2)))); break;
+                case ARM64_INS_LSR: // a logical shift: of the unsigned value
+                    put(e_bin(">>", e_un(bits32 ? "(unsigned)" : "(unsigned long long)", v(1)), v(2)));
+                    break;
+                case ARM64_INS_ASR: put(e_bin(">>", v(1), v(2))); break;
+                case ARM64_INS_ROR: put(e_intr("__ror", {v(1), v(2)})); break;
+                case ARM64_INS_MUL:
+                case ARM64_INS_SMULL: put(e_bin("*", v(1), v(2))); break;
+                case ARM64_INS_UMULL: // 32 x 32 bits unsigned, 64 out
+                    put(e_bin("*", e_un("(unsigned long long)", e_un("(unsigned)", v(1))), e_un("(unsigned)", v(2))));
+                    break;
+                case ARM64_INS_MNEG: put(e_un("-", e_bin("*", v(1), v(2)))); break;
+                case ARM64_INS_SMULH: put(e_intr("__mulhi", {v(1), v(2)})); break;
+                case ARM64_INS_UMULH: put(e_intr("__umulhi", {v(1), v(2)})); break;
+                case ARM64_INS_SDIV: put(e_bin("/", v(1), v(2))); break;
+                case ARM64_INS_UDIV: { // of the unsigned values
+                    const char* u = bits32 ? "(unsigned)" : "(unsigned long long)";
+                    put(e_bin("/", e_un(u, v(1)), e_un(u, v(2))));
+                    break;
+                }
+                case ARM64_INS_MADD:
+                case ARM64_INS_SMADDL:
+                case ARM64_INS_UMADDL: put(e_bin("+", v(3), e_bin("*", v(1), v(2)))); break;
+                case ARM64_INS_MSUB:
+                case ARM64_INS_SMSUBL:
+                case ARM64_INS_UMSUBL: {
+                    // a - (a / b) * b is a % b: how a remainder comes out of udiv / sdiv
+                    ep q = v(1), m = v(2), a2 = v(3);
+                    auto is_div = [&](const ep& d, const ep& by) {
+                        return d->kind == expr::k::bin && d->text == "/" && print(d->kids[0]) == print(a2) && print(d->kids[1]) == print(by);
+                    };
+                    if (is_div(q, m))
+                        put(e_bin("%", a2, m));
+                    else if (is_div(m, q))
+                        put(e_bin("%", a2, q));
+                    else
+                        put(e_bin("-", a2, e_bin("*", q, m)));
+                    break;
+                }
+                case ARM64_INS_SXTB: put(e_un("(char)", v(1))); break;
+                case ARM64_INS_SXTH: put(e_un("(short)", v(1))); break;
+                case ARM64_INS_SXTW: put(e_un("(int)", v(1))); break;
+                case ARM64_INS_UXTB: put(e_un("(unsigned char)", v(1))); break;
+                case ARM64_INS_UXTH: put(e_un("(unsigned short)", v(1))); break;
+                case ARM64_INS_UXTW: put(e_un("(unsigned int)", v(1))); break;
+                case ARM64_INS_UBFX: // (x >> lsb) & mask
+                    put(lsb ? e_bin("&", e_bin(">>", v(1), e_num(lsb)), e_num(fmask)) : e_bin("&", v(1), e_num(fmask)));
+                    break;
+                case ARM64_INS_UBFIZ: // (x & mask) << lsb
+                    put(e_bin("<<", e_bin("&", v(1), e_num(fmask)), e_num(lsb)));
+                    break;
+                case ARM64_INS_SBFX:
+                case ARM64_INS_SBFIZ: {
+                    // a sign-extended field: (int)x << 2 is sbfiz x0, x1, #2, #32
+                    const char* cast = width == 32 ? "(int)" : width == 16 ? "(short)" : width == 8 ? "(char)" : nullptr;
+                    if (id == ARM64_INS_SBFX && cast && !lsb)
+                        put(e_un(cast, v(1)));
+                    else if (id == ARM64_INS_SBFIZ && cast)
+                        put(lsb ? e_bin("<<", e_un(cast, v(1)), e_num(lsb)) : e_un(cast, v(1)));
+                    else
+                        put(e_intr(id == ARM64_INS_SBFX ? "__sbfx" : "__sbfiz", {v(1), e_num(lsb), e_num(width)}));
+                    break;
+                }
+                case ARM64_INS_BFI: // d = (d & ~(mask << lsb)) | ((x & mask) << lsb)
+                    put(e_bin("|", e_bin("&", v(0), e_num(~(fmask << lsb), true)),
+                              e_bin("<<", e_bin("&", v(1), e_num(fmask)), e_num(lsb))));
+                    break;
+                case ARM64_INS_BFXIL: // d = (d & ~mask) | ((x >> lsb) & mask)
+                    put(e_bin("|", e_bin("&", v(0), e_num(~fmask, true)),
+                              e_bin("&", lsb ? e_bin(">>", v(1), e_num(lsb)) : v(1), e_num(fmask))));
+                    break;
+                case ARM64_INS_EXTR: // two registers shifted together; the same one twice rotates it
+                    if (print(v(1)) == print(v(2)))
+                        put(e_intr("__ror", {v(1), v(3)}));
+                    else
+                        put(e_intr("__extr", {v(1), v(2), v(3)}));
+                    break;
+                case ARM64_INS_CLZ: put(e_intr("__clz", {v(1)})); break;
+                case ARM64_INS_CLS: put(e_intr("__cls", {v(1)})); break;
+                case ARM64_INS_RBIT: put(e_intr("__rbit", {v(1)})); break;
+                case ARM64_INS_REV: put(e_intr("__bswap", {v(1)})); break;
+                case ARM64_INS_REV16: put(e_intr("__rev16", {v(1)})); break;
+                case ARM64_INS_REV32: put(e_intr("__rev32", {v(1)})); break;
+                case ARM64_INS_CSEL:
+                case ARM64_INS_CSINC:
+                case ARM64_INS_CSINV:
+                case ARM64_INS_CSNEG:
+                case ARM64_INS_CSET:
+                case ARM64_INS_CSETM:
+                case ARM64_INS_CINC:
+                case ARM64_INS_CINV:
+                case ARM64_INS_CNEG: {
+                    bool ok = false;
+                    ep c = cond(ok);
+                    if (!ok) {
+                        opaque(k, insn);
+                        break;
+                    }
+                    auto inv = [&](ep e) { return e->kind == expr::k::num ? e_num(~e->num, true) : e_un("~", e); };
+                    switch (id) {
+                    case ARM64_INS_CSEL: put(e_tern(c, v(1), v(2))); break;
+                    case ARM64_INS_CSINC: put(e_tern(c, v(1), fold(e_bin("+", v(2), e_num(1))))); break;
+                    case ARM64_INS_CSINV: put(e_tern(c, v(1), inv(v(2)))); break;
+                    case ARM64_INS_CSNEG: put(e_tern(c, v(1), neg(v(2)))); break;
+                    case ARM64_INS_CSET: put(c); break;
+                    case ARM64_INS_CSETM: put(e_tern(c, e_num((uint64_t)-1, true), e_num(0))); break;
+                    case ARM64_INS_CINC: put(e_tern(c, fold(e_bin("+", v(1), e_num(1))), v(1))); break;
+                    case ARM64_INS_CINV: put(e_tern(c, inv(v(1)), v(1))); break;
+                    default: put(e_tern(c, neg(v(1)), v(1))); break;
+                    }
+                    break;
+                }
+                case ARM64_INS_ADR:
+                    put(addr_value((uint64_t)op(1).imm));
+                    break;
+                case ARM64_INS_ADRP: // a page: the add or the access after it names what it reaches
+                    put(e_num((uint64_t)op(1).imm, true));
+                    break;
+                case ARM64_INS_MRS: {
+                    const char* comma = strchr(insn->op_str, ',');
+                    put(e_intr("__mrs", {e_sym(comma ? util::trim(comma + 1) : std::string(insn->op_str))}));
+                    break;
+                }
+                case ARM64_INS_SVC: { // a system call: its number, then the arguments set for it
+                    std::vector<ep> args{reg_read(cur, db_.bin.format == bin_format::macho ? "x16" : "x8")};
+                    for (int i = 0; i < 6; i++) {
+                        bool more = false;
+                        for (int j = i; j < 6; j++)
+                            more = more || (argset & (1u << j));
+                        if (!more)
+                            break;
+                        args.push_back(reg_read(cur, fam_name(i)));
+                    }
+                    ep sc = e_intr("__syscall", args);
+                    barrier(k, {&sc});
+                    if (live_after[k] & 1u) {
+                        cur[ret_] = sc;
+                        born[ret_] = k;
+                        settle(k, {ret_}, {}, {});
+                    } else {
+                        line(a, print(sc) + ";");
+                        cur.erase(ret_);
+                    }
+                    break;
+                }
+                case ARM64_INS_BRK:
+                case ARM64_INS_UDF:
+                case ARM64_INS_HLT:
+                    barrier(k, {});
+                    line(a, "__builtin_trap();");
+                    break;
+                case ARM64_INS_B:
+                case ARM64_INS_CBZ:
+                case ARM64_INS_CBNZ:
+                case ARM64_INS_TBZ:
+                case ARM64_INS_TBNZ:
+                case ARM64_INS_RET:
+                case ARM64_INS_RETAA:
+                case ARM64_INS_RETAB:
+                    break; // the block's end, below
+                default:
+                    if (arm_is_load(id) && mi >= 1) {
+                        // ldr / ldp: each register from its place; a writeback moves the base
+                        int w = arm_mem_width(cs_, insn);
+                        std::vector<asg> vals;
+                        for (int r2 = 0; r2 < mi; r2++) {
+                            cs_arm64_op m2 = op(mi);
+                            m2.mem.disp += w * r2;
+                            ep at = mem_address_arm(m2, cur, w);
+                            // a got slot of this file's own variable holds its address: &counter
+                            uint64_t slot = at->kind == expr::k::un && at->text == "&" ? at->kids[0]->kind == expr::k::sym
+                                ? at->kids[0]->ref : at->kids[0]->kind == expr::k::num ? at->kids[0]->num : 0 : 0;
+                            uint64_t to = 0;
+                            const segment* sg = slot ? db_.bin.seg_at(slot) : nullptr;
+                            if (w == 8 && sg && (sg->name.compare(0, 4, ".got") == 0 || sg->name == "__got" || sg->name == "__auth_got") &&
+                                !db_.an.slot_import.count(slot) && db_.bin.read_ptr(slot, to) && to && db_.bin.is_mapped(to))
+                                vals.push_back({fam(r2), addr_value(to)});
+                            else {
+                                ep m = e_mem(at, w);
+                                if (arm_zext_load(id))
+                                    m->text = "u";
+                                vals.push_back({fam(r2), m});
+                            }
+                        }
+                        std::string base = reg_family(cs_reg_name(cs_, op(mi).mem.base));
+                        if (ax.writeback && base != sp_ && !base.empty()) {
+                            int64_t step = ax.post_index ? (mi + 1 < ax.op_count && op(mi + 1).type == ARM64_OP_IMM ? op(mi + 1).imm : 0)
+                                                         : op(mi).mem.disp;
+                            vals.push_back({base, fold(e_bin("+", reg_read(cur, base), e_num((uint64_t)step, true)))});
+                        }
+                        assign_all(k, vals);
+                    } else if (arm_is_load(id) && ax.op_count >= 2 && op(1).type == ARM64_OP_IMM) {
+                        // ldr x0, =value: from the literal pool
+                        int w = arm_mem_width(cs_, insn);
+                        put(e_mem(place((uint64_t)op(1).imm), w));
+                    } else if (arm_is_store(id) && mi >= 1) {
+                        int w = arm_mem_width(cs_, insn);
+                        for (int r2 = 0; r2 < mi; r2++) {
+                            cs_arm64_op m2 = op(mi);
+                            m2.mem.disp += w * r2;
+                            store(k, e_mem(mem_address_arm(m2, cur, w), w), "=", v(r2));
+                        }
+                        std::string base = reg_family(cs_reg_name(cs_, op(mi).mem.base));
+                        if (ax.writeback && base != sp_ && !base.empty()) {
+                            int64_t step = ax.post_index ? (mi + 1 < ax.op_count && op(mi + 1).type == ARM64_OP_IMM ? op(mi + 1).imm : 0)
+                                                         : op(mi).mem.disp;
+                            assign(k, base, fold(e_bin("+", reg_read(cur, base), e_num((uint64_t)step, true))));
+                        }
+                    } else if (arm_is_call(id)) {
+                        auto ce = std::make_shared<expr>();
+                        ce->kind = expr::k::call;
+                        std::string pname;
+                        uint64_t pref = 0;
+                        const prototype* pr = call_proto(insn, &pname, &pref);
+                        if (!pname.empty()) {
+                            ce->text = pname;
+                            ce->ref = pref;
+                        } else {
+                            // blr x16: an import's slot (or a got slot) it was loaded from names it
+                            ep t = v(0);
+                            uint64_t slot = t->kind == expr::k::mem && t->kids[0]->kind == expr::k::un && t->kids[0]->text == "&" &&
+                                            t->kids[0]->kids[0]->kind == expr::k::sym ? t->kids[0]->kids[0]->ref : 0;
+                            uint64_t via = 0;
+                            if (slot && db_.an.slot_import.count(slot)) {
+                                ce->text = db_.call_name(slot);
+                                ce->ref = slot;
+                                pr = known_prototype(db_.name_at(slot));
+                            } else if (slot && got_target(db_.bin, db_.an, slot, via)) {
+                                ce->text = callee_text(via);
+                                ce->ref = via;
+                                pr = db_.callee_proto(via);
+                            } else {
+                                ce->indirect = true;
+                                ce->kids.push_back(t);
+                            }
+                        }
+                        int known = pr && !pr->variadic ? (int)pr->params.size() : rw[k].target ? callee_of(rw[k].target).arity : -1;
+                        for (size_t i = 0; i < arg_bits.size(); i++) {
+                            if (known >= 0 ? (int)i >= known : !(argset & arg_bits[i]))
+                                break;
+                            ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
+                        }
+                        ep call = ce;
+                        barrier(k, {&call});
+                        uint32_t clob = rw[k].wr & scratch;
+                        if ((live_after[k] & 1u) && (clob & 1u)) {
+                            cur[ret_] = call; // the result is used: "x0 = f(...);"
+                            born[ret_] = k;
+                            settle(k, {ret_}, {}, {});
+                        } else {
+                            line(a, print(call) + ";");
+                            if (clob & 1u)
+                                cur.erase(ret_);
+                        }
+                        for (auto it = cur.begin(); it != cur.end();) {
+                            bool gone = (bit(it->first) & clob) && it->first != ret_;
+                            it = gone ? cur.erase(it) : std::next(it);
+                        }
+                        argset &= ~clob;
+                        fs = {};
+                        fs_set = true;
+                    } else if (arm_is_br(id)) {
+                        // the block's end, below
+                    } else if (rw[k].wr & ~bit(sp_)) {
+                        opaque(k, insn);
+                    } else if (mi >= 0) {
+                        barrier(k, {}); // a vector store and the like: memory changed
+                    }
+                    break;
+                }
+                if (last) {
+                    ir.fall = ir.end;
+                    if (arm_is_ret(id)) {
+                        ir.term = term_kind::ret;
+                        if (returns_value)
+                            ir.cond = reg_read(cur, ret_);
+                    } else if (id == ARM64_INS_B && ax.op_count >= 1 && ax.operands[0].type == ARM64_OP_IMM) {
+                        uint64_t t = (uint64_t)ax.operands[0].imm;
+                        bool ok = false;
+                        if (arm_conditional(ax)) {
+                            ir.term = term_kind::cond;
+                            ir.cond = cond(ok);
+                            ir.taken = t;
+                        } else if (block_of.count(t)) {
+                            ir.term = term_kind::jump;
+                            ir.fall = t;
+                        } else { // to another function: a tail call
+                            auto ce = std::make_shared<expr>();
+                            ce->kind = expr::k::call;
+                            ce->text = callee_text(t);
+                            ce->ref = t;
+                            int known = callee_of(t).arity;
+                            for (size_t i = 0; i < arg_bits.size(); i++) {
+                                if (known >= 0 ? (int)i >= known : !(argset & arg_bits[i]))
+                                    break;
+                                ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
+                            }
+                            ir.term = term_kind::indirect;
+                            ir.cond = ce;
+                        }
+                    } else if ((id == ARM64_INS_CBZ || id == ARM64_INS_CBNZ) && ax.op_count >= 2) {
+                        ir.term = term_kind::cond;
+                        ir.cond = e_bin(id == ARM64_INS_CBZ ? "==" : "!=", v(0), e_num(0));
+                        ir.taken = (uint64_t)op(1).imm;
+                    } else if ((id == ARM64_INS_TBZ || id == ARM64_INS_TBNZ) && ax.op_count >= 3) {
+                        // one bit: the sign bit is x < 0
+                        uint64_t n = (uint64_t)op(1).imm;
+                        ep xv = v(0);
+                        bool nz = id == ARM64_INS_TBNZ;
+                        if (n == (bits32 ? 31u : 63u))
+                            ir.cond = e_bin(nz ? "<" : ">=", bits32 ? e_un("(int)", xv) : xv, e_num(0));
+                        else
+                            ir.cond = e_bin(nz ? "!=" : "==", e_bin("&", xv, e_num(1ull << (n & 63))), e_num(0));
+                        ir.term = term_kind::cond;
+                        ir.taken = (uint64_t)op(2).imm;
+                    } else if (arm_is_br(id)) {
+                        auto t = db_.an.tables.find(a);
+                        if (t != db_.an.tables.end()) {
+                            ir.term = term_kind::sw;
+                            ir.table = &t->second;
+                            std::string f = t->second.index_reg ? reg_family(cs_reg_name(cs_, t->second.index_reg)) : std::string();
+                            ir.cond = !f.empty() ? reg_read(cur, f) : v(0);
+                        } else { // br x16: a tail call through a register
+                            auto ce = std::make_shared<expr>();
+                            ce->kind = expr::k::call;
+                            ce->indirect = true;
+                            ce->kids.push_back(v(0));
+                            for (size_t i = 0; i < arg_bits.size() && (argset & arg_bits[i]); i++)
+                                ce->kids.push_back(reg_read(cur, fam_name(low_bit(arg_bits[i]))));
+                            ir.term = term_kind::indirect;
+                            ir.cond = ce;
+                        }
+                    } else if ((arm_is_call(id) && db_.an.noret_calls.count(a)) || id == ARM64_INS_BRK ||
+                               id == ARM64_INS_UDF || id == ARM64_INS_HLT) {
+                        ir.term = term_kind::noreturn;
+                    }
+                }
+            } else
             switch (id) {
             case X86_INS_PUSH:
                 if (is_arg[k] && x.op_count >= 1 && cur_sp_known_)
@@ -2532,8 +4316,9 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 fs = {};
             if (!rw[k].call)
                 argset |= rw[k].wr & arg_mask;
+            vzero = (vzero & ~rw[k].vwr) | (rw[k].vzero >= 0 ? 1u << rw[k].vzero : 0u);
 
-            if (last) {
+            if (last && !arm_) {
                 if (cs_insn_group(cs_, insn, X86_GRP_RET)) {
                     ir.term = term_kind::ret;
                     if (returns_value)
@@ -2620,6 +4405,9 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             for (auto& kv : cur) {
                 if (!pending(kv.first))
                     continue;
+                auto kn = known.find(kv.first);
+                if (kn != known.end() && kn->second == kv.second.get() && (ir.live_in & bit(kv.first)))
+                    continue; // a known address the variable holds already
                 if (ir.live_out & bit(kv.first))
                     todo.push_back({kv.first, kv.second});
                 else
@@ -2628,9 +4416,15 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             std::vector<ep*> readers;
             if (ir.cond)
                 readers.push_back(&ir.cond);
+            if (flags_out[bi])
+                for (ep* f : {&fs.a, &fs.b, &fs.res, &fs.pre})
+                    if (*f)
+                        readers.push_back(f);
             if (!todo.empty())
                 emit_batch(ni ? cb.insns.back() : cb.start, todo, readers, spare);
         }
+        if (flags_out[bi])
+            fs_end[bi] = fs;
     }
 
     // switch variable: prefer the operand of the guarding "cmp idx, n / ja default"
@@ -2647,7 +4441,8 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
             ep c = pb.cond;
             if (c->kind == expr::k::bin && !c->kids.empty()) {
                 ep lhs = c->kids[0];
-                if (lhs->kind == expr::k::un && lhs->text == "(unsigned)" && !lhs->kids.empty())
+                if (lhs->kind == expr::k::un && (lhs->text == "(unsigned)" || lhs->text == "(unsigned long long)") &&
+                    !lhs->kids.empty())
                     lhs = lhs->kids[0];
                 sw.cond = lhs;
                 break;
@@ -2657,10 +4452,15 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
 
     // a switch block computes the table jump's target: assignments that nothing after them
     // reads are that computation, not worth showing
-    for (block_ir& sw : out) {
+    for (size_t bi = 0; bi < nb; bi++) {
+        block_ir& sw = out[bi];
         if (sw.term != term_kind::sw)
             continue;
         std::string rest = sw.cond ? print(sw.cond) : std::string();
+        if (flags_out[bi]) // a case tests the flags this block left
+            for (const ep& f : {fs_end[bi].a, fs_end[bi].b, fs_end[bi].res, fs_end[bi].pre})
+                if (f)
+                    rest += " " + print(f);
         for (size_t i = sw.stmts.size(); i-- > 0;) {
             const std::string& t = sw.stmts[i].text;
             size_t eq = t.find(" = ");
@@ -3404,17 +5204,19 @@ decompiled decompile(database& db, uint64_t func_start)
         return r;
     }
 
-    if (!db.bin.is_x86()) {
-        r.error = util::fmt("the decompiler reads x86 and x64 code; this is %s (the listing and graph work)",
-            arch_name(db.bin.arch));
-        return r;
-    }
+    const bool arm = db.bin.arch == bin_arch::arm64;
     csh cs = 0;
-    if (cs_open(CS_ARCH_X86, db.bin.is64() ? CS_MODE_64 : CS_MODE_32, &cs) != CS_ERR_OK) {
+    if (cs_open(arm ? CS_ARCH_ARM64 : CS_ARCH_X86, arm ? CS_MODE_ARM : db.bin.is64() ? CS_MODE_64 : CS_MODE_32, &cs) !=
+        CS_ERR_OK) {
         r.error = "capstone failed to open";
         return r;
     }
     cs_option(cs, CS_OPT_DETAIL, CS_OPT_ON);
+    struct arch_guard {
+        bool was = g_arm;
+        explicit arch_guard(bool a) { g_arm = a; }
+        ~arch_guard() { g_arm = was; }
+    } arch(arm);
 
     // ---- your names and types (db.lvars) and your prototype (db.protos) go over the
     // decompiler's own; the types also decide how memory reads print (p->next)
@@ -3437,11 +5239,14 @@ decompiled decompile(database& db, uint64_t func_start)
     int nregs = 0;
     while (arg_reg_at(nregs, is64, db.bin.format))
         nregs++;
-    int64_t stack_from = !is64 ? ptr : ptr + (db.bin.format == bin_format::pe ? 0x20 : 0);
+    // where the stack arguments start, from the stack pointer at the entry; arg_0 is the first
+    // (x86 has the return address below them, arm64 keeps it in x30)
+    int64_t stack_from = arm ? 0 : !is64 ? ptr : ptr + (db.bin.format == bin_format::pe ? 0x20 : 0);
+    const int64_t arg_bias = arm ? 0 : ptr;
     auto param_key = [&](int i) {
         if (i < nregs)
-            return reg_display(arg_reg_at(i, is64, db.bin.format), is64);
-        return util::fmt("arg_%llx", (unsigned long long)(stack_from - ptr + (i - (is64 ? nregs : 0)) * ptr));
+            return arm ? "a" + std::to_string(i) : reg_display(arg_reg_at(i, is64, db.bin.format), is64);
+        return util::fmt("arg_%llx", (unsigned long long)(stack_from - arg_bias + (i - (is64 ? nregs : 0)) * ptr));
     };
 
     type_view tv;
@@ -3520,7 +5325,7 @@ decompiled decompile(database& db, uint64_t func_start)
     int want = proto ? (int)proto->params.size() : -1;
     if (stack_params && max_arg >= 0 && want < 0)
         for (int64_t off = stack_from; off <= max_arg; off += ptr)
-            pkeys.push_back(lf.frame.count(off) ? lf.frame[off].name : util::fmt("arg_%llx", (unsigned long long)(off - ptr)));
+            pkeys.push_back(lf.frame.count(off) ? lf.frame[off].name : util::fmt("arg_%llx", (unsigned long long)(off - arg_bias)));
     if (want >= 0) { // the prototype says how many
         pkeys.resize(std::min<size_t>(pkeys.size(), (size_t)want));
         for (int i = (int)pkeys.size(); i < want; i++)
