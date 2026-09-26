@@ -139,5 +139,7 @@ bool read_dwarf_ptr(const binary& b, uint64_t& p, uint8_t enc, uint64_t& out);
 // one function's lsda (its exception table: the calls that can throw and where the unwinder goes
 // for each): the landing pads go into b.landing_pads. func is the start the pads are offsets from
 void read_lsda(binary& b, uint64_t func, uint64_t lsda);
+// a go program: every function's name from its pclntab (stripped ones keep it), as symbols
+void read_go_functions(binary& b);
 
 }

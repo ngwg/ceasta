@@ -151,6 +151,23 @@ bool is_noreturn_name(const std::string& name)
         "_ZSt17__throw_bad_allocv", "_ZSt20__throw_length_errorPKc", "_ZSt19__throw_logic_errorPKc",
         "_ZSt20__throw_out_of_rangePKc", "_ZSt24__throw_out_of_range_fmtPKcz",
         "_ZSt25__throw_bad_function_callv",
+        // go
+        "runtime.gopanic", "runtime.throw", "runtime.fatal", "runtime.fatalthrow", "runtime.fatalpanic",
+        "runtime.panicIndex", "runtime.panicIndexU", "runtime.panicSliceAlen", "runtime.panicSliceAlenU",
+        "runtime.panicSliceAcap", "runtime.panicSliceAcapU", "runtime.panicSliceB", "runtime.panicSliceBU",
+        "runtime.panicSlice3Alen", "runtime.panicSlice3AlenU", "runtime.panicSlice3Acap", "runtime.panicSlice3AcapU",
+        "runtime.panicSlice3B", "runtime.panicSlice3BU", "runtime.panicSlice3C", "runtime.panicSlice3CU",
+        "runtime.panicSliceConvert", "runtime.goPanicIndex", "runtime.goPanicIndexU", "runtime.goPanicSliceAlen",
+        "runtime.goPanicSliceAlenU", "runtime.goPanicSliceAcap", "runtime.goPanicSliceAcapU", "runtime.goPanicSliceB",
+        "runtime.goPanicSliceBU", "runtime.goPanicSlice3Alen", "runtime.goPanicSlice3AlenU", "runtime.goPanicSlice3Acap",
+        "runtime.goPanicSlice3AcapU", "runtime.goPanicSlice3B", "runtime.goPanicSlice3BU", "runtime.goPanicSlice3C",
+        "runtime.goPanicSlice3CU", "runtime.goPanicSliceConvert", "runtime.panicdivide", "runtime.panicoverflow",
+        "runtime.panicfloat", "runtime.panicmem", "runtime.panicmemAddr", "runtime.panicwrap", "runtime.panicshift",
+        "runtime.panicdottypeE", "runtime.panicdottypeI", "runtime.panicnildottype", "runtime.panicunsafeslicelen",
+        "runtime.panicunsafeslicenilptr", "runtime.panicunsafestringlen", "runtime.panicunsafestringnilptr",
+        "runtime.panicrangestate", "runtime.sigpanic", "runtime.Goexit", "runtime.goexit1", "runtime.exit",
+        "runtime.abort", "runtime.badmorestackg0", "runtime.badmorestackgsignal", "runtime.badctxt", "os.Exit", "syscall.Exit", "log.Fatal", "log.Fatalf", "log.Fatalln", "log.Panic",
+        "log.Panicf", "log.Panicln",
     };
     for (const char* n : names)
         if (name == n)
@@ -617,6 +634,24 @@ struct worker {
 
         if (j.has_mem_op && j.mem_base == 0 && j.mem_index != 0 && j.mem_scale == ps) {
             table = (uint64_t)j.mem_disp & mask;
+            es = (uint32_t)ps;
+            mode = 1;
+            idx = j.mem_index;
+        } else if (j.has_mem_op && j.mem_base != 0 && j.mem_base != regs::rip() && j.mem_index != 0 && j.mem_scale == ps) {
+            // lea rcx, [table] / jmp [rcx + rdx*8] (go)
+            bool found = false;
+            for (int i = nh - 1; i >= 0 && i >= nh - 6 && !found; i--) {
+                const insn& h = hist[i];
+                if (regs::same_reg(h.reg0, j.mem_base)) {
+                    if (!(h.is_lea && h.has_mem && h.mem_rip))
+                        return;
+                    basev = h.mem;
+                    found = true;
+                }
+            }
+            if (!found && !(late && nh > 0 && reaching_lea(hist[0].addr, j.mem_base, basev)))
+                return;
+            table = (basev + (uint64_t)j.mem_disp) & mask;
             es = (uint32_t)ps;
             mode = 1;
             idx = j.mem_index;

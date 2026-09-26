@@ -56,6 +56,7 @@
     <ClCompile Include="..\src\core\diff.cpp" />
     <ClCompile Include="..\src\core\disasm.cpp" />
     <ClCompile Include="..\src\core\elf.cpp" />
+    <ClCompile Include="..\src\core\golang.cpp" />
     <ClCompile Include="..\src\core\exchange.cpp" />
     <ClCompile Include="..\src\core\kuna.cpp" />
     <ClCompile Include="..\src\core\process.cpp" />

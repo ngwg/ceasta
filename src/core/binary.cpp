@@ -311,6 +311,7 @@ bool from_bytes(std::vector<uint8_t> bytes, const std::string& path, binary& out
         err = "file has no loadable sections";
         return false;
     }
+    read_go_functions(out);
     return true;
 }
 
