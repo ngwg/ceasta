@@ -848,6 +848,215 @@ void read_landing_pads(ctx& c)
     b.landing_pads.erase(std::unique(b.landing_pads.begin(), b.landing_pads.end()), b.landing_pads.end());
 }
 
+// ---- objective-c: method names from the runtime's metadata, stripped files too ----
+//
+//   -[NSString(MyAdditions) trimmed]    +[AppDelegate shared]    selRef_count
+//
+// each class in __objc_classlist points at its class_ro_t (name, instance methods, instance
+// variables), its metaclass at one with the class methods. categories (__objc_catlist) add
+// methods to a class, often another file's: then the pointer to it is bound to
+// _OBJC_CLASS_$_Name. selector and class references and the variables holding where each
+// instance variable is get names too, so the code reads: mov rsi, [selRef_count]
+
+// a class's runtime name, readable: swift's _TtC5MyApp11AppDelegate is MyApp.AppDelegate
+std::string objc_class_name(const std::string& n)
+{
+    if (n.compare(0, 4, "_TtC") != 0)
+        return n;
+    size_t i = 3;
+    while (i < n.size() && n[i] == 'C')
+        i++;
+    std::string out;
+    if (i < n.size() && n[i] == 's') { // the Swift module
+        out = "Swift";
+        i++;
+    }
+    while (i < n.size()) {
+        size_t len = 0, d = i;
+        while (d < n.size() && n[d] >= '0' && n[d] <= '9' && len < 4096)
+            len = len * 10 + (size_t)(n[d++] - '0');
+        if (d == i || len == 0 || len > n.size() - d)
+            return n;
+        out += (out.empty() ? "" : ".") + n.substr(d, len);
+        i = d + len;
+    }
+    return out.empty() ? n : out;
+}
+
+void read_objc(ctx& c)
+{
+    binary& b = c.b;
+    auto sect = [&](const char* name) -> const msect* {
+        for (const msect& x : c.sects)
+            if (x.name == name && x.size)
+                return &x;
+        return nullptr;
+    };
+    const msect* classes = sect("__objc_classlist");
+    const msect* cats = sect("__objc_catlist");
+    const msect* selrefs = sect("__objc_selrefs");
+    if (!classes && !cats && !selrefs)
+        return;
+    std::unordered_map<uint64_t, std::string> bound; // a pointer bound to an import: which
+    for (const import_entry& im : b.imports)
+        bound.emplace(im.slot, im.name);
+    std::unordered_set<uint64_t> named;
+    for (const symbol_entry& sy : b.symbols)
+        named.insert(sy.addr);
+    for (const export_entry& e : b.exports)
+        named.insert(e.addr);
+    size_t cap = b.symbols.size() + (1u << 20);
+    auto ptr = [&](uint64_t a) {
+        uint64_t v = 0;
+        return a && b.read_u64(a, v) ? v : 0;
+    };
+    auto add = [&](uint64_t a, const std::string& name, bool func) {
+        if (!a || name.empty() || b.symbols.size() >= cap || !named.insert(a).second)
+            return;
+        b.symbols.push_back({name, a, 0, func});
+        if (func)
+            b.func_hints.push_back(a);
+    };
+    // a method_list_t: big entries (name, types and imp pointers) or small ones (32-bit offsets
+    // from each field; the name's goes to a selector reference, which holds the string)
+    auto methods = [&](uint64_t list, char kind, const std::string& owner) {
+        uint32_t flags, count;
+        if (!list || !b.read_u32(list, flags) || !b.read_u32(list + 4, count))
+            return;
+        bool small = (flags & 0x80000000u) != 0;
+        uint32_t es = flags & 0xfffc;
+        if (es < (small ? 12u : 24u) || count > 65536)
+            return;
+        for (uint32_t i = 0; i < count; i++) {
+            uint64_t e = list + 8 + (uint64_t)i * es, sel, imp;
+            if (small) {
+                uint32_t n, m;
+                if (!b.read_u32(e, n) || !b.read_u32(e + 8, m))
+                    return;
+                sel = ptr(e + (uint64_t)(int64_t)(int32_t)n);
+                imp = e + 8 + (uint64_t)(int64_t)(int32_t)m;
+            } else {
+                sel = ptr(e);
+                imp = ptr(e + 16);
+            }
+            std::string name = sel ? b.read_cstr(sel, 1024) : std::string();
+            if (!name.empty() && b.is_code(imp))
+                add(imp, std::string(1, kind) + "[" + owner + " " + name + "]", true);
+        }
+    };
+    // the class_ro_t of a class (the low bits of the pointer are flags)
+    auto ro = [&](uint64_t cls) { return ptr(cls + 32) & 0x00007ffffffffff8ull; };
+    auto import_class = [&](uint64_t slot) {
+        auto it = bound.find(slot);
+        if (it == bound.end())
+            return std::string();
+        const std::string& n = it->second;
+        return n.compare(0, 13, "OBJC_CLASS_$_") == 0 ? objc_class_name(n.substr(13)) : n;
+    };
+    std::unordered_map<uint64_t, std::string> class_name; // class_t -> name
+    auto name_of = [&](uint64_t cls) {
+        auto it = class_name.find(cls);
+        if (it != class_name.end())
+            return it->second;
+        uint64_t r = ro(cls);
+        std::string n = r ? objc_class_name(b.read_cstr(ptr(r + 24), 1024)) : std::string();
+        class_name.emplace(cls, n);
+        return n;
+    };
+    uint64_t n = classes ? std::min<uint64_t>(classes->size / 8, 1u << 20) : 0;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t cls = ptr(classes->addr + i * 8);
+        std::string name = cls ? name_of(cls) : std::string();
+        if (name.empty())
+            continue;
+        methods(ptr(ro(cls) + 32), '-', name);
+        // ivar_list_t: the offset variable, name, type, alignment and size of each
+        uint64_t iv = ptr(ro(cls) + 48);
+        uint32_t ies = 0, icount = 0;
+        if (iv && b.read_u32(iv, ies) && b.read_u32(iv + 4, icount) && ies >= 32 && icount <= 65536)
+            for (uint32_t k = 0; k < icount; k++) {
+                uint64_t e = iv + 8 + (uint64_t)k * ies;
+                std::string var = b.read_cstr(ptr(e + 8), 1024);
+                if (!var.empty())
+                    add(ptr(e), "OBJC_IVAR_$_" + name + "." + var, false);
+            }
+        uint64_t meta = ptr(cls);
+        if (meta)
+            methods(ptr(ro(meta) + 32), '+', name);
+    }
+    n = cats ? std::min<uint64_t>(cats->size / 8, 1u << 20) : 0;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t cat = ptr(cats->addr + i * 8);
+        if (!cat)
+            continue;
+        std::string cname = b.read_cstr(ptr(cat), 1024);
+        uint64_t cls = ptr(cat + 8);
+        std::string owner = import_class(cat + 8);
+        if (owner.empty() && cls)
+            owner = name_of(cls);
+        if (owner.empty())
+            owner = "?";
+        if (!cname.empty())
+            owner += "(" + cname + ")";
+        methods(ptr(cat + 16), '-', owner);
+        methods(ptr(cat + 24), '+', owner);
+    }
+    n = selrefs ? std::min<uint64_t>(selrefs->size / 8, 1u << 20) : 0;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t slot = selrefs->addr + i * 8, sel = ptr(slot);
+        if (sel)
+            add(slot, "selRef_" + b.read_cstr(sel, 1024), false);
+    }
+    // selector stubs (xcode 14 and later): calls go to objc_msgSend$count, a stub that loads
+    // the selector into x1 / rsi and jumps to objc_msgSend
+    const msect* stubs = sect("__objc_stubs");
+    const msect* sr = selrefs;
+    auto selref_name = [&](uint64_t slot) {
+        uint64_t sel = sr && slot >= sr->addr && slot - sr->addr < sr->size ? ptr(slot) : 0;
+        return sel ? b.read_cstr(sel, 1024) : std::string();
+    };
+    if (stubs && sr) {
+        uint64_t end = stubs->addr + std::min<uint64_t>(stubs->size, 64u << 20);
+        if (b.arch == bin_arch::arm64) {
+            for (uint64_t a = (stubs->addr + 3) & ~3ull; a + 8 <= end; a += 4) {
+                uint32_t i1, i2;
+                if (!b.read_u32(a, i1) || (i1 & 0x9f00001f) != 0x90000001 || !b.read_u32(a + 4, i2) ||
+                    (i2 & 0xffc003ff) != 0xf9400021)
+                    continue; // adrp x1, page / ldr x1, [x1, #off]
+                int64_t pages = (int64_t)(((i1 >> 3) & 0x1ffffc) | ((i1 >> 29) & 3));
+                if (pages & 0x100000)
+                    pages -= 0x200000;
+                uint64_t slot = (a & ~0xfffull) + (uint64_t)(pages * 4096) + ((i2 >> 10) & 0xfff) * 8;
+                std::string sel = selref_name(slot);
+                if (!sel.empty())
+                    add(a, "objc_msgSend$" + sel, true);
+            }
+        } else {
+            for (uint64_t a = stubs->addr; a + 7 <= end; a++) {
+                uint8_t op[3];
+                uint32_t d;
+                if (b.read(a, op, 3) != 3 || op[0] != 0x48 || op[1] != 0x8b || op[2] != 0x35 || !b.read_u32(a + 3, d))
+                    continue; // mov rsi, [rip + selref]
+                std::string sel = selref_name(a + 7 + (uint64_t)(int64_t)(int32_t)d);
+                if (!sel.empty())
+                    add(a, "objc_msgSend$" + sel, true);
+            }
+        }
+    }
+    for (const char* refs : {"__objc_classrefs", "__objc_superrefs"}) {
+        const msect* r = sect(refs);
+        n = r ? std::min<uint64_t>(r->size / 8, 1u << 20) : 0;
+        for (uint64_t i = 0; i < n; i++) {
+            uint64_t slot = r->addr + i * 8, cls = ptr(slot);
+            std::string name = import_class(slot);
+            if (name.empty() && cls)
+                name = name_of(cls);
+            if (!name.empty())
+                add(slot, (refs[7] == 'c' ? "classRef_" : "superRef_") + name, false);
+        }
+    }
+}
+
 // a file offset in the slice as an address (LC_MAIN gives the entry point as one)
 bool file_to_addr(const ctx& c, uint64_t off, uint64_t& out)
 {
@@ -1040,6 +1249,7 @@ bool macho(binary& b, std::string& err, const options& o)
     read_function_starts(c);
     read_initializers(c);
     read_landing_pads(c);
+    read_objc(c);
 
     std::sort(b.imports.begin(), b.imports.end(), [](const import_entry& x, const import_entry& y) { return x.slot < y.slot; });
     auto by_addr_name = [](const auto& x, const auto& y) { return x.addr != y.addr ? x.addr < y.addr : x.name < y.name; };

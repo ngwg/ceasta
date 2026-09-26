@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <unordered_set>
 
 namespace {
 
@@ -119,12 +120,20 @@ std::vector<search_hit> search_everything(const database& db, const std::string&
         });
     }
     if (kinds & sk_names) {
-        // renamed data and labels; renamed functions already came up as functions
+        // renamed data and labels, and the file's names for data (selRef_count, a global);
+        // functions already came up as functions
         c.clear();
         std::vector<std::pair<uint64_t, std::string>> src; // as shown (a mangled name demangled)
+        std::unordered_set<uint64_t> seen;
+        auto take = [&](uint64_t at) {
+            if (!(db.an.flags_at(at) & fl_func) && seen.insert(at).second)
+                src.push_back({at, db.name_at(at)});
+        };
         for (const auto& n : db.user_names)
-            if (!(db.an.flags_at(n.first) & fl_func))
-                src.push_back({n.first, db.name_at(n.first)});
+            take(n.first);
+        for (const symbol_entry& sy : db.bin.symbols)
+            if (!sy.func && db.bin.is_mapped(sy.addr))
+                take(sy.addr);
         for (size_t i = 0; i < src.size(); i++) {
             int s = score(src[i].second, needle);
             if (s >= 0)

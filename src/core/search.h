@@ -20,7 +20,7 @@ struct search_hit {
 // which kinds to look in
 enum : unsigned {
     sk_functions = 1u << 0,
-    sk_names = 1u << 1,     // renamed items that aren't function starts
+    sk_names = 1u << 1,     // named items that aren't function starts (renamed, or the file's data symbols)
     sk_imports = 1u << 2,
     sk_exports = 1u << 3,
     sk_strings = 1u << 4,
