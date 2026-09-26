@@ -1,5 +1,34 @@
 # changelog
 
+## v0.13.0 - 2026-09-26
+
+- **readable names**: c++ symbols are demangled - gcc / clang (`_ZNSt6vector...`) and msvc
+  (`?Load@Config@@...`) - and so are rust's (legacy and v0). the listing shows a function with
+  its parameters, so overloads stay apart; pseudocode calls it by name
+  (`std::vector<int>::push_back(...)`); library types read the way the source spells them:
+  `std::string`, `std::vector<int>`, `std::map<int, char>`. the mangled name still finds it. the
+  names are what llvm-cxxfilt, llvm-undname and rustc-demangle print (checked on 190,000 of
+  them)
+- **objective-c**: method names from a mac program's own metadata, stripped or not -
+  `-[NSString(MyAdditions) trimmed]`, `+[AppDelegate shared]`. selector stubs are
+  `objc_msgSend$alloc`, and selector and class references and instance variables get names
+  (`mov rsi, [selRef_count]`). swift classes go by their swift name (`MyApp.AppDelegate`)
+- **go**: every function's name from the go runtime's own table, stripped programs too - go 1.2
+  to today, linux / windows / macos, x86 / x64 / arm64. go's panics and exits are known not to
+  return, and its switch tables are read
+- **analysis**
+  - c++ and rust cleanup code (exception landing pads) in linux programs belongs to its
+    function; it used to show up as hundreds of made-up functions
+  - more switch tables: a table base loaded before a loop, a jump through a register (go), a
+    bound check with other instructions between, and tables with no bound (a rust enum's tag)
+  - rust (and -fno-plt c / c++) calls functions of its own file through the got: those calls
+    go to the function now, and rust's panics are known not to return
+  - on the programs checked, every decoded instruction is where objdump puts it (v0.12 was off
+    in 45 to 5,583 places per program), with thousands fewer bogus `sub_` functions
+- pseudocode calls an import by its name: `memcmp(...)`, not `j_memcmp(...)`
+- signatures keep the mangled name, so a stripped program gets the readable one back
+- search finds a file's data names too (`selRef_init`, a global), not only the ones you renamed
+
 ## v0.12.0 - 2026-09-25
 
 - **macos**: `ceasta-x.y.z-macos.dmg` (the app) and `ceasta-cli-x.y.z-macos.tar.gz`, one build

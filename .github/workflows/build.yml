@@ -31,6 +31,23 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
 
+      - name: try the names (c++, go)
+        run: |
+          cli=build/ceasta-cli
+          # c++: libstdc++'s functions demangled, the library's types spelled short
+          $cli funcs /usr/lib/x86_64-linux-gnu/libstdc++.so.6 > cxx.txt
+          grep -m5 'std::string::' cxx.txt
+          grep -q 'std::string::append(char const\*)' cxx.txt
+          test "$(grep -c 'std::' cxx.txt)" -gt 1000
+          # go: a stripped program still has its functions' names
+          mkdir gotest && cd gotest
+          printf 'package main\n\nimport "fmt"\n\n//go:noinline\nfunc triple(n int) int { return n * 3 }\n\nfunc main() { fmt.Println(triple(14)) }\n' > main.go
+          go mod init example.com/gotest
+          go build -ldflags="-s -w" -o hello .
+          ../$cli info hello | grep 'go program'
+          ../$cli funcs hello | grep -E ' (main\.triple|main\.main)$'
+          test "$(../$cli funcs hello | grep -c -E ' (main\.triple|main\.main)$')" -eq 2
+
       - name: package the command line tool
         run: |
           version=$(sed -n 's/^#define CEASTA_VERSION "\(.*\)"/\1/p' src/version.h)
@@ -106,6 +123,17 @@ jobs:
           cmake --build build --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: try the names (msvc c++)
+        run: |
+          $cli = if (Test-Path build\Release\ceasta-cli.exe) { "build\Release\ceasta-cli.exe" } else { "build\ceasta-cli.exe" }
+          # the visual c++ runtime's exports: msvc names, demangled
+          $out = & $cli funcs C:\Windows\System32\msvcp140.dll
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $cpp = @($out | Select-String -SimpleMatch "std::")
+          "$($cpp.Count) c++ names, like:"
+          $cpp | Select-Object -First 5
+          if ($cpp.Count -lt 100) { exit 1 }
+
       - uses: microsoft/setup-msbuild@v2
 
       - name: the visual studio solution builds too
@@ -176,6 +204,17 @@ jobs:
           entry=$($cli info /bin/ls | awk '$1 == "entry" { print $2 }')
           $cli decompile /bin/ls "$entry" | head -30
           $cli info /usr/bin/curl | grep -E '^(format|signed|security|entitlements)'
+          # objective-c: a system app's methods, from its metadata (apple's apps are stripped)
+          found=
+          for app in TextEdit Preview Calculator Chess; do
+            f=/System/Applications/$app.app/Contents/MacOS/$app
+            [ -f "$f" ] || continue
+            n=$($cli funcs "$f" | grep -c -- '-\[' || true)
+            echo "$app: $n objective-c methods"
+            $cli funcs "$f" | grep -- '-\[' | head -5
+            if [ "$n" -gt 20 ]; then found=1; break; fi
+          done
+          test -n "$found"
 
       - name: package (the app in a dmg, the cli in a tarball)
         run: |

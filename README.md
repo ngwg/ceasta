@@ -79,7 +79,8 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 ## what it does
 
 - opens pe files (exe, dll, sys — x86, x64 and arm64), elf (x86, x64, arm64), mach-o (macos / ios programs and libraries, x86_64 and arm64, universal files too) and raw code
-- auto analysis: functions (entry, exports, symbols, .pdata, unwind tables, mach-o function starts, tls callbacks, calls, pointers in data), switch tables, xrefs, strings (ascii + utf-16), imports / exports, thunks, noreturn calls
+- auto analysis: functions (entry, exports, symbols, .pdata, unwind tables, mach-o function starts, go's function table, tls callbacks, calls, pointers in data), switch tables, exception cleanup code, xrefs, strings (ascii + utf-16), imports / exports, thunks, noreturn calls
+- readable names, stripped files too: c++ (gcc / clang and msvc) and rust names demangled, with the library's types spelled short (`std::map<std::string, int>::find(std::string const&)`, not `_ZNSt3mapINSt7__cxx11...`); objective-c methods from a mac program's metadata (`-[AppDelegate applicationDidFinishLaunching:]`, `objc_msgSend$alloc`); go functions from the go runtime's own table (`main.(*Cart).Add`)
 - ida-style listing: names instead of addresses, labels, xref and string comments, the arguments each instruction passes to a known api
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
 - decompiler (f5, x86 / x64): c-like pseudocode — if / else, loops, switch, stack variables, calls with their arguments (~350 known api prototypes). click a name: `n` renames it, `y` sets a type or a prototype. shift+f5 shows it next to the listing
