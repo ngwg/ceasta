@@ -524,6 +524,7 @@ private:
     bool slot_of(const x86_op_mem& m, int64_t& off) const;
     // what a call goes to by name, and the prototype that says what it takes (null: unknown)
     const prototype* call_proto(cs_insn* call, std::string* name = nullptr, uint64_t* ref = nullptr);
+    std::string callee_text(uint64_t t);
     int stack_args_of(cs_insn* call); // how many stack arguments a call takes, -1 unknown
 
     std::string disp(const std::string& fam) { return reg_display(fam, is64_); }
@@ -781,6 +782,16 @@ std::string lifter::frame_var(int64_t off, int width)
     return s.name;
 }
 
+// how a call to t is written. an import's stub (the plt) as a call to the import, the way the
+// source has it: memcmp(...), not j_memcmp(...)
+std::string lifter::callee_text(uint64_t t)
+{
+    auto ti = db_.an.thunk_import.find(t);
+    std::string n = ti != db_.an.thunk_import.end() && !db_.user_names.count(t)
+        ? db_.call_name(db_.bin.imports[ti->second].slot) : db_.call_name(t);
+    return n.empty() ? db_.location(t) : n;
+}
+
 const prototype* lifter::call_proto(cs_insn* in, std::string* name, uint64_t* ref)
 {
     const cs_x86& x = in->detail->x86;
@@ -791,10 +802,8 @@ const prototype* lifter::call_proto(cs_insn* in, std::string* name, uint64_t* re
         uint64_t t = (uint64_t)op.imm;
         if (ref)
             *ref = t;
-        if (name) {
-            std::string n = db_.name_at(t);
-            *name = n.empty() ? db_.location(t) : n;
-        }
+        if (name)
+            *name = callee_text(t);
         return db_.callee_proto(t);
     }
     // call [slot]: through an import's slot (the iat or the got), which has the import's name
@@ -808,8 +817,19 @@ const prototype* lifter::call_proto(cs_insn* in, std::string* name, uint64_t* re
             if (ref)
                 *ref = slot;
             if (name)
-                *name = n;
+                *name = db_.call_name(slot);
             return known_prototype(n);
+        }
+        // call [got slot]: a function of this file, called the way rust and -fno-plt code do
+        uint64_t via;
+        if (got_target(db_.bin, db_.an, slot, via)) {
+            if (ref)
+                *ref = via;
+            if (name) {
+                std::string cn = db_.call_name(via);
+                *name = cn.empty() ? db_.location(via) : cn;
+            }
+            return db_.callee_proto(via);
         }
     }
     return nullptr;
@@ -1982,8 +2002,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                 const prototype* pr = call_proto(insn, &pname, &pref);
                 if (x.op_count >= 1 && x.operands[0].type == X86_OP_IMM) {
                     uint64_t target = (uint64_t)x.operands[0].imm;
-                    std::string nm = db_.name_at(target);
-                    ce->text = nm.empty() ? db_.location(target) : nm;
+                    ce->text = callee_text(target);
                     ce->ref = target;
                 } else if (!pname.empty()) {
                     ce->text = pname; // call [CreateFileW]: the import, by name
@@ -2092,8 +2111,7 @@ bool lifter::run(uint64_t func_start, std::vector<block_ir>& out, std::vector<st
                         uint64_t t = (uint64_t)x.operands[0].imm;
                         auto ce = std::make_shared<expr>();
                         ce->kind = expr::k::call;
-                        std::string nm = db_.name_at(t);
-                        ce->text = nm.empty() ? db_.location(t) : nm;
+                        ce->text = callee_text(t);
                         ce->ref = t;
                         int known = callee_of(t).arity;
                         for (size_t i = 0; i < arg_bits.size(); i++) {
@@ -2938,11 +2956,14 @@ decompiled decompile(database& db, uint64_t func_start)
     const function* fn = db.an.func_containing(func_start);
     uint64_t start = fn ? fn->start : func_start;
     r.func = start;
-    r.name = db.location(start);
+    // written like a call: a demangled c++ name without its parameters (the header adds them)
+    r.name = db.call_name(start);
+    if (r.name.empty())
+        r.name = db.location(start);
 
     if (fn && fn->thunk) {
         r.ok = true;
-        std::string tn = db.name_at(fn->thunk_target);
+        std::string tn = db.call_name(fn->thunk_target);
         if (tn.empty())
             tn = db.location(fn->thunk_target);
         r.lines.push_back({0, r.name + ": thunk to " + tn, start});

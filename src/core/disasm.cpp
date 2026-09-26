@@ -41,6 +41,25 @@ bool disassembler::open(bin_arch arch)
     return true;
 }
 
+bool disassembler::writes_reg(const insn& in, unsigned reg)
+{
+    if (!handle_ || arch_ == bin_arch::arm64)
+        return true;
+    const uint8_t* code = in.bytes;
+    size_t size = in.size;
+    uint64_t a = in.addr;
+    cs_insn* ci = (cs_insn*)scratch_;
+    cs_regs rd, wr;
+    uint8_t nrd = 0, nwr = 0;
+    if (!cs_disasm_iter((csh)handle_, &code, &size, &a, ci) ||
+        cs_regs_access((csh)handle_, ci, rd, &nrd, wr, &nwr) != CS_ERR_OK)
+        return true;
+    for (uint8_t i = 0; i < nwr; i++)
+        if (regs::same_reg(wr[i], reg))
+            return true;
+    return false;
+}
+
 const char* disassembler::reg_name(unsigned reg) const
 {
     const char* n = handle_ ? cs_reg_name((csh)handle_, reg) : nullptr;
@@ -381,6 +400,16 @@ static unsigned canon(unsigned r)
 bool same_reg(unsigned a, unsigned b)
 {
     return a != X86_REG_INVALID && canon(a) == canon(b);
+}
+
+bool kept_by_calls(unsigned r)
+{
+    switch (canon(r)) {
+    case X86_REG_RBX: case X86_REG_RBP: case X86_REG_R12: case X86_REG_R13: case X86_REG_R14: case X86_REG_R15:
+        return true;
+    default:
+        return false;
+    }
 }
 
 int a64_num(unsigned r)

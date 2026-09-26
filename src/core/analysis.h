@@ -127,3 +127,8 @@ struct cfg {
 bool build_cfg(const binary& b, const analysis& a, uint64_t func_start, cfg& out, size_t max_blocks = 1500);
 
 bool is_noreturn_name(const std::string& name);
+
+// a slot of the got (.got, __got, __auth_got) that holds the address of code in the file, not an
+// import: rust and -fno-plt code call other crates' functions through these (call [rip + slot]).
+// v is the function it points at
+bool got_target(const binary& b, const analysis& an, uint64_t slot, uint64_t& v);

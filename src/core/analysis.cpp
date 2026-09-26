@@ -1,4 +1,5 @@
 #include "core/analysis.h"
+#include "core/demangle.h"
 #include "core/disasm.h"
 #include "core/util.h"
 #include <algorithm>
@@ -125,6 +126,16 @@ int cfg::block_of(uint64_t a) const
     return -1;
 }
 
+bool got_target(const binary& b, const analysis& an, uint64_t slot, uint64_t& v)
+{
+    const segment* s = b.seg_at(slot);
+    if (!s || !(s->name.compare(0, 4, ".got") == 0 || s->name == "__got" || s->name == "__auth_got"))
+        return false;
+    if (an.slot_import.count(slot) || !b.read_ptr(slot, v) || !v)
+        return false;
+    return b.is_code(v);
+}
+
 bool is_noreturn_name(const std::string& name)
 {
     static const char* const names[] = {
@@ -144,7 +155,60 @@ bool is_noreturn_name(const std::string& name)
     for (const char* n : names)
         if (name == n)
             return true;
-    return false;
+    if (!demangle::is_mangled(name))
+        return false;
+    // c++ and rust functions that throw, panic or abort, by their demangled name (without
+    // libc++'s inline namespace: std::__1::__throw_length_error is std::__throw_length_error).
+    // generic arguments don't matter (core::panicking::assert_failed::<i32, i32>)
+    std::string d = demangle::name(name);
+    if (d.empty())
+        return false;
+    if (d.back() == '>') {
+        int depth = 0;
+        size_t k = d.size();
+        while (k > 0) {
+            char c = d[--k];
+            if (c == '>')
+                depth++;
+            else if (c == '<' && --depth == 0)
+                break;
+        }
+        d.erase(k >= 2 && d.compare(k - 2, 2, "::") == 0 ? k - 2 : k);
+    }
+    static const char* const qualified[] = {
+        "std::terminate", "std::abort", "std::exit", "std::_Exit", "std::quick_exit", "std::rethrow_exception",
+        "std::__throw_bad_alloc", "std::__throw_bad_array_new_length", "std::__throw_length_error",
+        "std::__throw_logic_error", "std::__throw_out_of_range", "std::__throw_out_of_range_fmt",
+        "std::__throw_invalid_argument", "std::__throw_domain_error", "std::__throw_runtime_error",
+        "std::__throw_range_error", "std::__throw_overflow_error", "std::__throw_underflow_error",
+        "std::__throw_system_error", "std::__throw_bad_cast", "std::__throw_bad_typeid",
+        "std::__throw_bad_function_call", "std::__throw_bad_optional_access", "std::__throw_bad_variant_access",
+        "std::__throw_future_error", "std::__throw_regex_error", "std::__throw_ios_failure",
+        "std::__libcpp_verbose_abort", "std::_Xlength_error", "std::_Xout_of_range", "std::_Xbad_alloc",
+        "std::_Xinvalid_argument", "std::_Xruntime_error", "std::_Xoverflow_error", "std::_Xbad_function_call",
+        "std::_Xregex_error", "std::_Throw_bad_array_new_length", "std::_Throw_C_error", "std::_Throw_Cpp_error",
+        "std::_Throw_range_error", "std::_Throw_bad_optional_access", "std::_Throw_bad_variant_access",
+        "core::panicking::panic", "core::panicking::panic_fmt", "core::panicking::panic_nounwind",
+        "core::panicking::panic_nounwind_fmt", "core::panicking::panic_nounwind_nobacktrace",
+        "core::panicking::panic_bounds_check", "core::panicking::panic_explicit", "core::panicking::panic_display",
+        "core::panicking::panic_str", "core::panicking::panic_str_2015", "core::panicking::panic_in_cleanup",
+        "core::panicking::panic_cannot_unwind", "core::panicking::panic_misaligned_pointer_dereference",
+        "core::panicking::panic_null_pointer_dereference", "core::panicking::assert_failed",
+        "core::panicking::assert_failed_inner", "core::panicking::unreachable_display",
+        "core::result::unwrap_failed", "core::option::unwrap_failed", "core::option::expect_failed",
+        "core::cell::panic_already_borrowed", "core::cell::panic_already_mutably_borrowed",
+        "core::slice::index::slice_start_index_len_fail", "core::slice::index::slice_end_index_len_fail",
+        "core::slice::index::slice_index_order_fail", "core::slice::index::slice_end_index_overflow_fail",
+        "core::str::slice_error_fail", "core::str::slice_error_fail_rt", "alloc::alloc::handle_alloc_error",
+        "alloc::raw_vec::capacity_overflow", "alloc::raw_vec::handle_error", "std::process::exit",
+        "std::process::abort", "std::panicking::begin_panic", "std::panicking::begin_panic_handler",
+        "std::panicking::rust_panic_with_hook", "std::panicking::rust_panic", "std::sys::pal::unix::abort_internal",
+        "std::alloc::rust_oom", "std::alloc::default_alloc_error_hook",
+    };
+    for (const char* q : qualified)
+        if (d == q)
+            return true;
+    return d.compare(0, 30, "core::panicking::panic_const::") == 0;
 }
 
 // ---- the analysis pass ----
@@ -170,9 +234,14 @@ struct worker {
     std::vector<uint64_t> orphans;
     std::vector<uint64_t> work;
     std::vector<uint64_t> deferred;               // code pointers seen in operands
+    std::vector<uint64_t> table_retry;            // x86 jmp reg that wasn't a switch (yet)
+    std::unordered_set<uint64_t> data_refs;       // for retry_tables: addresses code points at
+    std::vector<std::pair<uint64_t, uint64_t>> jumps_to; // and the jumps, (to, from), sorted
+    std::vector<uint64_t> lea_refs;               // x64: what every "lea reg, [rip+x]" byte pattern points at, sorted
     std::vector<xref> xrefs;
     std::unordered_map<uint64_t, uint8_t> data_cand;
     std::unordered_map<uint64_t, std::string> sym_names;
+    std::unordered_map<std::string, bool> noret_cache; // callee name -> never returns
     std::unordered_map<uint64_t, int> thunk_cache;
     const segment* got = nullptr;                 // .got.plt for 32 bit pic plt stubs
     uint64_t mask = 0;
@@ -461,6 +530,18 @@ struct worker {
         return r;
     }
 
+    bool noreturn(const std::string& name)
+    {
+        if (name.empty())
+            return false;
+        auto it = noret_cache.find(name);
+        if (it != noret_cache.end())
+            return it->second;
+        bool r = is_noreturn_name(name);
+        noret_cache.emplace(name, r);
+        return r;
+    }
+
     std::string callee_name(const insn& in)
     {
         uint64_t m;
@@ -469,6 +550,12 @@ struct worker {
                 int i = import_of_slot(m);
                 if (i >= 0)
                     return b.imports[(size_t)i].name;
+                uint64_t v;
+                if (got_target(b, an, m, v)) { // call [got]: another crate's function, in this file
+                    auto it = sym_names.find(v);
+                    if (it != sym_names.end())
+                        return it->second;
+                }
             }
             return std::string();
         }
@@ -495,6 +582,10 @@ struct worker {
         if (in.has_target)
             add_xref(in.addr, in.target, in.kind == flow::call && !get_pc_call(in) ? xref_type::call : xref_type::jump);
         uint64_t m;
+        uint64_t via;
+        if (in.indirect && (in.kind == flow::call || in.kind == flow::jump) && mem_addr(in, m) &&
+            got_target(b, an, m, via))
+            add_xref(in.addr, via, in.kind == flow::call ? xref_type::call : xref_type::jump);
         if (mem_addr(in, m) && b.is_mapped(m)) {
             if (in.is_lea) {
                 add_xref(in.addr, m, xref_type::offset);
@@ -513,7 +604,9 @@ struct worker {
     }
 
     // switch tables: jmp [idx*ps + table], or the lea/movsxd/add/jmp reg forms
-    void resolve_table(const insn* hist, int nh, const insn& j)
+    // late: the retry after the first walks. a table without a bound check is only read then,
+    // up to the next address other code references (often the next table)
+    void resolve_table(const insn* hist, int nh, const insn& j, bool late = false)
     {
         int ps = b.ptr_size();
         uint64_t table = 0, basev = 0;
@@ -558,6 +651,17 @@ struct worker {
                     break;
                 }
             }
+            // a base loaded ahead of a loop, before the history starts: the paths into its first
+            // instruction, jumps included (a loop's entry often jumps to its test)
+            if (!found && late && nh > 0) {
+                int first = nh - 1;
+                while (first > 0 && hist[first - 1].next() == hist[first].addr)
+                    first--;
+                bool written = false;
+                for (int i = first; i < add_pos && !written; i++)
+                    written = dis.writes_reg(hist[i], breg) || (hist[i].kind == flow::call && !regs::kept_by_calls(breg));
+                found = !written && reaching_lea(hist[first].addr, breg, basev);
+            }
             // i386 pic code keeps the got address in ebx (the abi guarantees it)
             if (!found && got && regs::same_reg(breg, regs::ebx())) {
                 basev = got->start;
@@ -582,26 +686,41 @@ struct worker {
         for (int i = load_pos - 1; i >= 0 && i >= load_pos - 10; i--) {
             const insn& h = hist[i];
             if (ins::is_cmp(h) && regs::same_reg(h.reg0, cur) && h.has_imm) {
-                if (i + 1 < nh && (ins::is_ja(hist[i + 1]) || ins::is_jae(hist[i + 1]))) {
-                    uint64_t n = h.imm + (ins::is_ja(hist[i + 1]) ? 1 : 0);
-                    if (n > 0 && n <= 4096) {
-                        count = (uint32_t)n;
-                        bounded = true;
+                // the compiler can put moves between the cmp and the jump: they keep the flags
+                for (int k = i + 1; k < nh && k < load_pos; k++) {
+                    const insn& c = hist[k];
+                    if (ins::is_ja(c) || ins::is_jae(c)) {
+                        uint64_t n = h.imm + (ins::is_ja(c) ? 1 : 0);
+                        if (n > 0 && n <= 4096) {
+                            count = (uint32_t)n;
+                            bounded = true;
+                        }
+                        break;
                     }
+                    if (!(ins::is_move(c) || c.is_lea) || regs::same_reg(c.reg0, cur))
+                        break;
                 }
                 break;
             }
             if (ins::is_move(h) && regs::same_reg(h.reg0, cur) && h.reg1)
                 cur = h.reg1;
+            if (ins::is_move(h) && regs::same_reg(h.reg0, cur) && h.has_mem_op && !h.is_lea) {
+                if (h.mem_size == 1)
+                    count = 256; // a byte from memory (an enum's tag): no more cases than that
+                break;
+            }
         }
+        if (!bounded && !late)
+            return;
 
         const segment* js = b.seg_at(j.addr);
-        uint32_t limit = bounded ? count : 512;
+        uint32_t limit = count ? count : 512;
         std::vector<uint64_t> targets;
         uint32_t n = 0;
         for (; n < limit; n++) {
             uint64_t ea = table + (uint64_t)n * es;
-            if (!bounded && n > 0 && (an.flags_at(ea) & (fl_code | fl_str)))
+            if (!bounded && n > 0 && ((an.flags_at(ea) & (fl_code | fl_str)) || data_refs.count(ea) ||
+                                      std::binary_search(lea_refs.begin(), lea_refs.end(), ea)))
                 break;
             uint64_t e;
             if (es == 8) {
@@ -898,6 +1017,8 @@ struct worker {
                             a64_hand_over(x, st);
                 } else {
                     resolve_table(hist, nh, in);
+                    if (!an.tables.count(in.addr) && (in.has_mem_op ? in.mem_index != 0 : in.reg0 != 0))
+                        table_retry.push_back(in.addr);
                 }
                 stop = true;
                 break;
@@ -921,14 +1042,18 @@ struct worker {
                     push_code(in.target);
                 }
                 break;
-            case flow::call:
+            case flow::call: {
+                uint64_t m, via;
                 if (in.has_target && !get_pc_call(in))
                     add_func(in.target);
-                if (is_noreturn_name(callee_name(in))) {
+                else if (in.indirect && mem_addr(in, m) && got_target(b, an, m, via))
+                    add_func(via);
+                if (noreturn(callee_name(in))) {
                     an.noret_calls.insert(in.addr);
                     stop = true;
                 }
                 break;
+            }
             case flow::ret:
             case flow::stop:
                 stop = true;
@@ -967,6 +1092,29 @@ struct worker {
             work.pop_back();
             explore(a);
         }
+    }
+
+    // tables without a bound check end where the next thing code points at starts, often the next
+    // table. the code that points there may be reachable only through the first table, so this
+    // looks at the bytes instead: every "lea r64, [rip+x]" (48 / 4c 8d, modrm 00 reg 101)
+    void scan_lea_refs()
+    {
+        if (arm || !b.is64())
+            return;
+        for (const segment& s : b.segments) {
+            if (!s.exec())
+                continue;
+            const std::vector<uint8_t>& d = s.data;
+            for (size_t off = 0; off + 7 <= d.size(); off++) {
+                if ((d[off] != 0x48 && d[off] != 0x4c) || d[off + 1] != 0x8d || (d[off + 2] & 0xc7) != 0x05)
+                    continue;
+                uint64_t t = s.start + off + 7 + (uint64_t)(int64_t)(int32_t)util::rd32(&d[off + 3]);
+                if (b.is_mapped(t) && !b.is_code(t))
+                    lea_refs.push_back(t);
+            }
+        }
+        std::sort(lea_refs.begin(), lea_refs.end());
+        lea_refs.erase(std::unique(lea_refs.begin(), lea_refs.end()), lea_refs.end());
     }
 
     // strong function start patterns. -1 is a wildcard byte
@@ -1147,6 +1295,96 @@ struct worker {
         return true;
     }
 
+    // the address every known path into a loads into reg with "lea reg, [rip+x]" (a switch
+    // table's base, set up ahead of its loop). false when a path sets reg some other way, two
+    // paths disagree, or none sets it
+    bool reaching_lea(uint64_t a, unsigned reg, uint64_t& out)
+    {
+        if (jumps_to.empty()) {
+            for (const xref& x : xrefs)
+                if (x.type == xref_type::jump)
+                    jumps_to.push_back({x.to, x.from});
+            std::sort(jumps_to.begin(), jumps_to.end());
+        }
+        bool kept = regs::kept_by_calls(reg), have = false;
+        uint64_t val = 0;
+        std::vector<uint64_t> stack{a};
+        std::unordered_set<uint64_t> seen{a};
+        for (int budget = 0; !stack.empty() && budget < 512; budget++) {
+            uint64_t x = stack.back();
+            stack.pop_back();
+            if (func_starts.count(x))
+                continue; // the caller's value
+            std::vector<uint64_t> preds;
+            uint64_t h = x ? an.item_head(x - 1) : x;
+            insn p;
+            if (h < x && (an.flags_at(h) & fl_code) && dis.decode(b, h, p) && p.next() == x && p.kind != flow::jump &&
+                p.kind != flow::ret && p.kind != flow::stop && !an.noret_calls.count(h))
+                preds.push_back(h);
+            for (auto it = std::lower_bound(jumps_to.begin(), jumps_to.end(), std::make_pair(x, (uint64_t)0));
+                 it != jumps_to.end() && it->first == x; ++it)
+                preds.push_back(it->second);
+            for (uint64_t pa : preds) {
+                insn q;
+                if (!seen.insert(pa).second)
+                    continue;
+                if (!dis.decode(b, pa, q))
+                    return false;
+                if (q.is_lea && q.has_mem && q.mem_rip && regs::same_reg(q.reg0, reg)) {
+                    if (have && q.mem != val)
+                        return false;
+                    val = q.mem;
+                    have = true;
+                } else if ((q.kind == flow::call && !kept) || dis.writes_reg(q, reg)) {
+                    return false;
+                } else {
+                    stack.push_back(pa);
+                }
+            }
+        }
+        if (!have)
+            return false;
+        out = val;
+        return true;
+    }
+
+    // switches the first walks couldn't read, now that more of the code is known: the table's
+    // base was loaded ahead of a loop (the walk came in through the loop's back edge), or there's
+    // no bound check, so where the table ends depends on what else code points at
+    void retry_tables()
+    {
+        data_refs.clear();
+        jumps_to.clear();
+        for (const xref& x : xrefs)
+            if (x.type == xref_type::offset || x.type == xref_type::read)
+                data_refs.insert(x.to);
+        for (size_t i = 0; i < table_retry.size() && !cancelled; i++) {
+            uint64_t ja = table_retry[i];
+            insn j;
+            if (an.tables.count(ja) || !dis.decode(b, ja, j))
+                continue;
+            const int hist_max = 12;
+            insn back[hist_max];
+            int nh = 0;
+            uint64_t a = ja;
+            while (nh < hist_max && a > 0) {
+                uint64_t h = an.item_head(a - 1);
+                insn p;
+                if (h >= a || !(an.flags_at(h) & fl_code) || !dis.decode(b, h, p) || p.next() != a ||
+                    p.kind == flow::jump || p.kind == flow::ret || p.kind == flow::stop || an.noret_calls.count(h))
+                    break;
+                back[nh++] = p;
+                a = h;
+            }
+            std::reverse(back, back + nh);
+            resolve_table(back, nh, j, true);
+            if (an.tables.count(ja))
+                run_work();
+        }
+        jumps_to = std::vector<std::pair<uint64_t, uint64_t>>();
+        data_refs = std::unordered_set<uint64_t>();
+    }
+
     // code nobody points at: after each piece of known code, skip padding and try again
     void sweep_gaps()
     {
@@ -1307,10 +1545,14 @@ struct worker {
                 uint64_t m;
                 if (first.indirect && mem_addr(first, m)) {
                     int imp = import_of_slot(m);
+                    uint64_t via;
                     if (imp >= 0) {
                         f.thunk = true;
                         f.thunk_target = m;
                         an.thunk_import[s] = (uint32_t)imp;
+                    } else if (got_target(b, an, m, via) && via != s) {
+                        f.thunk = true;
+                        f.thunk_target = via;
                     }
                 } else if (first.has_target && first.target != s) {
                     f.thunk = true;
@@ -1429,6 +1671,7 @@ struct worker {
                 sym_names.emplace(e.addr, e.name);
 
         progress(2);
+        scan_lea_refs();
         if (b.has_entry)
             add_func(b.entry);
         for (uint64_t h : b.func_hints)
@@ -1440,6 +1683,7 @@ struct worker {
         for (const auto& lp : b.landing_pads)
             push_code(lp.second);
         run_work();
+        retry_tables();
         if (cancelled)
             return false;
         progress(35);
@@ -1462,6 +1706,7 @@ struct worker {
         if (cancelled)
             return false;
         progress(50);
+        retry_tables();
         sweep_gaps();
         if (cancelled)
             return false;

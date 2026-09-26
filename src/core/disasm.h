@@ -72,6 +72,9 @@ public:
     bool decode(const uint8_t* buf, size_t n, uint64_t addr, insn& out);
     bool decode(const binary& b, uint64_t addr, insn& out);
     const char* reg_name(unsigned reg) const;
+    // x86: the instruction can change reg (or a part of it), implicit writes included. true when
+    // unsure
+    bool writes_reg(const insn& in, unsigned reg);
 
     // the memory the instruction in buf writes when it runs, worked out from its operands and
     // the registers' current values (reg gives one by name: "rdi", "esp", "eflags", ...). false
@@ -101,6 +104,8 @@ unsigned rip();
 unsigned eip();
 unsigned ebx();
 bool same_reg(unsigned a, unsigned b); // eax vs rax etc count as the same register
+// x86: a register a called function keeps (rbx, rbp, r12-r15 on every abi)
+bool kept_by_calls(unsigned r);
 // arm64: the number of a general register (w5 and x5 are 5, sp is 31), -1 for anything else
 int a64_num(unsigned reg);
 }

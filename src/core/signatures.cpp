@@ -2,6 +2,7 @@
 
 #include "core/analysis.h"
 #include "core/database.h"
+#include "core/demangle.h"
 #include "core/disasm.h"
 #include "core/util.h"
 
@@ -89,8 +90,11 @@ std::vector<signature> make_signatures(database& db)
         std::string name = db.name_at(f.start);
         if (!real_name(name))
             continue;
+        // a demangled name keeps its mangled spelling: one word, and it demangles again where
+        // the signature names a function
+        std::string raw = db.raw_name_at(f.start);
         signature s;
-        s.name = name;
+        s.name = raw.empty() ? name : raw;
         s.hash = fingerprint(db, f.start, f.end, s.length);
         if (s.hash && s.length >= 8) // skip tiny stubs, they collide
             out.push_back(std::move(s));
@@ -168,7 +172,8 @@ std::vector<sig_match> match_signatures(database& db, const std::vector<signatur
         auto it = by_key.find(key(h, len));
         if (it == by_key.end() || !it->second.unique)
             continue;
-        matched.push_back({f.start, it->second.name});
+        demangle::result d = demangle::run(it->second.name);
+        matched.push_back({f.start, d.ok ? d.display : it->second.name});
         if (apply) {
             std::string err;
             db.set_name(f.start, it->second.name, err);

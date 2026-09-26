@@ -133,4 +133,11 @@ bool macho(binary& out, std::string& err, const options& o);
 bool is_macho(const std::vector<uint8_t>& head);
 bool macho_arch(const std::vector<uint8_t>& head, bin_arch& out);
 
+// a value in dwarf pointer encoding enc at p, which moves past it: absolute, uleb / sleb, 2 / 4 / 8
+// bytes, pc relative. false for the encodings it doesn't know (data / text relative, indirect)
+bool read_dwarf_ptr(const binary& b, uint64_t& p, uint8_t enc, uint64_t& out);
+// one function's lsda (its exception table: the calls that can throw and where the unwinder goes
+// for each): the landing pads go into b.landing_pads. func is the start the pads are offsets from
+void read_lsda(binary& b, uint64_t func, uint64_t lsda);
+
 }

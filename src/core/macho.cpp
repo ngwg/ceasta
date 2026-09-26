@@ -818,38 +818,6 @@ void read_initializers(ctx& c)
 
 // ---- exception landing pads: __unwind_info's lsda index, then each lsda's call sites ----
 
-// a dwarf encoded value (the ones call site tables use). false when the encoding isn't known
-bool read_encoded(const binary& b, uint64_t& p, uint8_t enc, uint64_t& out)
-{
-    uint64_t at = p;
-    switch (enc & 0x0f) {
-    case 0x00: { uint64_t v; if (!b.read_u64(p, v)) return false; out = v; p += 8; break; }
-    case 0x01: case 0x09: {
-        // uleb / sleb
-        uint64_t v = 0;
-        int shift = 0;
-        uint8_t c = 0;
-        do {
-            if (!b.read_u8(p++, c) || shift >= 64)
-                return false;
-            v |= (uint64_t)(c & 0x7f) << shift;
-            shift += 7;
-        } while (c & 0x80);
-        if ((enc & 0x0f) == 0x09 && shift < 64 && (c & 0x40))
-            v |= ~0ull << shift;
-        out = v;
-        break;
-    }
-    case 0x02: case 0x0a: { uint16_t v; if (!b.read_u16(p, v)) return false; out = (enc & 8) ? (uint64_t)(int16_t)v : v; p += 2; break; }
-    case 0x03: case 0x0b: { uint32_t v; if (!b.read_u32(p, v)) return false; out = (enc & 8) ? (uint64_t)(int32_t)v : v; p += 4; break; }
-    case 0x04: case 0x0c: { uint64_t v; if (!b.read_u64(p, v)) return false; out = v; p += 8; break; }
-    default: return false;
-    }
-    if ((enc & 0x70) == 0x10)
-        out += at; // pc relative
-    return true;
-}
-
 void read_landing_pads(ctx& c)
 {
     binary& b = c.b;
@@ -872,30 +840,9 @@ void read_landing_pads(ctx& c)
         uint64_t e = ui->addr + lsda_first + i * 8;
         if (!b.read_u32(e, func_off) || !b.read_u32(e + 4, lsda_off))
             break;
-        uint64_t func = c.header_addr + func_off, p = c.header_addr + lsda_off;
-        if (!b.is_code(func))
-            continue;
-        uint8_t lp_enc, tt_enc, cs_enc;
-        uint64_t lpstart = func, v, cs_len;
-        if (!b.read_u8(p++, lp_enc))
-            continue;
-        if (lp_enc != 0xff && !read_encoded(b, p, lp_enc, lpstart))
-            continue;
-        if (!b.read_u8(p++, tt_enc))
-            continue;
-        if (tt_enc != 0xff && !read_encoded(b, p, 0x01, v))
-            continue;
-        if (!b.read_u8(p++, cs_enc) || !read_encoded(b, p, 0x01, cs_len))
-            continue;
-        uint64_t cs_end = p + std::min<uint64_t>(cs_len, 1u << 20);
-        while (p < cs_end && b.landing_pads.size() < (4u << 20)) {
-            uint64_t start, len, pad, action;
-            if (!read_encoded(b, p, cs_enc, start) || !read_encoded(b, p, cs_enc, len) || !read_encoded(b, p, cs_enc, pad) ||
-                !read_encoded(b, p, 0x01, action))
-                break;
-            if (pad && b.is_code(lpstart + pad))
-                b.landing_pads.push_back({func, lpstart + pad});
-        }
+        uint64_t func = c.header_addr + func_off;
+        if (b.is_code(func))
+            loader::read_lsda(b, func, c.header_addr + lsda_off);
     }
     std::sort(b.landing_pads.begin(), b.landing_pads.end());
     b.landing_pads.erase(std::unique(b.landing_pads.begin(), b.landing_pads.end()), b.landing_pads.end());

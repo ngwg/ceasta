@@ -78,6 +78,11 @@ public:
     void build();
 
     std::string name_at(uint64_t a) const;      // "" when the address has no name
+    // the name a call is written with in pseudocode: a demangled c++ function without its
+    // parameters (std::vector<int>::push_back), otherwise name_at
+    std::string call_name(uint64_t a) const;
+    // the mangled spelling behind a demangled name (_ZNSt6vector...), "" when the name isn't one
+    std::string raw_name_at(uint64_t a) const;
     std::string location(uint64_t a) const;     // name, or func+off, or plain address
     bool set_name(uint64_t a, const std::string& name, std::string& err);
     std::string comment_at(uint64_t a) const;
@@ -191,11 +196,19 @@ private:
     void build_names();
     void build_rows();
     void claim_name(uint64_t a, const std::string& base);
+    // a symbol's name, demangled when it's mangled; aliases collects the other spellings that
+    // should find it (the mangled one, the name without parameters)
+    void claim_symbol(uint64_t a, const std::string& raw, std::vector<std::pair<std::string, uint64_t>>& aliases);
     std::string item_text(uint64_t a, uint32_t size, line_text& out) const;
 
     std::vector<row> rows_;
     bool rows_dirty_ = true;
     std::unordered_map<uint64_t, std::string> names_;   // symbols, imports, exports, strings, thunks
+    std::unordered_map<uint64_t, uint32_t> call_len_;   // demangled functions: the part of names_ a call shows
+    std::unordered_map<uint64_t, std::string> raw_names_; // demangled symbols: the spelling in the file
+    // user names that are mangled symbols (signatures give those): shown demangled, and the
+    // part a call shows
+    std::unordered_map<uint64_t, std::pair<std::string, uint32_t>> user_shown_;
     std::unordered_map<std::string, uint64_t> by_name_;
     mutable disassembler dis_;
     int digits_ = 8;

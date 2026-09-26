@@ -188,6 +188,65 @@ void binary::finish_segments()
 
 namespace loader {
 
+bool read_dwarf_ptr(const binary& b, uint64_t& p, uint8_t enc, uint64_t& out)
+{
+    uint64_t at = p;
+    if (enc == 0xff || (enc & 0x80))
+        return false;
+    switch (enc & 0x0f) {
+    case 0x00: if (!b.read_ptr(p, out)) return false; p += (uint64_t)b.ptr_size(); break;
+    case 0x01: case 0x09: {
+        // uleb / sleb
+        uint64_t v = 0;
+        int shift = 0;
+        uint8_t c = 0;
+        do {
+            if (!b.read_u8(p++, c) || shift >= 64)
+                return false;
+            v |= (uint64_t)(c & 0x7f) << shift;
+            shift += 7;
+        } while (c & 0x80);
+        if ((enc & 0x0f) == 0x09 && shift < 64 && (c & 0x40))
+            v |= ~0ull << shift;
+        out = v;
+        break;
+    }
+    case 0x02: case 0x0a: { uint16_t v; if (!b.read_u16(p, v)) return false; out = (enc & 8) ? (uint64_t)(int16_t)v : v; p += 2; break; }
+    case 0x03: case 0x0b: { uint32_t v; if (!b.read_u32(p, v)) return false; out = (enc & 8) ? (uint64_t)(int32_t)v : v; p += 4; break; }
+    case 0x04: case 0x0c: if (!b.read_u64(p, out)) return false; p += 8; break;
+    default: return false;
+    }
+    if ((enc & 0x70) == 0x10)
+        out += at;
+    else if (enc & 0x70)
+        return false;
+    if (!b.is64())
+        out &= 0xffffffffull;
+    return true;
+}
+
+void read_lsda(binary& b, uint64_t func, uint64_t p)
+{
+    uint8_t lp_enc, tt_enc, cs_enc;
+    uint64_t lpstart = func, v, cs_len;
+    if (!b.read_u8(p++, lp_enc) || (lp_enc != 0xff && !read_dwarf_ptr(b, p, lp_enc, lpstart)))
+        return;
+    if (!b.read_u8(p++, tt_enc) || (tt_enc != 0xff && !read_dwarf_ptr(b, p, 0x01, v)))
+        return;
+    if (!b.read_u8(p++, cs_enc) || !read_dwarf_ptr(b, p, 0x01, cs_len))
+        return;
+    uint64_t cs_end = p + std::min<uint64_t>(cs_len, 1u << 20);
+    while (p < cs_end && b.landing_pads.size() < (4u << 20)) {
+        uint64_t start, len, pad, action;
+        if (!read_dwarf_ptr(b, p, cs_enc, start) || !read_dwarf_ptr(b, p, cs_enc, len) ||
+            !read_dwarf_ptr(b, p, cs_enc, pad) || !read_dwarf_ptr(b, p, 0x01, action))
+            break;
+        uint64_t at = b.is64() ? lpstart + pad : (lpstart + pad) & 0xffffffffull;
+        if (pad && b.is_code(at))
+            b.landing_pads.push_back({func, at});
+    }
+}
+
 static std::string base_name(const std::string& path)
 {
     size_t p = path.find_last_of("/\\");

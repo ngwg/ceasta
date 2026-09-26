@@ -33,12 +33,27 @@ std::string py(const std::string& s)
 std::string rva(const database& db, uint64_t a) { return util::fmt("0x%llx", (unsigned long long)(a - db.bin.base)); }
 
 // a prototype in the other tool's c: its name, then the calling convention ida and ghidra take
+bool c_identifier(const std::string& n)
+{
+    if (n.empty() || (n[0] >= '0' && n[0] <= '9'))
+        return false;
+    for (char c : n)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+            return false;
+    return true;
+}
+
 std::string c_proto(const database& db, uint64_t f, const prototype& p)
 {
     prototype q = p;
+    // the other tool parses this as c: a demangled name ("Foo::bar(int)") can't be the name in it,
+    // the mangled symbol can
     std::string n = db.name_at(f);
-    if (!n.empty())
-        q.name = n;
+    if (!c_identifier(n))
+        n = db.raw_name_at(f);
+    if (!c_identifier(n))
+        n = "sub_" + util::hex(f);
+    q.name = n;
     return format_prototype(q) + ";";
 }
 

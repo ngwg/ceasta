@@ -52,6 +52,7 @@
     <ClCompile Include="..\src\core\debugger.cpp" />
     <ClCompile Include="..\src\core\debugger_steps.cpp" />
     <ClCompile Include="..\src\core\decompiler.cpp" />
+    <ClCompile Include="..\src\core\demangle.cpp" />
     <ClCompile Include="..\src\core\diff.cpp" />
     <ClCompile Include="..\src\core\disasm.cpp" />
     <ClCompile Include="..\src\core\elf.cpp" />
@@ -76,6 +77,7 @@
     <ClInclude Include="..\src\core\database.h" />
     <ClInclude Include="..\src\core\debugger.h" />
     <ClInclude Include="..\src\core\decompiler.h" />
+    <ClInclude Include="..\src\core\demangle.h" />
     <ClInclude Include="..\src\core\disasm.h" />
     <ClInclude Include="..\src\core\json.h" />
     <ClInclude Include="..\src\core\kuna.h" />

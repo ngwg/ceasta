@@ -1,4 +1,5 @@
 #include "core/database.h"
+#include "core/demangle.h"
 #include "core/os.h"
 #include "core/util.h"
 #include <algorithm>
@@ -122,31 +123,81 @@ void database::claim_name(uint64_t a, const std::string& base)
     by_name_[n] = a;
 }
 
+void database::claim_symbol(uint64_t a, const std::string& raw,
+    std::vector<std::pair<std::string, uint64_t>>& aliases)
+{
+    if (raw.empty() || names_.count(a))
+        return;
+    demangle::result d = demangle::run(raw);
+    if (!d.ok) {
+        claim_name(a, raw);
+        return;
+    }
+    // overloads and constructor variants share a name (Foo::Foo() twice): demangled names may
+    // repeat, like in gdb or objdump -C; a lookup by the name finds the first
+    names_[a] = d.display;
+    raw_names_[a] = raw;
+    by_name_.emplace(d.display, a);
+    if (d.name.size() < d.display.size() && d.display.compare(0, d.name.size(), d.name) == 0)
+        call_len_[a] = (uint32_t)d.name.size();
+    aliases.emplace_back(raw, a);
+    if (d.name != d.display)
+        aliases.emplace_back(d.name, a);
+}
+
 void database::build_names()
 {
     names_.clear();
     by_name_.clear();
+    call_len_.clear();
+    raw_names_.clear();
+    std::vector<std::pair<std::string, uint64_t>> aliases;
     // strongest names first, an address keeps the first name it gets
     for (const symbol_entry& s : bin.symbols)
-        claim_name(s.addr, s.name);
+        claim_symbol(s.addr, s.name, aliases);
     for (const export_entry& e : bin.exports)
         if (e.addr)
-            claim_name(e.addr, e.name);
+            claim_symbol(e.addr, e.name, aliases);
     for (const import_entry& im : bin.imports)
-        claim_name(im.slot, im.name);
+        claim_symbol(im.slot, im.name, aliases);
     if (bin.has_entry)
         claim_name(bin.entry, "start");
 
+    // a thunk is j_ + what it jumps to, as shown (demangled), and calls show it the same way
+    auto claim_thunk = [&](uint64_t at, uint64_t to, const std::string& shown) {
+        if (names_.count(at))
+            return;
+        claim_name(at, "j_" + shown);
+        auto c = call_len_.find(to);
+        if (c != call_len_.end() && names_[at] == "j_" + shown)
+            call_len_[at] = c->second + 2;
+    };
     std::vector<std::pair<uint64_t, uint32_t>> thunks(an.thunk_import.begin(), an.thunk_import.end());
     std::sort(thunks.begin(), thunks.end());
-    for (const auto& t : thunks)
-        claim_name(t.first, "j_" + bin.imports[t.second].name);
+    for (const auto& t : thunks) {
+        const import_entry& im = bin.imports[t.second];
+        auto it = names_.find(im.slot);
+        claim_thunk(t.first, im.slot, it != names_.end() ? it->second : im.name);
+    }
     for (const function& f : an.funcs) {
         if (!f.thunk || an.thunk_import.count(f.start))
             continue;
         auto it = names_.find(f.thunk_target);
         if (it != names_.end())
-            claim_name(f.start, "j_" + it->second);
+            claim_thunk(f.start, f.thunk_target, it->second);
+    }
+    // got slots holding a function of this file (rust, -fno-plt): named after it, so
+    // call [slot] reads as the call it is: call qword ptr [core::option::unwrap_failed_ptr]
+    for (const segment& sg : bin.segments) {
+        if (!(sg.name.compare(0, 4, ".got") == 0 || sg.name == "__got" || sg.name == "__auth_got"))
+            continue;
+        uint64_t ps = (uint64_t)bin.ptr_size();
+        for (uint64_t slot = sg.start; slot + ps <= sg.end; slot += ps) {
+            uint64_t v;
+            if (names_.count(slot) || !got_target(bin, an, slot, v) || !names_.count(v))
+                continue;
+            claim_name(slot, call_name(v) + "_ptr");
+        }
     }
     for (const string_item& s : an.strings) {
         std::string n = string_name(s.text);
@@ -158,8 +209,17 @@ void database::build_names()
     std::sort(tables.begin(), tables.end());
     for (uint64_t t : tables)
         claim_name(t, "jpt_" + util::hex(t));
+    // the mangled spelling and the name without parameters find the symbol too, where no
+    // other name has them
+    for (const auto& al : aliases)
+        by_name_.emplace(al.first, al.second);
     for (const auto& u : user_names)
         by_name_[u.second] = u.first;
+    for (const auto& u : user_shown_) {
+        by_name_.emplace(u.second.first, u.first);
+        if (u.second.second)
+            by_name_.emplace(u.second.first.substr(0, u.second.second), u.first);
+    }
 }
 
 std::string database::auto_name(uint64_t a) const
@@ -188,12 +248,38 @@ std::string database::auto_name(uint64_t a) const
 std::string database::name_at(uint64_t a) const
 {
     auto u = user_names.find(a);
-    if (u != user_names.end())
-        return u->second;
+    if (u != user_names.end()) {
+        auto d = user_shown_.find(a);
+        return d != user_shown_.end() ? d->second.first : u->second;
+    }
     auto n = names_.find(a);
     if (n != names_.end())
         return n->second;
     return auto_name(a);
+}
+
+std::string database::call_name(uint64_t a) const
+{
+    if (user_names.count(a)) {
+        auto d = user_shown_.find(a);
+        if (d != user_shown_.end() && d->second.second)
+            return d->second.first.substr(0, d->second.second);
+    } else {
+        auto c = call_len_.find(a);
+        auto n = names_.find(a);
+        if (c != call_len_.end() && n != names_.end() && c->second <= n->second.size())
+            return n->second.substr(0, c->second);
+    }
+    return name_at(a);
+}
+
+std::string database::raw_name_at(uint64_t a) const
+{
+    auto u = user_names.find(a);
+    if (u != user_names.end())
+        return user_shown_.count(a) ? u->second : std::string();
+    auto r = raw_names_.find(a);
+    return r != raw_names_.end() ? r->second : std::string();
 }
 
 std::string database::location(uint64_t a) const
@@ -220,7 +306,9 @@ bool database::check_name(uint64_t a, const std::string& name, std::string& err)
     }
     if (n.empty())
         return true;
-    if (n.size() > 255) {
+    // mangled names (a signature can give one) run longer
+    demangle::result dm = demangle::run(n);
+    if (n.size() > (dm.ok ? 4096u : 255u)) {
         err = "name is too long";
         return false;
     }
@@ -316,12 +404,25 @@ bool database::set_name(uint64_t a, const std::string& name, std::string& err)
     }
     auto old = user_names.find(a);
     std::string before = old != user_names.end() ? old->second : std::string();
+    // the demangled spellings of the old name stop finding a
+    auto drop_shown = [&]() {
+        auto d = user_shown_.find(a);
+        if (d == user_shown_.end())
+            return;
+        for (const std::string& k : {d->second.first, d->second.first.substr(0, d->second.second)}) {
+            auto b = by_name_.find(k);
+            if (b != by_name_.end() && b->second == a)
+                by_name_.erase(b);
+        }
+        user_shown_.erase(d);
+    };
     if (n.empty()) {
         record(edit_kind::name, a, before, std::string());
         if (old != user_names.end()) {
             auto b = by_name_.find(old->second);
             if (b != by_name_.end() && b->second == a)
                 by_name_.erase(b);
+            drop_shown();
             user_names.erase(old);
             // a stored name (symbol, import) becomes visible again
             auto s = names_.find(a);
@@ -333,7 +434,9 @@ bool database::set_name(uint64_t a, const std::string& name, std::string& err)
         }
         return true;
     }
-    if (n.size() > 255) {
+    // a mangled c++ / rust / msvc name (a signature can give one) shows demangled
+    demangle::result dm = demangle::run(n);
+    if (n.size() > (dm.ok ? 4096u : 255u)) {
         err = "name is too long";
         return false;
     }
@@ -361,9 +464,17 @@ bool database::set_name(uint64_t a, const std::string& name, std::string& err)
         if (b != by_name_.end() && b->second == a)
             by_name_.erase(b);
     }
+    drop_shown();
     record(edit_kind::name, a, before, n);
     user_names[a] = n;
     by_name_[n] = a;
+    if (dm.ok) {
+        uint32_t cl = dm.name.size() < dm.display.size() && dm.display.compare(0, dm.name.size(), dm.name) == 0
+            ? (uint32_t)dm.name.size() : 0;
+        user_shown_[a] = {dm.display, cl};
+        by_name_.emplace(dm.display, a);
+        by_name_.emplace(dm.name, a);
+    }
     dirty = true;
     arg_notes_.clear(); // a name can make a call a well-known one (strcpy, CreateFileW)
     noted_funcs_.clear();

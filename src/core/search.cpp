@@ -121,17 +121,17 @@ std::vector<search_hit> search_everything(const database& db, const std::string&
     if (kinds & sk_names) {
         // renamed data and labels; renamed functions already came up as functions
         c.clear();
-        std::vector<const std::pair<const uint64_t, std::string>*> src;
+        std::vector<std::pair<uint64_t, std::string>> src; // as shown (a mangled name demangled)
         for (const auto& n : db.user_names)
             if (!(db.an.flags_at(n.first) & fl_func))
-                src.push_back(&n);
+                src.push_back({n.first, db.name_at(n.first)});
         for (size_t i = 0; i < src.size(); i++) {
-            int s = score(src[i]->second, needle);
+            int s = score(src[i].second, needle);
             if (s >= 0)
-                c.push_back({s, src[i]->first, i});
+                c.push_back({s, src[i].first, i});
         }
         emit(c, cap, cut, out, [&](const cand& x) {
-            return search_hit{hit_kind::name, x.addr, src[x.index]->second, db.location(x.addr)};
+            return search_hit{hit_kind::name, x.addr, src[x.index].second, db.location(x.addr)};
         });
     }
     if (kinds & sk_imports) {

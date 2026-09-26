@@ -243,11 +243,20 @@ unsigned enc_size(uint8_t enc, int ptr)
     }
 }
 
+// what an fde's cie says about it
+struct cie_info {
+    uint8_t fde_enc = 0xff;  // how its pc range is written, 0xff: unknown
+    uint8_t lsda_enc = 0xff; // how its lsda pointer is written, 0xff: it has none
+    bool z = false;          // it has augmentation data
+};
+
 // a function's unwind info starts from the state right after a call. gcc's split off cold
 // parts (foo.cold) are entered with the caller's frame already set up, so their first rules
-// (before the first advance) move the cfa or save registers: those aren't function starts
-bool fde_is_fragment(const binary& b, uint64_t fde, std::unordered_map<uint64_t, std::pair<uint8_t, bool>>& cies)
+// (before the first advance) move the cfa or save registers: those aren't function starts.
+// lsda is set to the fde's exception table, 0 when it has none
+bool fde_is_fragment(const binary& b, uint64_t fde, std::unordered_map<uint64_t, cie_info>& cies, uint64_t& lsda)
 {
+    lsda = 0;
     uint32_t len, cie_ptr;
     if (!b.read_u32(fde, len) || len == 0 || len == 0xffffffff || !b.read_u32(fde + 4, cie_ptr) || !cie_ptr)
         return false;
@@ -255,7 +264,7 @@ bool fde_is_fragment(const binary& b, uint64_t fde, std::unordered_map<uint64_t,
     auto it = cies.find(cie);
     if (it == cies.end()) {
         // the cie: version, augmentation, alignments, return register, then augmentation data
-        std::pair<uint8_t, bool> info{0xff, false};
+        cie_info info;
         uint32_t clen, id;
         uint8_t ver;
         if (b.read_u32(cie, clen) && clen && clen != 0xffffffff && b.read_u32(cie + 4, id) && id == 0 &&
@@ -269,35 +278,40 @@ bool fde_is_fragment(const binary& b, uint64_t fde, std::unordered_map<uint64_t,
             else if (ok)
                 ok = uleb(b, p, cend, v);
             if (ok && !aug.empty() && aug[0] == 'z' && uleb(b, p, cend, v)) {
-                info.second = true;
+                info.z = true;
                 for (size_t i = 1; i < aug.size() && p < cend; i++) {
                     uint8_t e = 0;
                     if (aug[i] == 'R') {
                         b.read_u8(p++, e);
-                        info.first = e;
+                        info.fde_enc = e;
                     } else if (aug[i] == 'P') {
                         b.read_u8(p++, e);
                         p += enc_size(e, b.ptr_size());
                     } else if (aug[i] == 'L') {
-                        p++;
+                        b.read_u8(p++, e);
+                        info.lsda_enc = e;
                     } else if (aug[i] != 'S' && aug[i] != 'B' && aug[i] != 'G') {
                         break;
                     }
                 }
             }
             if (!ok)
-                info.first = 0xff;
+                info.fde_enc = 0xff;
         }
         it = cies.emplace(cie, info).first;
     }
-    uint8_t fde_enc = it->second.first;
-    unsigned sz = fde_enc == 0xff ? 0 : enc_size(fde_enc, b.ptr_size());
+    const cie_info& ci = it->second;
+    unsigned sz = ci.fde_enc == 0xff ? 0 : enc_size(ci.fde_enc, b.ptr_size());
     if (!sz)
         return false;
     uint64_t p = fde + 8 + 2 * (uint64_t)sz, v;
-    if (it->second.second) {
+    if (ci.z) {
         if (!uleb(b, p, end, v))
             return false;
+        // the augmentation data is the lsda pointer, when the cie says there is one
+        uint64_t q = p;
+        if (ci.lsda_enc != 0xff && v && !loader::read_dwarf_ptr(b, q, ci.lsda_enc, lsda))
+            lsda = 0;
         p += v;
     }
     for (int n = 0; p < end && n < 64; n++) {
@@ -368,14 +382,21 @@ void read_eh_frame_hdr(ctx& c)
         if (!get(h[1], eh_frame) || !get(h[2], count))
             return;
         count = std::min<uint64_t>(count, 1u << 20);
-        std::unordered_map<uint64_t, std::pair<uint8_t, bool>> cies; // fde pointer encoding, 'z'
+        std::unordered_map<uint64_t, cie_info> cies;
         for (uint64_t k = 0; k < count && p < end; k++) {
-            uint64_t start = 0, fde = 0;
+            uint64_t start = 0, fde = 0, lsda = 0;
             if (!get(h[3], start) || !get(h[3], fde))
                 break;
-            if (b.is_code(start) && !fde_is_fragment(b, fde, cies))
+            if (!b.is_code(start))
+                continue;
+            if (!fde_is_fragment(b, fde, cies, lsda))
                 b.func_hints.push_back(start);
+            // c++ and rust landing pads: code only the unwinder jumps to
+            if (lsda)
+                loader::read_lsda(b, start, lsda);
         }
+        std::sort(b.landing_pads.begin(), b.landing_pads.end());
+        b.landing_pads.erase(std::unique(b.landing_pads.begin(), b.landing_pads.end()), b.landing_pads.end());
         return;
     }
 }
