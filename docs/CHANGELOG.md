@@ -1,5 +1,11 @@
 # changelog
 
+## unreleased
+
+- fixes: an unstripped mach-o program whose functions are exported (clang's default) no
+  longer reads "symbols stripped" in file info: strip takes a program's exported names too,
+  so they count (a library's exports still don't)
+
 ## v0.12.0 - 2026-09-25
 
 - **macos**: `ceasta-x.y.z-macos.dmg` (the app) and `ceasta-cli-x.y.z-macos.tar.gz`, one build

@@ -945,7 +945,7 @@ void inspect_macho(const binary& b, file_info& out)
     std::string built, tools, uuid, id, dyld, rpaths, source;
     std::vector<std::string> weak_libs;
     bool thread_entry = false, has_sig = false, symbols = false;
-    uint32_t cryptid = 0, crypt_off = 0, crypt_size = 0;
+    uint32_t cryptid = 0, crypt_off = 0, crypt_size = 0, sym_off = 0, nsyms = 0;
     uint64_t sig_off = 0, sig_size = 0, file_end = 0;
     std::vector<std::string> ents;
     std::string sec_extra;
@@ -1050,6 +1050,10 @@ void inspect_macho(const binary& b, file_info& out)
             crypt_size = r.u32(off + 12);
             cryptid = r.u32(off + 16);
             break;
+        case 0x2: // symbol table
+            sym_off = r.u32(off + 8);
+            nsyms = r.u32(off + 12);
+            break;
 
         default:
             break;
@@ -1113,10 +1117,24 @@ void inspect_macho(const binary& b, file_info& out)
         sec += ", encrypted";
     if (type != 1) // an object file isn't run, none of it applies
         out.header.push_back({"security", sec});
-    // stripped: no function names beyond what's exported
+    // stripped: no function names beyond what strip keeps. a library keeps its exports; strip
+    // takes a program's exported names too, all but weak definitions and __mh_execute_header
+    std::vector<uint64_t> kept;
+    if (type == 2) {
+        for (uint32_t i = 0; i < nsyms && base + sym_off + (i + 1) * 16ull <= end; i++) {
+            uint64_t e = base + sym_off + i * 16ull;
+            // external, in a section, a weak definition (0x80) or referenced dynamically (0x10)
+            if ((r.u8(e + 4) & 0xef) == 0x0f && (r.u16(e + 6) & 0x90))
+                kept.push_back(r.u64(e + 8));
+        }
+    } else {
+        for (const export_entry& x : b.exports)
+            kept.push_back(x.addr);
+    }
+    std::sort(kept.begin(), kept.end());
     size_t named = 0;
     for (const symbol_entry& y : b.symbols)
-        if (y.func && std::none_of(b.exports.begin(), b.exports.end(), [&](const export_entry& x) { return x.addr == y.addr; }))
+        if (y.func && !std::binary_search(kept.begin(), kept.end(), y.addr))
             named++;
     symbols = named > 0;
     out.header.push_back({"symbols", symbols ? util::fmt("yes, %zu function names (not stripped)", named) : std::string("stripped")});
