@@ -182,6 +182,11 @@ int main(int argc, char** argv)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr; // our own settings.ini lives in the user folder
 
+    // the backends first: on a glfw built with wayland, the content scale helper looks the window
+    // up in the backend's window -> context map, which only init fills (an assert otherwise)
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+
     // 1 on macos, where the window works in points and a retina screen just has more pixels per
     // point (imgui draws its fonts at that density); the monitor's scale on x11
     float scale = ImGui_ImplGlfw_GetContentScaleForWindow(window);
@@ -193,9 +198,6 @@ int main(int argc, char** argv)
     style.ScaleAllSizes(scale);
     style.FontScaleDpi = scale;
     theme::load_fonts();
-
-    ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init(glsl_version);
 
     static app_state state;
     state.dpi_scale = scale;
