@@ -11,7 +11,11 @@ ceasta-cli mcp <file> --http 8744     # or a localhost http server
 ceasta-cli mcp <file> --allow-debug   # also expose the tools that run the program
 ceasta-cli mcp <file> --allow-lua     # also expose run_lua (runs arbitrary lua)
 ceasta-cli mcp <file> --arch arm64    # a universal mac file: its arm64 part (default x86_64)
+ceasta-cli mcp fw.bin --raw-mips --base 80010000   # a flat dump as mips code
 ```
+
+The file you launch with is open for the whole session — and on the command line the server can
+open more (see [analyzing a whole firmware image](#analyzing-a-whole-firmware-image)).
 
 ## from the app
 
@@ -65,11 +69,12 @@ Always on (read and annotate):
 | `get_binary_info` | format, arch, entry, segments, counts, and the file info: security flags, hashes, sections with entropy, packer warnings |
 | `list_functions` / `list_strings` / `list_imports` / `list_exports` | browse, with a filter |
 | `decompile_function` | C-like pseudocode (x86 / x64), with the function's variables |
-| `decompile_with_kuna` | the same function from [kuna](https://github.com/Noelo-Lab/kuna), a second decompiler — only there when kuna is installed (on PATH, set in the app, or `--kuna-path`) |
-| `disassemble` / `disassemble_function` | the listing, with names (arm64 too) |
+| `decompile_with_kuna` | the same function from [kuna](https://github.com/Noelo-Lab/kuna), a second decompiler (arm64 and mips too, raw mips dumps included, speaking the names from your listing) — only there when kuna is installed (on PATH, set in the app, or `--kuna-path`) |
+| `disassemble` / `disassemble_function` | the listing, with names (arm64 and mips too) |
 | `get_xrefs_to` / `get_xrefs_from` | callers and callees |
 | `read_bytes` / `search_bytes` / `lookup` / `get_basic_blocks` | bytes, patterns, what's at an address, the CFG |
 | `diff_binary` | compare with another file, function by function |
+| `open_file` / `close_file` / `select_file` / `list_files` | open another binary (executable, library, kernel module, or a raw dump with `raw_arch` + `base`), switch between the open ones, close them — every other tool follows the active file. Only on `ceasta-cli mcp` |
 | `rename` / `set_comment` | record what it learns (saved with the project) |
 | `rename_variable` / `set_variable_type` / `set_function_prototype` | name and type a function's variables, give it a prototype (`int check_key(const char* key)`) — the pseudocode and the callers use them |
 | `suggest_name` / `suggest_variable_name` | propose a name with a reason instead of applying it: it waits for you in **AI > Review suggested names** |
@@ -89,6 +94,29 @@ registers' live values).
 
 With `--allow-lua`: `run_lua`, which runs any Lua with ceasta's [scripting API](lua.md) — and
 Lua's `io` / `os`, so it has your file access.
+
+## analyzing a whole firmware image
+
+`ceasta-cli mcp` owns its files: launch it on anything (even a flat dump), then the AI opens the
+rest itself and walks the image — the u-boot, the kernel's modules, the userspace binaries —
+switching with a tool call instead of a config change:
+
+```
+claude mcp add ceasta -- ceasta-cli mcp rootfs/usr/lib/modules/audio.ko
+```
+
+*"open rootfs/usr/bin/prudynt, find where it calls IMP_System_Bind, and explain what the bind
+table it builds connects."* — `open_file` loads the binary, the analysis runs, and the listing
+comes out with ingenic IMP / ISP prototypes, GOT imports as `j_strcpy`-style thunks, o32 call
+arguments in the listing, and MXU instructions decoded (mips32, little endian: ingenic xburst,
+the t-series camera SoCs).
+
+The same works from the app's server for the file you have open — the open/close tools are the
+one CLI-only set, because the app's server follows your window.
+
+For mips debugging add `--allow-debug` and point `CEASTA_ROOTFS` at the extracted firmware root:
+the debug tools run the program under `qemu-mipsel` (watchpoints and `debug_call` stay
+native-only).
 
 ## ready-made prompts
 

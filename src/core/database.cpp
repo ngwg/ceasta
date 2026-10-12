@@ -1,4 +1,5 @@
 #include "core/database.h"
+#include "core/disasm.h"
 #include "core/os.h"
 #include "core/util.h"
 #include <algorithm>
@@ -555,6 +556,7 @@ void database::note_args(const function& f)
         a += sz ? sz : 1;
     }
     bool pe = bin.format == bin_format::pe, x64 = bin.is64(), a64 = bin.arch == bin_arch::arm64;
+    bool mips = bin.arch == bin_arch::mips;
     static const char* const win64[] = {"rcx", "rdx", "r8", "r9"};
     static const char* const sysv[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
     for (size_t i = 0; i < heads.size(); i++) {
@@ -564,12 +566,37 @@ void database::note_args(const function& f)
         const prototype* p = nullptr;
         if (call.has_target && !call.indirect)
             p = callee_proto(call.target);
-        else if (call.has_mem && !call.is_lea) // call [__imp_CreateFileW]
+        else if (mips && call.indirect && bin.mips_gp) {
+            // jalr t9: the got slot it calls through was loaded by a nearby lw t9, got16(gp)
+            int cr = regs::mips_num(call.reg0);
+            for (size_t j = i; j-- > 0 && i - j <= 8;) {
+                insn in;
+                if (!decode(heads[j], in) || in.kind != flow::normal)
+                    break;
+                if (ins::mips_lw(in) && regs::mips_num(in.reg0) == cr &&
+                    regs::mips_num(in.mem_base) == 28) {
+                    call.has_mem = true;
+                    call.mem = (bin.mips_gp + (int32_t)in.mem_disp) & 0xffffffffull;
+                    break;
+                }
+            }
+            if (call.has_mem)
+                p = known_prototype(name_at(call.mem));
+        } else if (call.has_mem && !call.is_lea) // call [__imp_CreateFileW]
             p = known_prototype(name_at(call.mem));
         if (!p || p->params.empty())
             continue;
-        size_t nregs = a64 ? 8 : !x64 ? 0 : pe ? 4 : 6;
+        size_t nregs = a64 ? 8 : mips ? 4 : !x64 ? 0 : pe ? 4 : 6;
         std::vector<bool> done(p->params.size(), false);
+        // mips: the call's delay slot runs first, so an argument set there is the last writer
+        if (mips && call.next() < f.end) {
+            insn ds;
+            if (decode(call.next(), ds) && ds.kind == flow::normal && ds.nwr && ds.wr[0] >= 4 &&
+                ds.wr[0] < 8 && !ds.mem_write && (ds.wr[0] - 4) < done.size()) {
+                done[(size_t)(ds.wr[0] - 4)] = true;
+                arg_notes_[call.next()] = p->params[(size_t)(ds.wr[0] - 4)].name;
+            }
+        }
         int pushes = 0;
         for (size_t j = i; j-- > 0 && i - j <= 24;) {
             insn in;
@@ -579,13 +606,17 @@ void database::note_args(const function& f)
             if (a64) {
                 if (in.nwr && in.wr[0] < nregs && !in.mem_write) // x0..x7 (w0..w7)
                     arg = in.wr[0];
+            } else if (mips) {
+                if (in.nwr && in.wr[0] >= 4 && in.wr[0] < 8 && !in.mem_write) // a0..a3
+                    arg = in.wr[0] - 4;
             } else if (!x64 && std::string(in.mnem) == "push")
                 arg = pushes++;
             else if (in.mem_write && in.has_mem_op && !in.mem_index && in.mem_base) {
-                // a stack argument: [rsp + 0x20 + 8 * n] on win64, [rsp + 8 * n] on system v / x86
+                // a stack argument: [rsp + 0x20 + 8 * n] on win64, [rsp + 8 * n] on system v / x86,
+                // [sp + 16 + 4 * n] on mips o32 (the first four live in a0..a3)
                 std::string base = reg_name(in.mem_base);
-                if (base == "rsp" || base == "esp") {
-                    int64_t off = in.mem_disp - (x64 && pe ? 0x20 : 0);
+                if (base == "rsp" || base == "esp" || base == "$sp" || (mips && base == "sp")) {
+                    int64_t off = in.mem_disp - (x64 && pe ? 0x20 : mips ? 16 : 0);
                     int ptr = x64 ? 8 : 4;
                     if (off >= 0 && off % ptr == 0)
                         arg = (int)nregs + (int)(off / ptr);
@@ -1024,8 +1055,8 @@ void database::format(const row& r, line_text& out)
             if (pr != an.page_refs.end())
                 out.target = pr->second;
         }
-        if (in.arm && in.has_mem && bin.is_mapped(in.mem) && !an.string_at(in.mem)) {
-            // blr x8 through a slot: what it calls. an address the text couldn't name: where it is
+        if ((in.arm || in.mips) && in.has_mem && bin.is_mapped(in.mem) && !an.string_at(in.mem)) {
+            // blr x8 / jalr t9 through a slot: what it calls. an address the text couldn't name: where it is
             std::string n = name_at(in.mem);
             if (in.is_branch() || n.empty() || out.text.find(n) == std::string::npos)
                 out.auto_comment = location(in.mem);
@@ -1358,6 +1389,31 @@ std::unique_ptr<database> open_database(const std::string& path, const load_opti
         if (!os::read_file(path, bytes, err))
             return nullptr;
         loader::raw(std::move(bytes), path, opts.raw_base, opts.raw_arch, db->bin);
+        // an entry override is often the only sane start for a raw blob (a pic stub at the
+        // base is one, but some dumps start mid-image)
+        if (opts.has_raw_entry && db->bin.has_entry) {
+            db->bin.entry = opts.raw_entry;
+            db->bin.func_hints.clear();
+            if (db->bin.is_mapped(opts.raw_entry))
+                db->bin.func_hints.push_back(opts.raw_entry);
+        }
+        // raw mips pic: the user's answer first, else vote on the prologues in the image.
+        // storing it in mips_gp turns on the elf paths: gp-known register state, got-like
+        // slot loads and jalr call resolution
+        if (opts.raw_arch == bin_arch::mips && !db->bin.mips_gp) {
+            if (opts.raw_gp) {
+                db->bin.mips_gp = opts.raw_gp;
+                db->bin.notes.push_back("mips pic: $gp from --gp");
+            } else if (db->bin.base) {
+                mips_pic pic = detect_mips_pic(db->bin.file, db->bin.base);
+                if (pic.found) {
+                    db->bin.mips_gp = pic.gp;
+                    db->bin.notes.push_back(util::fmt(
+                        "mips pic: $gp = 0x%x (from %d prologue%s, --gp overrides)", (uint32_t)pic.gp,
+                        pic.votes, pic.votes == 1 ? "" : "s"));
+                }
+            }
+        }
     } else {
         loader::options lo;
         lo.has_slice = opts.has_slice;

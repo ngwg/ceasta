@@ -1,5 +1,6 @@
 #include "core/kuna.h"
 #include "core/binary.h"
+#include "core/database.h"
 #include "core/json.h"
 #include "core/os.h"
 #include "core/process.h"
@@ -16,11 +17,23 @@ std::string kuna_find(const std::string& configured)
 
 std::string kuna_unsupported(const binary& b)
 {
-    if (b.format != bin_format::pe && b.format != bin_format::elf && b.format != bin_format::macho)
-        return "kuna reads pe, elf and mach-o files; this one was opened as raw code";
+    if (b.format != bin_format::pe && b.format != bin_format::elf && b.format != bin_format::macho &&
+        !(b.format == bin_format::raw && b.arch == bin_arch::mips))
+        return "kuna reads pe, elf and mach-o files, and raw mips dumps; this one was opened as some other raw code";
     if (b.path.empty() || !os::exists(b.path))
         return "the program isn't on disk for kuna to read";
     return std::string();
+}
+
+// how to load b in kuna when it isn't a pe / elf / mach-o: a raw mips dump gets kuna's own
+// raw loader (sleigh mips:LE:32 - ceasta's mips is little endian - at the dump's base), so
+// flash dumps and bootloader blobs decompile like elf files. "" ends the list
+std::vector<std::string> kuna_format_args(const binary& b)
+{
+    if (b.format == bin_format::raw && b.arch == bin_arch::mips)
+        return {"--raw-image", "--target", "MIPS:LE:32:default", "--base",
+                util::fmt("0x%llx", (unsigned long long)b.base)};
+    return {};
 }
 
 std::string kuna_input(const binary& b, std::string& err)
@@ -64,17 +77,41 @@ std::string first_lines(const std::string& text, int n)
 
 } // namespace
 
-kuna_result kuna_decompile(const std::string& kuna, const std::string& file, uint64_t addr, uint32_t timeout_ms,
-    const std::atomic<bool>* cancel)
+// the names the database knows (symbols, imports, your renames - not the sub_ fill-ins),
+// as --define-function start-end=name arguments for the kuna command line
+std::vector<std::string> kuna_define_args(const database& db)
+{
+    std::vector<std::string> out;
+    size_t n = 0;
+    for (const function& f : db.an.funcs) {
+        if (n >= 3000)
+            break;
+        std::string name = db.name_at(f.start);
+        if (name.empty() || name.rfind("sub_", 0) == 0)
+            continue;
+        out.push_back("--define-function");
+        out.push_back(util::fmt("%llx-%llx=%s", (unsigned long long)f.start, (unsigned long long)f.end,
+            name.c_str()));
+        n++;
+    }
+    return out;
+}
+
+kuna_result kuna_decompile(const std::string& kuna, const std::string& file, uint64_t addr,
+    uint32_t timeout_ms, const std::atomic<bool>* cancel, const std::vector<std::string>& extra_args)
 {
     kuna_result r;
     if (kuna.empty()) {
         r.error = "kuna isn't installed (put it on PATH, or set where it is)";
         return r;
     }
+    std::vector<std::string> argv{kuna, "decompile", file, util::fmt("0x%llx", (unsigned long long)addr),
+        "--addr"};
+    for (const std::string& a : extra_args)
+        argv.push_back(a);
+    argv.push_back("--json");
     uint64_t t0 = os::now_ms();
-    os::process_result p = os::run_process(
-        {kuna, "decompile", file, util::fmt("0x%llx", (unsigned long long)addr), "--addr", "--json"}, timeout_ms, cancel);
+    os::process_result p = os::run_process(argv, timeout_ms, cancel);
     r.millis = os::now_ms() - t0;
     if (!p.started) {
         r.error = "couldn't run kuna: " + p.error;

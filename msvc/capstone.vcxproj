@@ -40,7 +40,7 @@
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <SDLCheck>false</SDLCheck>
       <ConformanceMode>false</ConformanceMode>
-      <PreprocessorDefinitions>CAPSTONE_HAS_X86;CAPSTONE_HAS_ARM64;CAPSTONE_USE_SYS_DYN_MEM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CAPSTONE_HAS_X86;CAPSTONE_HAS_ARM64;CAPSTONE_HAS_MIPS;CAPSTONE_USE_SYS_DYN_MEM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\third_party\capstone\include;..\third_party\capstone;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
@@ -64,6 +64,10 @@
     <ClCompile Include="..\third_party\capstone\arch\X86\X86IntelInstPrinter.c" />
     <ClCompile Include="..\third_party\capstone\arch\X86\X86Mapping.c" />
     <ClCompile Include="..\third_party\capstone\arch\X86\X86Module.c" />
+    <ClCompile Include="..\third_party\capstone\arch\Mips\MipsDisassembler.c" />
+    <ClCompile Include="..\third_party\capstone\arch\Mips\MipsInstPrinter.c" />
+    <ClCompile Include="..\third_party\capstone\arch\Mips\MipsMapping.c" />
+    <ClCompile Include="..\third_party\capstone\arch\Mips\MipsModule.c" />
   </ItemGroup>
   <ItemGroup>
   </ItemGroup>

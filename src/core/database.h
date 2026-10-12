@@ -51,6 +51,9 @@ struct load_options {
     bool force_raw = false;
     bin_arch raw_arch = bin_arch::x64;
     uint64_t raw_base = 0;
+    uint64_t raw_gp = 0;      // raw blob: the $gp value of mips pic code (0 = auto)
+    bool has_raw_entry = false;
+    uint64_t raw_entry = 0;   // raw blob: entry point override (default: the base)
     // a universal mach-o file: which part to open (unset: x86_64 when it has one)
     bool has_slice = false;
     bin_arch slice = bin_arch::x64;

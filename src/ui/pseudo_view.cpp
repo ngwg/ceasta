@@ -389,8 +389,9 @@ static const kuna_entry* kuna_for(app_state& s, uint64_t func)
             k.worker = std::thread([] {});
             return nullptr;
         }
-        k.worker = std::thread([exe, file, func] {
-            g_kuna.result = kuna_decompile(exe, file, func, 120000, &g_kuna.cancel);
+        std::vector<std::string> defines = kuna_define_args(*s.db);
+        k.worker = std::thread([exe, file, func, defines] {
+            g_kuna.result = kuna_decompile(exe, file, func, 120000, &g_kuna.cancel, defines);
             g_kuna.finished = true;
         });
     }

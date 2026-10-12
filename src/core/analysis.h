@@ -101,6 +101,20 @@ struct analysis {
 // runs the full analysis. progress may be null. returns false if cancelled
 bool analyze(const binary& b, analysis& out, analysis_progress* progress = nullptr);
 
+// mips pic prologue shapes that set up $gp from its own address (self-relative code, common in
+// roms / flash dumps with no loader to answer). found: a high confidence guess, votes: how many
+// prologues agree. votes >= 3 means every function that touches gp-relative data likely starts
+// with one of these
+struct mips_pic {
+    bool found = false;
+    uint64_t gp = 0;
+    int votes = 0;
+};
+
+// scans function starts for pic prologues (bal +8; lw $gp,($ra) or lui/addiu pairs) and votes.
+// blob is the whole image in file order, base its load address
+mips_pic detect_mips_pic(const std::vector<uint8_t>& blob, uint64_t base);
+
 // control flow graph of one function, built on demand for the graph view
 
 enum class edge_kind : uint8_t { next, taken, not_taken, jump, table };

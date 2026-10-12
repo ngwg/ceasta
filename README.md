@@ -2,7 +2,7 @@
   <img src="docs/icon.png" width="96" height="96" alt="ceasta">
 </p>
 <h1 align="center">ceasta</h1>
-<p align="center">a disassembler, decompiler and debugger in one — for windows, linux and macos, x86, x64 and arm64</p>
+<p align="center">a disassembler, decompiler and debugger in one — for windows, linux and macos, x86, x64, arm64 and mips</p>
 <p align="center">
   <a href="https://github.com/ngwg/ceasta/releases"><img src="https://img.shields.io/github/v/release/ngwg/ceasta?color=2ea043&label=release" alt="latest release"></a>
   <img src="https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-555" alt="platforms">
@@ -78,21 +78,22 @@ grab it from the [releases page](https://github.com/ngwg/ceasta/releases):
 
 ## what it does
 
-- opens pe files (exe, dll, sys — x86, x64 and arm64), elf (x86, x64, arm64), mach-o (macos / ios programs and libraries, x86_64 and arm64, universal files too) and raw code
+- opens pe files (exe, dll, sys — x86, x64 and arm64), elf (x86, x64, arm64, and mips32 including kernel modules), mach-o (macos / ios programs and libraries, x86_64 and arm64, universal files too) and raw code
+- mips32, little endian (ingenic xburst — the t-series camera SoCs, and anything else mips32r2): full decode including ingenic's mxu simd extension, kernel modules with relocations applied (`.ko` — hi16/lo16 pairs and friends, so cross section references resolve), got imports and plt thunks named, o32 call arguments in the listing, ingenic IMP / ISP prototypes built in, and pseudocode via kuna. see [mips and camera firmware](#mips-and-camera-firmware)
 - auto analysis: functions (entry, exports, symbols, .pdata, unwind tables, mach-o function starts, tls callbacks, calls, pointers in data), switch tables, xrefs, strings (ascii + utf-16), imports / exports, thunks, noreturn calls
 - ida-style listing: names instead of addresses, labels, xref and string comments, the arguments each instruction passes to a known api
 - function graph (space): colored edges, zoom with ctrl + wheel, drag to pan
 - decompiler (f5, x86 / x64): c-like pseudocode — if / else, loops, switch, stack variables, calls with their arguments (~350 known api prototypes). click a name: `n` renames it, `y` sets a type or a prototype. shift+f5 shows it next to the listing
-- a second decompiler if you want one: with [kuna](https://github.com/Noelo-Lab/kuna) installed (a decompiler ported from ghidra's), the pseudocode view gets a `kuna` switch — its output for the same function, lines linked to the listing, arm64 too. [more below](#second-decompiler-kuna)
+- a second decompiler if you want one: with [kuna](https://github.com/Noelo-Lab/kuna) installed (a decompiler ported from ghidra's), the pseudocode view gets a `kuna` switch — its output for the same function, lines linked to the listing, arm64 and mips too, speaking the names and prototypes from your listing. [more below](#second-decompiler-kuna)
 - file info: headers, security flags (aslr, dep, cfg / pie, nx, relro, canary / hardened runtime), md5 / sha256 / imphash, section entropy, resources, version info, a mac program's code signature and entitlements, and warnings when it looks packed
 - search everything (ctrl+f): functions, names, imports, exports, strings, comments and segments in one box, and the strings say where they're used
-- debugger (x86 / x64, windows and linux): start or attach, breakpoints (with conditions: `rdi == 3`), watchpoints on variables, step into / over / out, step back, run to cursor, pause, registers, stack, call stack, memory map, live memory
+- debugger (x86 / x64 native on windows and linux, arm64 / mips through the linux backend — mips runs under `qemu-mipsel` with `CEASTA_ROOTFS` set to the extracted firmware root): start or attach, breakpoints (with conditions: `rdi == 3`), watchpoints on variables (native backends), step into / over / out, step back, run to cursor, pause, registers, stack, call stack, memory map, live memory
   - the pseudocode marks the line you're stopped on
   - call a function in the running program (`call decrypt "..."`), record indirect call targets as xrefs (`trace`)
   - `ceasta-cli dbg`: the same debugger in a terminal
 - binary diff: match functions between two builds and see what changed
 - library signatures: name known functions in a stripped binary (`sigmake` / `sigapply`)
-- a built-in MCP server: connect an AI (Claude Code, Cursor, ...) to the open binary from the AI menu, or with `ceasta-cli mcp` — with ready-made prompts, and names you review before they're applied. see [connect an AI](docs/mcp.md)
+- a built-in MCP server: connect an AI (Claude Code, Cursor, ...) to the open binary from the AI menu, or with `ceasta-cli mcp` — with ready-made prompts, and names you review before they're applied. with `ceasta-cli mcp` the AI can open and close files itself and walk a whole firmware image — kernel modules, apps, raw dumps — in one session. see [connect an AI](docs/mcp.md)
 - rename, comments, bookmarks, jump to address or name, xrefs, byte search, back / forward, undo / redo, and every action in one list (ctrl+shift+p)
 - your work in one file, like ida's `.i64`: ctrl+s writes `<file>.ceasta` with your names, comments, types, breakpoints and the program itself — it opens later, or on another machine, without the original. closing asks before it throws unsaved work away
 - trade names with other tools: export an idapython script, a ghidra script or an x64dbg database; import from x64dbg, `.map` files, and ida / ghidra (with the scripts in `scripts/`)
@@ -169,7 +170,7 @@ ceasta-cli import file.exe names.json     names from x64dbg, a .map, ida or ghid
 ceasta-cli mcp file.exe             serve the file to an AI over MCP
 ```
 
-`--raw32` / `--raw64` / `--raw-arm64` (and `--base <hex>`) load a file as raw code.
+`--raw32` / `--raw64` / `--raw-arm64` / `--raw-mips` (and `--base <hex>`) load a file as raw code.
 
 ## second decompiler: kuna
 
@@ -177,7 +178,7 @@ ceasta-cli mcp file.exe             serve the file to an AI over MCP
 
 - install kuna the way its readme says and put `kuna` on your PATH, or point ceasta at it: view > second decompiler (kuna)...
 - the pseudocode view then has a `ceasta | kuna` switch. kuna's output is read-only and uses its own names (`sub_401000`, `dat_404010`), but its lines are linked to the listing like ceasta's, and a click on `sub_...` jumps there
-- it reads arm64 too, where ceasta's own decompiler stops
+- it reads arm64 and raw mips dumps too, where ceasta's own decompiler stops (a raw dump loads in kuna with its own raw loader, at the same base)
 - `ceasta-cli decompile file main --kuna` (or `--kuna-path /path/to/kuna`), and the AI gets a `decompile_with_kuna` tool
 
 ## connect an AI
@@ -228,7 +229,7 @@ cd ceasta-cli-*-linux-x64
 ./ceasta-cli dbg ./program                  debug it (break, step, registers, memory)
 ```
 
-both read elf, windows pe and mac mach-o files alike (x86, x64, arm64), so you can look at a windows exe — or an arm64 phone or server binary, or a mac app — from linux too.
+both read elf, windows pe and mac mach-o files alike (x86, x64, arm64, mips), so you can look at a windows exe — or an arm64 phone or server binary, a mac app, or a camera firmware — from linux too.
 
 the terminal debugger (`dbg`) is a ptrace debugger with ceasta's names, disassembly and decompiler built in:
 
@@ -264,6 +265,24 @@ it reads mach-o files: programs, libraries, bundles and `.o` files, x86_64 and a
 ```
 
 there's no debugger on macos yet: that needs apple's debugging interfaces and a signed, entitled build. the windows and linux builds have one, and they read mac files too.
+
+## mips and camera firmware
+
+mips32, little endian — ingenic's xburst cores (the t10–t41 camera SoCs and friends), and any other mips32r2-class code:
+
+- decode: the full base isa plus ingenic's own mxu simd extension (capstone stops at plain mips, so ceasta decodes it itself)
+- formats: elf (u-boot, vmlinux, apps, stripped or not), kernel modules (`.ko` — relocations are applied at load, so `hi16` / `lo16` pairs and cross section references resolve), and flat dumps (`--raw-mips --base <hex>`, or "mips" in the open-as-raw panel)
+- analysis: `lui` / `addiu` constant pairs tracked like arm64's adrp/add, got imports and plt thunks named (`j_strcpy`), switch tables resolved, and o32 call arguments in the listing (`a0`–`a3`, stack and delay slots)
+- ingenic IMP / ISP prototypes are built in, so camera firmware calls come out with named, typed arguments
+- pseudocode via kuna, speaking the names from your listing
+- debug under emulation: install qemu-user, point `CEASTA_ROOTFS` at an extracted firmware root, and the debugger runs the program — breakpoints, stepping, registers, memory. watchpoints and `call` stay native-only
+
+```
+ceasta-cli info firmware.bin                      a whole flash dump, raw
+ceasta-cli funcs rootfs/usr/lib/modules/audio.ko  a kernel module, relocations applied
+ceasta-cli decompile rootfs/usr/bin/prudynt 0x17a80 --kuna
+ceasta-cli dbg rootfs/usr/bin/prudynt             live, under qemu-mipsel
+```
 
 ## build
 
@@ -301,7 +320,7 @@ ci builds glfw and ceasta for arm64 and x86_64 at once (`-DCMAKE_OSX_ARCHITECTUR
 - `scripts/` — `ida_to_ceasta.py` and `ghidra_to_ceasta.py`: your names from those tools, for file > import names
 - `docs/` — the [lua guide](docs/lua.md), the [changelog](docs/CHANGELOG.md), third-party licenses, screenshots
 - `installer/` — inno setup script and packaging; `packaging/linux/` — the AppImage's desktop entry and icon; `packaging/macos/` — the app's Info.plist and icon; `src/mac_platform.mm` — the mac open / save panels
-- `third_party/` — imgui, capstone (x86 and arm64), lua 5.4
+- `third_party/` — imgui, capstone (x86, arm64 and mips), lua 5.4
 
 ## license
 

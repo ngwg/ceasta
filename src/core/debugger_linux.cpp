@@ -2,6 +2,7 @@
 
 #ifdef CEASTA_LINUX_DEBUGGER
 
+#include "core/debugger_remote.h"
 #include "core/disasm.h"
 #include "core/os.h"
 #include "core/util.h"
@@ -101,6 +102,8 @@ struct thread_ctx {
 struct debugger::impl {
     debugger& owner;
     explicit impl(debugger& o) : owner(o) {}
+
+    remote_state* r = nullptr;    // set: the program is a mips one, running under qemu
 
     enum class step { none, into, resume };
 
@@ -649,6 +652,11 @@ debugger::debugger() : d(new impl(*this)) {}
 
 debugger::~debugger()
 {
+    if (d->r) {
+        remote::destroy(d->r);
+        d->r = nullptr;
+        return;
+    }
     if (d->state != dbg_state::none) {
         if (d->attached)
             detach();
@@ -661,7 +669,7 @@ bool debugger::supported() { return true; }
 
 bool debugger::start(const std::string& exe, const std::string& args, const std::string& cwd, std::string& err)
 {
-    if (d->state != dbg_state::none) {
+    if (d->state != dbg_state::none || d->r) {
         err = "a process is already being debugged";
         return false;
     }
@@ -669,6 +677,14 @@ bool debugger::start(const std::string& exe, const std::string& args, const std:
     if (loader::peek_arch(exe, arch) && arch == bin_arch::arm64) {
         err = "the debugger runs x86 and x64 programs; this one is arm64";
         return false;
+    }
+    if (loader::peek_arch(exe, arch) && arch == bin_arch::mips) {
+        // mips programs run under qemu's emulator, through its gdb stub
+        if (!remote::start(d->r, exe, args, cwd, break_on_entry, on_log, err))
+            return false;
+        if (on_created)
+            on_created();
+        return true;
     }
     std::vector<std::string> argv{exe};
     for (const std::string& a : util::split(args, " "))
@@ -755,6 +771,12 @@ bool debugger::attach(uint32_t pid, std::string& err)
 
 void debugger::detach()
 {
+    if (d->r) {
+        remote::destroy(d->r);
+        d->r = nullptr;
+        d->log("detached");
+        return;
+    }
     if (d->state == dbg_state::none)
         return;
     for (const auto& b : d->bps)
@@ -773,6 +795,11 @@ void debugger::detach()
 
 void debugger::kill()
 {
+    if (d->r) {
+        remote::destroy(d->r);
+        d->r = nullptr;
+        return;
+    }
     if (d->state == dbg_state::none)
         return;
     d->killing = true;
@@ -787,6 +814,16 @@ void debugger::kill()
 
 void debugger::poll(uint32_t timeout_ms)
 {
+    if (d->r) {
+        dbg_state before = remote::state(d->r);
+        remote::poll(d->r, timeout_ms);
+        if (before == dbg_state::running && remote::state(d->r) == dbg_state::none) {
+            int code = remote::exit_code(d->r);
+            if (on_exit)
+                on_exit(code);
+        }
+        return;
+    }
     uint64_t deadline = os::now_ms() + timeout_ms;
     for (int i = 0; i < 512 && d->state == dbg_state::running; i++) {
         int status = 0;
@@ -805,13 +842,30 @@ void debugger::poll(uint32_t timeout_ms)
     }
 }
 
-dbg_state debugger::state() const { return d->state; }
+dbg_state debugger::state() const { return d->r ? remote::state(d->r) : d->state; }
 
-bool debugger::raw_cont(std::string& err) { return d->resume(impl::step::none, err); }
-bool debugger::raw_step_into(std::string& err) { return d->resume(impl::step::into, err); }
+bool debugger::raw_cont(std::string& err)
+{
+    if (d->r)
+        return remote::cont(d->r, false, err);
+    return d->resume(impl::step::none, err);
+}
+bool debugger::raw_step_into(std::string& err)
+{
+    if (d->r)
+        return remote::cont(d->r, true, err);
+    return d->resume(impl::step::into, err);
+}
 
 bool debugger::raw_step_over(std::string& err)
 {
+    if (d->r) {
+        if (remote::state(d->r) != dbg_state::stopped) {
+            err = "the process isn't stopped";
+            return false;
+        }
+        return remote::step_over(d->r, err);
+    }
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
         return false;
@@ -833,6 +887,13 @@ bool debugger::raw_step_over(std::string& err)
 
 bool debugger::raw_run_to(uint64_t addr, std::string& err)
 {
+    if (d->r) {
+        if (remote::state(d->r) != dbg_state::stopped) {
+            err = "the process isn't stopped";
+            return false;
+        }
+        return remote::run_to(d->r, addr, err);
+    }
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
         return false;
@@ -846,6 +907,8 @@ bool debugger::raw_run_to(uint64_t addr, std::string& err)
 
 bool debugger::pause(std::string& err)
 {
+    if (d->r)
+        return remote::pause(d->r, err);
     if (d->state != dbg_state::running) {
         err = "the process isn't running";
         return false;
@@ -861,6 +924,11 @@ bool debugger::pause(std::string& err)
 
 bool debugger::add_bp(uint64_t addr, std::string& err)
 {
+    if (d->r) {
+        if (remote::has_bp(d->r, addr))
+            return true;
+        return remote::set_bp(d->r, addr, true, err);
+    }
     if (!d->pid) {
         err = "no process";
         return false;
@@ -882,6 +950,8 @@ bool debugger::add_bp(uint64_t addr, std::string& err)
 
 bool debugger::del_bp(uint64_t addr)
 {
+    if (d->r)
+        return remote::set_bp(d->r, addr, false, d->reason) || !remote::has_bp(d->r, addr);
     auto it = d->bps.find(addr);
     if (it == d->bps.end())
         return false;
@@ -896,10 +966,17 @@ bool debugger::del_bp(uint64_t addr)
     return true;
 }
 
-bool debugger::has_bp(uint64_t addr) const { return d->bps.count(addr) != 0; }
+bool debugger::has_bp(uint64_t addr) const
+{
+    if (d->r)
+        return remote::has_bp(d->r, addr);
+    return d->bps.count(addr) != 0;
+}
 
 std::vector<uint64_t> debugger::bps() const
 {
+    if (d->r)
+        return remote::bps(d->r);
     std::vector<uint64_t> out;
     for (const auto& b : d->bps)
         out.push_back(b.first);
@@ -908,18 +985,28 @@ std::vector<uint64_t> debugger::bps() const
 
 uint64_t debugger::pc() const
 {
+    if (d->r)
+        return remote::pc(d->r);
     thread_ctx c;
     return d->state == dbg_state::stopped && d->get_ctx(d->cur_tid, c) ? c.pc() : 0;
 }
 
 uint64_t debugger::sp() const
 {
+    if (d->r) {
+        for (const reg_value& reg : remote::registers(d->r))
+            if (reg.name == "sp")
+                return reg.value;
+        return 0;
+    }
     thread_ctx c;
     return d->state == dbg_state::stopped && d->get_ctx(d->cur_tid, c) ? c.sp() : 0;
 }
 
 std::vector<reg_value> debugger::registers() const
 {
+    if (d->r)
+        return remote::registers(d->r);
     std::vector<reg_value> out;
     thread_ctx c;
     if (d->state != dbg_state::stopped || !d->get_ctx(d->cur_tid, c))
@@ -939,6 +1026,8 @@ std::vector<reg_value> debugger::registers() const
 
 bool debugger::set_register(const std::string& name, uint64_t v, std::string& err)
 {
+    if (d->r)
+        return remote::set_register(d->r, name, v, err);
     thread_ctx c;
     if (d->state != dbg_state::stopped || !d->get_ctx(d->cur_tid, c)) {
         err = "the process isn't stopped";
@@ -971,6 +1060,10 @@ bool debugger::set_register(const std::string& name, uint64_t v, std::string& er
 
 size_t debugger::read(uint64_t addr, void* out, size_t n) const
 {
+    if (d->r) {
+        size_t got = remote::read(d->r, addr, out, n) ? n : 0;
+        return got;
+    }
     size_t got = d->raw_read(addr, out, n);
     uint8_t* p = (uint8_t*)out;
     for (auto it = d->bps.lower_bound(addr); it != d->bps.end() && it->first < addr + got; ++it)
@@ -982,6 +1075,13 @@ size_t debugger::read(uint64_t addr, void* out, size_t n) const
 
 bool debugger::write(uint64_t addr, const void* in, size_t n, std::string& err)
 {
+    if (d->r) {
+        if (!remote::write(d->r, addr, in, n)) {
+            err = "can't write memory at " + util::hex(addr);
+            return false;
+        }
+        return true;
+    }
     if (!d->pid) {
         err = "no process";
         return false;
@@ -1007,6 +1107,11 @@ bool debugger::write(uint64_t addr, const void* in, size_t n, std::string& err)
 
 bool debugger::raw_call(uint64_t func, const std::vector<uint64_t>& args, uint64_t& result, std::string& err)
 {
+    if (d->r) {
+        (void)func, (void)args, (void)result;
+        err = "calling a function isn't available for emulated programs";
+        return false;
+    }
     if (d->state != dbg_state::stopped) {
         err = "the process isn't stopped";
         return false;
@@ -1132,6 +1237,8 @@ bool debugger::raw_call(uint64_t func, const std::vector<uint64_t>& args, uint64
 // changes a stopped thread's registers) and pick it up before they run on
 bool debugger::apply_watches(std::string& err)
 {
+    if (d->r)
+        return remote::apply_watches(d->r, active_watches(), err);
     if (d->state != dbg_state::stopped) {
         err = "stop the program first";
         return false;
@@ -1155,14 +1262,16 @@ bool debugger::apply_watches(std::string& err)
     return true;
 }
 
-bool debugger::is64() const { return !d->m32; }
-uint64_t debugger::image_base() const { return d->image_base; }
-uint32_t debugger::pid() const { return (uint32_t)d->pid; }
-uint32_t debugger::tid() const { return (uint32_t)d->cur_tid; }
-int debugger::exit_code() const { return d->exit_code; }
-std::string debugger::stop_reason() const { return d->reason; }
+bool debugger::is64() const { return d->r ? false : !d->m32; }
+uint64_t debugger::image_base() const { return d->r ? remote::image_base(d->r) : d->image_base; }
+uint32_t debugger::pid() const { return d->r ? remote::pid(d->r) : (uint32_t)d->pid; }
+uint32_t debugger::tid() const { return d->r ? remote::pid(d->r) : (uint32_t)d->cur_tid; }
+int debugger::exit_code() const { return d->r ? remote::exit_code(d->r) : d->exit_code; }
+std::string debugger::stop_reason() const { return d->r ? remote::stop_reason(d->r) : d->reason; }
 std::vector<dbg_module> debugger::modules() const
 {
+    if (d->r)
+        return remote::modules(d->r);
     if (d->state == dbg_state::stopped && d->maps_seq != d->stop_seq) {
         d->scan_maps();
         d->maps_seq = d->stop_seq;
@@ -1173,6 +1282,8 @@ std::vector<dbg_module> debugger::modules() const
 // /proc/<pid>/maps: "lo-hi perms offset dev inode path"
 std::vector<dbg_region> debugger::regions() const
 {
+    if (d->r)
+        return remote::regions(d->r);
     std::vector<dbg_region> out;
     if (!d->pid)
         return out;
@@ -1201,6 +1312,11 @@ std::vector<dbg_region> debugger::regions() const
 std::vector<dbg_thread> debugger::threads() const
 {
     std::vector<dbg_thread> out;
+    if (d->r) {
+        if (remote::state(d->r) == dbg_state::stopped)
+            out.push_back({remote::pid(d->r), remote::pc(d->r)});
+        return out;
+    }
     for (const auto& t : d->threads) {
         thread_ctx c;
         out.push_back({(uint32_t)t.first, d->state == dbg_state::stopped && d->get_ctx(t.first, c) ? c.pc() : 0});
@@ -1210,6 +1326,8 @@ std::vector<dbg_thread> debugger::threads() const
 
 bool debugger::select_thread(uint32_t tid)
 {
+    if (d->r)
+        return tid == remote::pid(d->r);
     if (!d->threads.count((pid_t)tid))
         return false;
     d->cur_tid = (pid_t)tid;

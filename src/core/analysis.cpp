@@ -179,6 +179,7 @@ struct worker {
     bool imm_refs = false;
     bool cancelled = false;
     bool arm = false;                             // arm64: 4 byte instructions, the a64_ state below
+    bool mips = false;                            // mips32: 4 byte instructions, delay slots
 
     // arm64: what registers hold while walking code. kind 1: an address (adrp, adr, add),
     // kind 2: the value loaded from the address v (a pointer slot, like a got entry)
@@ -199,6 +200,29 @@ struct worker {
         bool empty() const { return regs.empty() && breg < 0 && breg2 < 0 && creg < 0; }
     };
     std::unordered_map<uint64_t, a64_state> a64_pending; // the state a branch target starts with
+
+    // mips: what the general registers hold while walking code. kind 1: a constant or address
+    // (lui, addiu, ori, a got entry known from the file), kind 2: loaded from the slot at v
+    // (a got entry that's an import). $gp keeps its value across calls in o32 code
+    struct mips_state {
+        uint32_t v[32] = {};
+        uint8_t k[32] = {};
+        int creg = -1;     // a "slti creg, idx, cimm" bound (a switch index) still live
+        uint32_t cimm = 0;
+        uint8_t clob = 0;  // 1: a call's clobbers pend; 2: its delay slot has run
+        bool empty() const
+        {
+            if (creg >= 0)
+                return false;
+            for (int i = 0; i < 32; i++)
+                if (k[i])
+                    return false;
+            return true;
+        }
+    };
+    std::unordered_map<uint64_t, mips_state> mips_pending;
+    uint32_t gp_value = 0; // the $gp constant a pic elf sets up at its entry
+    bool gp_known = false;
 
     worker(const binary& bin, analysis& out, analysis_progress* p) : b(bin), an(out), prog(p) {}
 
@@ -236,7 +260,7 @@ struct worker {
 
     void add_func(uint64_t a, bool weak = false)
     {
-        if (!code_at(a) || (arm && (a & 3)))
+        if (!code_at(a) || ((arm || mips) && (a & 3)))
             return;
         if (weak && b.starts_complete && !func_starts.count(a)) {
             if (!(an.flags_at(a) & fl_code)) {
@@ -256,7 +280,7 @@ struct worker {
 
     void push_code(uint64_t a)
     {
-        if (code_at(a) && !(arm && (a & 3)))
+        if (code_at(a) && !((arm || mips) && (a & 3)))
             work.push_back(a);
     }
 
@@ -285,6 +309,12 @@ struct worker {
     {
         const segment* s = b.seg_at(slot);
         bool got = s && (s->name.compare(0, 4, ".got") == 0 || s->name == "__got" || s->name == "__auth_got");
+        // a raw dump has no section names: with $gp recovered, any word reachable as a signed
+        // 16 bit gp offset — the form every "lw x, off($gp)" the code emits takes
+        if (!got && b.format == bin_format::raw && gp_known) {
+            uint32_t d = (uint32_t)(slot - gp_value);
+            got = d >= (uint32_t)0xffff8000 || d < 0x8000;
+        }
         return got && !an.slot_import.count(slot) && b.read_ptr(slot, v) && v && b.is_mapped(v);
     }
 
@@ -391,6 +421,148 @@ struct worker {
             a64_pending.emplace(target, st);
     }
 
+    // ---- mips register tracking ----
+
+    // a register read: $zero reads as the known constant 0
+    static bool mips_get(const mips_state& st, int r, uint8_t& kind, uint32_t& v)
+    {
+        if (r == 0) {
+            kind = 1;
+            v = 0;
+            return true;
+        }
+        if (r > 0 && st.k[r]) {
+            kind = st.k[r];
+            v = st.v[r];
+            return true;
+        }
+        return false;
+    }
+
+    // runs one instruction over the register state. loads and stores at a known base, and
+    // branches through a known register, resolve to addresses (pc_refs, in.has_mem / target)
+    void mips_step(mips_state& st, insn& in)
+    {
+        int rd = regs::mips_num(in.reg0);
+        // the call was two steps ago (its delay slot ran with pre-call state): its
+        // caller-saved clobbers land here, before whatever this instruction does
+        if (st.clob == 2) {
+            static const int scratch[] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25};
+            for (int r : scratch) {
+                st.k[r] = 0;
+                if (st.creg == r)
+                    st.creg = -1;
+            }
+        }
+        if (st.clob)
+            st.clob++;
+
+        // read every source before anything kills it: an addiu usually writes its own source
+        uint8_t kd = 0, k1 = 0, k2 = 0, kb = 0;
+        uint32_t vd = 0, v1 = 0, v2 = 0, vb = 0;
+        mips_get(st, rd, kd, vd);
+        mips_get(st, regs::mips_num(in.reg1), k1, v1);
+        mips_get(st, regs::mips_num(in.reg2), k2, v2);
+        mips_get(st, regs::mips_num(in.mem_base), kb, vb);
+
+        // memory at a known base: lw t9, got16(gp) resolves to its slot
+        if (in.has_mem_op && kb == 1) {
+            uint32_t use = vb + (int32_t)in.mem_disp;
+            an.pc_refs[in.addr] = use;
+            in.has_mem = true;
+            in.mem = use;
+        }
+        // an indirect branch or call through a register we know: jr t9 / jalr t9
+        if (in.indirect && in.is_branch() && kd) {
+            an.pc_refs[in.addr] = vd;
+            if (kd == 1 && !in.has_mem_op) {
+                in.has_target = true;
+                in.target = vd; // jr to a lui / addiu computed address
+            } else if (kd == 2) {
+                in.has_mem = true;
+                in.mem = vd; // the got slot: imports resolve through it
+            }
+        }
+
+        // kill what it writes, then remember what we can track
+        for (uint8_t i = 0; i < in.nwr; i++) {
+            if (in.wr[i] > 0)
+                st.k[in.wr[i]] = 0;
+            if (in.wr[i] == st.creg)
+                st.creg = -1;
+        }
+
+        bool addr_formed = false; // an add / ori / move resolved a register to a known address
+        if (ins::mips_lui(in)) {
+            if (rd > 0) {
+                st.k[rd] = 1;
+                st.v[rd] = (uint32_t)in.imm; // decode stored it shifted left 16
+            }
+        } else if (ins::mips_addiu(in) && rd > 0 && k1 == 1) {
+            st.k[rd] = 1;
+            st.v[rd] = v1 + (uint32_t)(int32_t)in.imm;
+            addr_formed = true;
+        } else if (ins::mips_ori(in) && rd > 0 && k1 == 1) {
+            st.k[rd] = 1;
+            st.v[rd] = v1 | (uint32_t)in.imm;
+            addr_formed = true;
+        } else if (ins::mips_xori(in) && rd > 0 && k1 == 1) {
+            st.k[rd] = 1;
+            st.v[rd] = v1 ^ (uint32_t)in.imm;
+            addr_formed = true;
+        } else if (ins::mips_andi(in) && rd > 0 && k1 == 1) {
+            st.k[rd] = 1;
+            st.v[rd] = v1 & (uint32_t)in.imm;
+        } else if ((ins::mips_addu(in) || ins::mips_subu(in)) && rd > 0 && k1 == 1 && k2 == 1) {
+            st.k[rd] = 1;
+            st.v[rd] = ins::mips_subu(in) ? v1 - v2 : v1 + v2;
+            addr_formed = true;
+        } else if (ins::mips_move(in) && rd > 0) {
+            st.k[rd] = k1;
+            st.v[rd] = v1;
+            if (k1 == 1)
+                addr_formed = true;
+        } else if (ins::mips_lw(in) && rd > 0 && in.has_mem) {
+            uint64_t ptr;
+            if (got_value(in.mem, ptr)) {
+                st.k[rd] = 1; // a pointer the file already knows
+                st.v[rd] = (uint32_t)ptr;
+            } else {
+                st.k[rd] = 2; // loaded from the slot at mem (an import, usually)
+                st.v[rd] = (uint32_t)in.mem;
+            }
+        } else if (ins::mips_slti(in)) {
+            st.creg = regs::mips_num(in.reg1);
+            st.cimm = (uint32_t)in.imm;
+        }
+        // a pair (lui %hi / addiu %lo) just computed an address: surface it like an lea
+        if (addr_formed && rd > 0 && st.k[rd] == 1 && !in.has_mem) {
+            an.pc_refs[in.addr] = st.v[rd];
+            in.has_mem = true;
+            in.mem = st.v[rd];
+            in.is_lea = true;
+        }
+        if (in.kind == flow::call) {
+            // caller saved: v0 v1, a0..a3, t0..t7, t8 t9 — but the delay slot runs first,
+            // so the clobbers wait two steps. $gp and the s registers survive
+            st.k[31] = 1; // ra
+            st.v[31] = (uint32_t)(in.addr + 8); // delay slots: the return address is addr + 8
+            st.clob = 1;
+        }
+        // o32: $gp is a program constant (the code reloads it from the frame after calls,
+        // which only restores the same value) — whatever ran, it stays known
+        if (gp_known) {
+            st.k[28] = 1;
+            st.v[28] = gp_value;
+        }
+    }
+
+    void mips_hand_over(uint64_t target, const mips_state& st)
+    {
+        if (!st.empty() && !func_starts.count(target) && !(an.flags_at(target) & fl_code))
+            mips_pending.emplace(target, st);
+    }
+
     // an arm64 stub that jumps through an import slot: adrp x16, page; ldr x17, [x16, #off];
     // add x16, x16, #off; br x17 (plt), or adrp x16 / ldr x16 / br x16 (windows). the slot, or 0
     uint64_t a64_stub_slot(uint64_t a)
@@ -429,6 +601,29 @@ struct worker {
         return false;
     }
 
+    // mips pic plt stub: lui gp, hi / lw t9, slot(gp) / addiu gp, gp, lo / jr t9 (or a t7
+    // variant). the got slot it jumps through, or 0
+    uint64_t mips_stub_slot(uint64_t a)
+    {
+        mips_state st;
+        if (gp_known) {
+            st.k[28] = 1;
+            st.v[28] = gp_value;
+        }
+        for (int i = 0; i < 8; i++, a += 4) {
+            insn in;
+            if (!dis.decode(b, a, in) || !in.mips)
+                return 0;
+            bool tail = in.indirect && in.kind == flow::jump;
+            mips_step(st, in);
+            if (tail)
+                return in.has_mem ? in.mem : 0;
+            if (in.is_branch() || in.kind == flow::stop)
+                return 0; // a real branch: not a stub tail
+        }
+        return 0;
+    }
+
     int import_of_slot(uint64_t slot) const
     {
         auto it = an.slot_import.find(slot);
@@ -445,6 +640,10 @@ struct worker {
         insn in;
         if (arm) {
             uint64_t slot = a64_stub_slot(a);
+            if (slot)
+                r = import_of_slot(slot);
+        } else if (mips) {
+            uint64_t slot = mips_stub_slot(a);
             if (slot)
                 r = import_of_slot(slot);
         } else if (dis.decode(b, a, in)) {
@@ -487,8 +686,16 @@ struct worker {
             data_cand.emplace(a, size);
     }
 
-    // "call $+5; pop reg" is how 32 bit code reads eip, not a call to a function
-    static bool get_pc_call(const insn& in) { return in.kind == flow::call && in.has_target && in.target == in.next(); }
+    // "call $+5; pop reg" is how 32 bit code reads eip, not a call to a function. mips's
+    // "bal to the delay slot or the next line" does the same with ra
+    static bool get_pc_call(const insn& in)
+    {
+        if (in.kind != flow::call || !in.has_target)
+            return false;
+        if (in.mips)
+            return in.target == in.next() || in.target == in.next() + 4;
+        return in.target == in.next();
+    }
 
     void refs(const insn& in)
     {
@@ -822,6 +1029,169 @@ struct worker {
         }
     }
 
+    // mips: what the register walk knew before a hist entry
+    struct mips_seen {
+        uint8_t k = 0;        // bits 1, 2, 4: mem_base, reg1, reg2 known
+        uint32_t v[3] = {};
+        int creg = -1;        // the switch bound still live at that point
+        uint32_t cimm = 0;
+    };
+
+    static mips_seen mips_snapshot(const mips_state& st, const insn& in)
+    {
+        mips_seen r;
+        r.creg = st.creg;
+        r.cimm = st.cimm;
+        unsigned regs3[3] = {in.mem_base, in.reg1, in.reg2};
+        for (int i = 0; i < 3; i++) {
+            uint8_t kind;
+            uint32_t v;
+            if (mips_get(st, regs::mips_num(regs3[i]), kind, v) && kind == 1) {
+                r.k |= (uint8_t)(1 << i);
+                r.v[i] = v;
+            }
+        }
+        return r;
+    }
+
+    // mips: the instruction in hist[0..pos) that last wrote general register r, or -1
+    static int mips_def(const insn* hist, int pos, int r)
+    {
+        if (r <= 0)
+            return -1;
+        for (int i = pos - 1; i >= 0; i--)
+            for (uint8_t k = 0; k < hist[i].nwr; k++)
+                if (hist[i].wr[k] == r)
+                    return i;
+        return -1;
+    }
+
+    // mips switch: jr t, where t is loaded from base + idx * 4 and base is a known address
+    // (lui %hi / addiu %lo pairs, a got page, gp). the entries are absolute targets, or offsets
+    // a trailing addu adds to a known base
+    void resolve_table_mips(const insn* hist, const mips_seen* hseen, int nh, const insn& j)
+    {
+        int jd = regs::mips_num(j.reg0);
+        if (jd <= 0)
+            return;
+        int lp = mips_def(hist, nh, jd);
+        if (lp < 0 || !ins::mips_lw(hist[lp]))
+            return;
+        const insn& ld = hist[lp];
+        if (!ld.has_mem_op || ld.mem_write)
+            return;
+
+        // the lw's base register: a known constant means absolute entries only with no index —
+        // a switch needs the addu of a known base with the shifted index
+        int lb = regs::mips_num(ld.mem_base);
+        int bp = mips_def(hist, lp, lb);
+        if (bp < 0)
+            return;
+        const insn& ad = hist[bp];
+        if (!ins::mips_addu(ad))
+            return;
+        int ra = regs::mips_num(ad.reg1), rb = regs::mips_num(ad.reg2);
+        for (int pick = 0; pick < 2; pick++) {
+            int rbase = pick == 0 ? ra : rb, rsh = pick == 0 ? rb : ra;
+            if (!(hseen[bp].k & (pick == 0 ? 2 : 4)))
+                continue; // the base side has to be known
+            uint64_t basev = pick == 0 ? hseen[bp].v[1] : hseen[bp].v[2];
+            int sp = mips_def(hist, bp, rsh);
+            if (sp < 0)
+                continue;
+            const insn& sh = hist[sp];
+            uint32_t es = 0;
+            int idx = -1;
+            if (ins::mips_sll(sh) && regs::mips_num(sh.reg1) > 0) {
+                idx = regs::mips_num(sh.reg1);
+                es = 1u << (sh.imm & 31);
+            } else if (ins::mips_sllv(sh) && regs::mips_num(sh.reg1) > 0) {
+                idx = regs::mips_num(sh.reg1);
+                es = 4;
+            }
+            if (idx <= 0 || es < 1 || es > 4)
+                continue;
+            uint64_t table = basev + (uint64_t)ld.mem_disp;
+
+            // case count: the slti bound on the index still live when the table was loaded
+            uint32_t count = hseen[lp].creg == idx ? hseen[lp].cimm
+                           : hseen[sp].creg == idx ? hseen[sp].cimm
+                           : hseen[bp].creg == idx ? hseen[bp].cimm
+                                                   : 0;
+            if (!count || count > 4096)
+                return; // without a bound any byte looks like a target
+
+            // entries relative to a base? an addu after the lw that feeds the jr
+            uint64_t relbase = 0;
+            bool relative = false;
+            int fp = -1;
+            for (int i = lp + 1; i < nh; i++)
+                if (hist[i].nwr >= 1 && hist[i].wr[0] == jd) {
+                    fp = i;
+                    break;
+                }
+            if (fp > 0 && ins::mips_addu(hist[fp])) {
+                const insn& fin = hist[fp];
+                for (int pick2 = 0; pick2 < 2; pick2++) {
+                    int rq = regs::mips_num(pick2 == 0 ? fin.reg1 : fin.reg2);
+                    int slot = rq == regs::mips_num(fin.reg1) ? 1 : rq == regs::mips_num(fin.reg2) ? 2 : 0;
+                    if (slot && (hseen[fp].k & (1 << slot))) {
+                        relbase = hseen[fp].v[slot];
+                        relative = true;
+                    }
+                }
+            }
+
+            const segment* js = b.seg_at(j.addr);
+            std::vector<uint64_t> targets;
+            uint32_t n = 0;
+            for (; n < count; n++) {
+                uint32_t e = 0;
+                uint8_t raw[4];
+                if (b.read(table + (uint64_t)n * es, raw, es) != es)
+                    break;
+                for (uint32_t k = 0; k < es; k++)
+                    e |= (uint32_t)raw[k] << (8 * k);
+                uint64_t t = relative ? (uint32_t)(relbase + (uint32_t)(int32_t)e) : e;
+                if (!js || !js->contains(t) || (t & 3))
+                    break;
+                uint8_t tf = an.flags_at(t);
+                if (is_tail_only(tf) || (tf & (fl_str | fl_data)))
+                    break;
+                targets.push_back(t);
+            }
+            if (n != count || targets.empty())
+                return;
+            for (uint32_t k = 0; k < n; k++) {
+                uint64_t ea = table + (uint64_t)k * es;
+                if (range_free(ea, es)) {
+                    mark_item(ea, es, fl_data);
+                    an.data_sizes[ea] = (uint8_t)es;
+                }
+            }
+            std::vector<uint64_t> cases = targets;
+            std::sort(targets.begin(), targets.end());
+            targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+            add_xref(j.addr, table, xref_type::read);
+            for (uint64_t t : targets) {
+                add_xref(j.addr, t, xref_type::jump);
+                push_code(t);
+                if (weak_starts.erase(t))
+                    func_starts.erase(t);
+            }
+            jump_table jt;
+            jt.jmp = j.addr;
+            jt.table = table;
+            jt.entry_size = es;
+            jt.entries = n;
+            jt.targets = std::move(targets);
+            jt.cases = std::move(cases);
+            jt.index_reg = (unsigned)idx;
+            an.tables[j.addr] = std::move(jt);
+            return;
+        }
+    }
+
     // linear walk from a, following fall through. branch targets go on the work list
     void explore(uint64_t a)
     {
@@ -833,12 +1203,25 @@ struct worker {
         a64_seen hseen[hist_max];   // arm64: addresses its registers held
         int nh = 0;
         a64_state st;
+        mips_state mst;
+        mips_seen hm[hist_max];
         if (arm) {
             auto p = a64_pending.find(a);
             if (p != a64_pending.end()) {
                 if (!func_starts.count(a))
                     st = std::move(p->second);
                 a64_pending.erase(p);
+            }
+        }
+        if (mips) {
+            auto p = mips_pending.find(a);
+            if (p != mips_pending.end()) {
+                if (!func_starts.count(a))
+                    mst = std::move(p->second);
+                mips_pending.erase(p);
+            } else if (gp_known) {
+                mst.k[28] = 1; // pic: $gp is the same constant in every function
+                mst.v[28] = gp_value;
             }
         }
         uint64_t first = a;
@@ -871,12 +1254,33 @@ struct worker {
                     }
                 }
             }
+            if (mips && a != first) {
+                if (func_starts.count(a)) {
+                    mst = mips_state(); // ran into the next function
+                    if (gp_known) {
+                        mst.k[28] = 1;
+                        mst.v[28] = gp_value;
+                    }
+                } else {
+                    auto p = mips_pending.find(a);
+                    if (p != mips_pending.end()) {
+                        if (mst.empty())
+                            mst = p->second;
+                        mips_pending.erase(p);
+                    }
+                }
+            }
             int pre_breg = st.breg, pre_breg2 = st.breg2;
             uint32_t pre_bcount = st.bcount;
             a64_seen pre_seen;
+            mips_seen pre_m;
             if (arm) {
                 pre_seen = a64_snapshot(st, in);
                 a64_step(st, in);
+            }
+            if (mips) {
+                pre_m = mips_snapshot(mst, in);
+                mips_step(mst, in);
             }
             refs(in);
 
@@ -886,16 +1290,30 @@ struct worker {
                 if (in.has_target) {
                     if (arm)
                         a64_hand_over(in.target, st);
+                    if (mips)
+                        mips_hand_over(in.target, mst);
                     if (thunk_import_at(in.target) >= 0)
                         add_func(in.target); // a tail call to an import stub
                     else
                         push_code(in.target);
+                } else if (mips && in.has_mem) {
+                    // a jr through a got slot with no import behind it: in a raw dump the
+                    // file's own pointer is the tail target (an elf resolves it as an import)
+                    uint64_t ptr;
+                    if (got_value(in.mem, ptr) && b.is_mapped(ptr))
+                        push_code(ptr);
                 } else if (arm) {
                     resolve_table_a64(hist, hbreg, hbreg2, hbcount, hseen, nh, in);
                     auto t = an.tables.find(in.addr);
                     if (t != an.tables.end())
                         for (uint64_t x : t->second.targets)
                             a64_hand_over(x, st);
+                } else if (mips) {
+                    resolve_table_mips(hist, hm, nh, in);
+                    auto t = an.tables.find(in.addr);
+                    if (t != an.tables.end())
+                        for (uint64_t x : t->second.targets)
+                            mips_hand_over(x, mst);
                 } else {
                     resolve_table(hist, nh, in);
                 }
@@ -918,12 +1336,22 @@ struct worker {
                             st.bcount = (uint32_t)std::min<uint64_t>(st.cimm + (ins::a64_bhi(in) ? 1 : 0), 1u << 20);
                         }
                     }
+                    if (mips)
+                        mips_hand_over(in.target, mst);
                     push_code(in.target);
                 }
                 break;
             case flow::call:
                 if (in.has_target && !get_pc_call(in))
                     add_func(in.target);
+                else if (mips && in.indirect) {
+                    // pic call "lw t9, off(gp); jalr t9": mips_step records the slot in
+                    // in.mem. in a raw dump that slot's file value is the only way to reach
+                    // the callee — an elf would stop at the import boundary, this blob has none
+                    uint64_t ptr;
+                    if (in.has_mem && got_value(in.mem, ptr) && b.is_mapped(ptr))
+                        add_func(ptr);
+                }
                 if (is_noreturn_name(callee_name(in))) {
                     an.noret_calls.insert(in.addr);
                     stop = true;
@@ -936,8 +1364,13 @@ struct worker {
             default:
                 break;
             }
-            if (stop)
+            if (stop) {
+                // mips: the instruction in a taken branch's delay slot runs before the branch
+                // takes effect, so it's code this walk would otherwise never reach
+                if (mips && (in.kind == flow::jump || in.kind == flow::ret || in.kind == flow::call))
+                    mark_delay_slot(in.next());
                 return;
+            }
             if (nh == hist_max) {
                 for (int i = 1; i < hist_max; i++) {
                     hist[i - 1] = hist[i];
@@ -945,6 +1378,7 @@ struct worker {
                     hbreg2[i - 1] = hbreg2[i];
                     hbcount[i - 1] = hbcount[i];
                     hseen[i - 1] = hseen[i];
+                    hm[i - 1] = hm[i];
                 }
                 nh--;
             }
@@ -952,9 +1386,26 @@ struct worker {
             hbreg2[nh] = pre_breg2;
             hbcount[nh] = pre_bcount;
             hseen[nh] = pre_seen;
+            hm[nh] = pre_m;
             hist[nh++] = in;
             a = in.next();
         }
+    }
+
+    // mips delay slot: decode and mark one instruction without following it
+    void mark_delay_slot(uint64_t a)
+    {
+        if (!code_at(a) || (an.flags_at(a) & (fl_code | fl_tail | fl_str | fl_data)) || (a & 3))
+            return;
+        insn in;
+        if (!dis.decode(b, a, in) || !code_at(a + in.size - 1))
+            return;
+        for (uint32_t k = 1; k < in.size; k++)
+            if (an.flags_at(a + k) & (fl_code | fl_tail | fl_str | fl_data))
+                return;
+        mark_item(a, in.size, fl_code);
+        an.insn_count++;
+        refs(in);
     }
 
     void run_work()
@@ -1036,6 +1487,16 @@ struct worker {
                 }
                 continue;
             }
+            if (mips) {
+                for (size_t off = (size_t)((4 - (s.start & 3)) & 3); off + 4 <= d.size(); off += 4) {
+                    if (fl[off] || !ins::mips_prologue(util::rd32(&d[off])))
+                        continue;
+                    if (off >= 4 && !fl[off - 4] && !ins::mips_gap_before(util::rd32(&d[off - 4])))
+                        continue;
+                    add_func(s.start + off, true);
+                }
+                continue;
+            }
             for (size_t off = 0; off < d.size(); off++) {
                 if (fl[off])
                     continue;
@@ -1101,10 +1562,11 @@ struct worker {
 
     uint64_t skip_padding(uint64_t p, uint64_t lim)
     {
-        if (arm) {
+        if (arm || mips) {
             p = (p + 3) & ~3ull;
             uint32_t w;
-            while (p + 4 <= lim && b.read_u32(p, w) && (w == 0 || w == 0xd503201f)) // zeros, nop
+            while (p + 4 <= lim && b.read_u32(p, w) &&
+                   (w == 0 || (arm && w == 0xd503201f))) // zeros, nop (arm also: nop hint)
                 p += 4;
             return std::min(p, lim);
         }
@@ -1136,9 +1598,9 @@ struct worker {
                 return false;
             if (ins::is_suspicious(in) || in.kind == flow::stop)
                 return false;
-            if (!arm && in.size >= 2 && in.bytes[0] == 0 && in.bytes[1] == 0 && ++zero_ops >= 2)
+            if (!arm && !mips && in.size >= 2 && in.bytes[0] == 0 && in.bytes[1] == 0 && ++zero_ops >= 2)
                 return false; // runs of "add [rax], al" are zeros, not code
-            if (!arm && i == 0 && in.bytes[0] == 0)
+            if (!arm && !mips && i == 0 && in.bytes[0] == 0)
                 return false;
             if (in.kind == flow::ret || in.kind == flow::jump)
                 return i >= 1;
@@ -1293,7 +1755,9 @@ struct worker {
             // thunk: the whole body is one jump (after an optional endbr)
             insn first;
             uint64_t fa = s;
-            uint64_t slot = arm && f.insns <= 6 ? a64_stub_slot(s) : 0;
+            uint64_t slot = arm && f.insns <= 6 ? a64_stub_slot(s)
+                          : mips && f.insns <= 6 ? mips_stub_slot(s)
+                                                 : 0;
             if (slot && import_of_slot(slot) >= 0) {
                 f.thunk = true;
                 f.thunk_target = slot;
@@ -1339,7 +1803,8 @@ struct worker {
                 }
                 uint64_t a = seg.start + i;
                 bool refd = reffed.count(a) != 0;
-                if (seg.exec() && !refd) {
+                // a raw dump has no sections, so "executable" says nothing: scan it like data
+                if (seg.exec() && b.format != bin_format::raw && !refd) {
                     i++;
                     continue;
                 }
@@ -1400,10 +1865,12 @@ struct worker {
     {
         mask = b.is64() ? ~0ull : 0xffffffffull;
         arm = b.arch == bin_arch::arm64;
+        mips = b.arch == bin_arch::mips;
         imm_refs = (b.format == bin_format::pe || b.format == bin_format::elf || b.format == bin_format::macho) &&
                    b.base >= 0x10000;
-        if (!dis.open(b.arch))
-            return false;
+        // an architecture the listing can't decode yet: every decode fails and the passes
+        // below just find no code — the file still opens as data and strings
+        dis.open(b.arch);
         an = analysis();
         for (const segment& s : b.segments) {
             an.seg_start.push_back(s.start);
@@ -1413,12 +1880,55 @@ struct worker {
         }
 
         int ps = b.ptr_size();
+        if (mips && b.mips_gp) {
+            // the loader answered (the raw blob ran the prologue vote): trust it
+            gp_value = (uint32_t)b.mips_gp;
+            gp_known = true;
+        } else if (mips) {
+            // no loader answer: read the lui / addiu pair at the entry, where the c runtime
+            // sets $gp up
+            mips_state st0;
+            uint64_t a = b.entry;
+            for (int i = 0; i < 64; i++, a += 4) {
+                insn in;
+                if (!dis.decode(b, a, in) || !in.mips || in.is_branch())
+                    break;
+                if (ins::mips_lui(in) && regs::mips_num(in.reg0) == 28 && in.has_imm) {
+                    st0.k[28] = 1;
+                    st0.v[28] = (uint32_t)in.imm;
+                } else if (ins::mips_addiu(in) && regs::mips_num(in.reg0) == 28 &&
+                           regs::mips_num(in.reg1) == 28 && in.has_imm && st0.k[28] == 1) {
+                    gp_value = st0.v[28] + (uint32_t)(int32_t)in.imm;
+                    gp_known = true;
+                    break;
+                } else if (in.nwr >= 1 && in.wr[0] == 28) {
+                    break; // gp written by something we don't track
+                }
+            }
+        }
         for (size_t i = 0; i < b.imports.size(); i++) {
             uint64_t slot = b.imports[i].slot;
             an.slot_import.emplace(slot, (uint32_t)i);
             if (range_free(slot, (uint32_t)ps)) {
                 mark_item(slot, (uint32_t)ps, fl_data);
                 an.data_sizes[slot] = (uint8_t)ps;
+            }
+        }
+        if (mips && gp_known && b.format == bin_format::raw) {
+            // no imports section: read the pointer table at $gp - 0x7ff0 ourselves, the same
+            // addresses an "lw x, off(gp)" would touch. marking them data lets a jr through a
+            // slot resolve to the function it points at. the window can hold null entries and
+            // slots pointing past the dump (bss, ram), so skip rather than stop at the first
+            uint32_t gp_base = gp_value - 0x7ff0;
+            for (uint32_t off = 0; off < 0x10000; off += 4) {
+                uint64_t slot = (gp_base + off) & mask;
+                uint64_t ptr;
+                if (!b.is_mapped(slot) || !b.read_ptr(slot, ptr) || !ptr || !b.is_mapped(ptr))
+                    continue; // padding, or a slot the runtime linker would fill
+                if (range_free(slot, (uint32_t)ps)) {
+                    mark_item(slot, (uint32_t)ps, fl_data);
+                    an.data_sizes[slot] = (uint8_t)ps;
+                }
             }
         }
         for (const symbol_entry& s : b.symbols)
@@ -1501,6 +2011,110 @@ struct worker {
     }
 };
 
+}
+
+// ---- mips pic detection for raw blobs ----
+
+// read one aligned mips32 word
+static uint32_t mips_word(const std::vector<uint8_t>& d, size_t off)
+{
+    return (uint32_t)d[off] | ((uint32_t)d[off + 1] << 8) | ((uint32_t)d[off + 2] << 16) |
+        ((uint32_t)d[off + 3] << 24);
+}
+
+// what a function start looks like for $gp purposes, one of:
+// 0 unknown, 1 "bal +8; .word gp; lw $gp,($ra)" (self-relative literal pool: the word the
+// bal's ra lands on holds the absolute gp value), 2 "lui $gp, hi" (classic, needs the %lo
+// addiu which may be far away), 3 "lui $gp, hi; addiu $gp, $gp, lo" (a complete pair)
+static int mips_prologue_kind(const std::vector<uint8_t>& d, size_t i, size_t words, uint32_t& hi)
+{
+    if (i + 4 > words)
+        return 0;
+    uint32_t w0 = mips_word(d, i * 4);
+    if (w0 == 0x04110002) { // bal with a +8 branch offset: ra = the next instruction
+        if (mips_word(d, i * 4 + 12) == 0x8ffc0000) { // lw $gp, 0($ra)
+            hi = mips_word(d, i * 4 + 8); // the word ra points at IS the gp value
+            return 1;
+        }
+        return 0;
+    }
+    if ((w0 & 0xffe00000) == 0x3c000000 && ((w0 >> 16) & 0x1f) == 28) { // lui $gp, imm
+        hi = (uint32_t)(w0 & 0xffff) << 16;
+        if (i + 2 <= words) {
+            uint32_t w1 = mips_word(d, i * 4 + 4);
+            if ((w1 & 0xffe00000) == 0x27000000 && ((w1 >> 16) & 0x1f) == 28 &&
+                ((w1 >> 21) & 0x1f) == 28) // addiu $gp, $gp, lo
+                return 3;
+        }
+        return 2;
+    }
+    return 0;
+}
+
+// how many words in [lo, lo + 0x10000) read as pointers into the image itself. a real
+// gp-anchored table is dense with them; a wrong guess lands in code or padding
+static int pointer_window_score(const std::vector<uint8_t>& d, uint64_t base, uint32_t lo)
+{
+    if (base > lo || lo - base + 0x10000 > d.size())
+        return 0;
+    size_t start = (size_t)(lo - base);
+    int n = 0;
+    for (uint32_t off = 0; off < 0x10000 && start + off + 4 <= d.size(); off += 4) {
+        uint32_t w = mips_word(d, start + off);
+        if (w >= (uint32_t)base && w - (uint32_t)base < d.size())
+            n++;
+    }
+    return n;
+}
+
+mips_pic detect_mips_pic(const std::vector<uint8_t>& blob, uint64_t base)
+{
+    mips_pic r;
+    if (blob.size() < 64)
+        return r;
+    std::map<uint32_t, int> votes1, votes2, votes3;
+    size_t words = blob.size() / 4;
+    for (size_t i = 0; i + 1 < words; i++) {
+        uint32_t hi = 0;
+        int k = mips_prologue_kind(blob, i, words, hi);
+        if (k == 1)
+            votes1[hi]++;
+        else if (k == 2)
+            votes2[hi]++;
+        else if (k == 3)
+            votes3[hi]++;
+    }
+    // a bal-stub vote is a four-word fingerprint (branch, pointer literal, gp load): one hit
+    // settles it. a lui/addiu pair is exact too. a lone lui high is common in data, so it only
+    // counts with several votes and a pointer-dense 64k window where the table would live
+    for (const std::map<uint32_t, int>* vs : {&votes1, &votes3}) {
+        for (const auto& v : *vs) {
+            if (v.second) {
+                r.found = true;
+                r.gp = v.first;
+                r.votes = v.second;
+                return r;
+            }
+        }
+    }
+    uint32_t best = 0;
+    int bestn = 0, bestscore = 0;
+    for (const auto& v : votes2) {
+        if (v.second < 3)
+            continue;
+        int score = pointer_window_score(blob, base, v.first);
+        if (score > bestscore) {
+            bestscore = score;
+            bestn = v.second;
+            best = v.first;
+        }
+    }
+    if (bestscore >= 32) {
+        r.found = true;
+        r.gp = best; // the %lo part is filled in later, off the real loads
+        r.votes = bestn;
+    }
+    return r;
 }
 
 bool analyze(const binary& b, analysis& out, analysis_progress* progress)

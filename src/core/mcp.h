@@ -1,6 +1,8 @@
 #pragma once
 #include "core/json.h"
 #include <atomic>
+#include <map>
+#include <memory>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -37,6 +39,8 @@ struct mcp_debug_link {
 struct mcp_options {
     bool allow_debug = false; // tools that run the program and change its state
     bool allow_lua = false;   // run_lua runs any code, with file and os access
+    bool allow_open = false;  // open_file / close_file / select_file / list_files: the server
+                              // owns its files and every tool follows the active one
     // write each rename / comment to disk right away (the cli server has no save of its own).
     // the gui turns it off: there the ai's edits wait for the user's save, like their own
     bool autosave = true;
@@ -49,6 +53,10 @@ class mcp_server {
 public:
     mcp_options opts;
     std::function<database*()> get_db;
+    // the files the server opened itself (allow_open): tools follow the active one
+    std::map<std::string, std::shared_ptr<database>> owned;
+    std::string active;
+    database* active_db();
     mcp_debug_link debug;               // used when opts.allow_debug
     std::function<lua_host*()> get_lua; // used when opts.allow_lua
     // runs fn on the thread that owns the database / debugger and waits for it. unset: here
@@ -70,6 +78,7 @@ public:
         bool debug = false;   // needs allow_debug
         bool lua = false;     // needs allow_lua
         bool kuna = false;    // needs opts.kuna
+        bool files = false;   // needs allow_open
         bool writes = false;  // changes the project or the program
         bool owner = true;    // the handler runs on the owner thread as a whole
         run_t run;

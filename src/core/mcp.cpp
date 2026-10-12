@@ -188,9 +188,11 @@ database* need_db(mcp_server& s, std::string& out)
 {
     database* db = s.get_db ? s.get_db() : nullptr;
     if (!db)
-        out = "no file is open in ceasta";
+        out = s.opts.allow_open ? "no file is open (open_file loads one)"
+                                : "no file is open in ceasta";
     return db;
 }
+
 
 } // namespace
 
@@ -311,7 +313,7 @@ void add_read_tools(std::vector<tool>& t)
 
     add("decompile_with_kuna",
         "The same function decompiled by kuna, a decompiler ported from Ghidra's that the user has installed. It is "
-        "often better than decompile_function on optimized code, and it also reads arm64. It names things itself "
+        "often better than decompile_function on optimized code, and it also reads arm64 and raw mips dumps. It names things itself "
         "(sub_401000, dat_404010, a0 for arguments), so renames and types set in ceasta don't show up here; its "
         "addresses are the same as ceasta's. Use it for a second opinion on a hard function.",
         schema({{"function", prop("string", "name or address of the function, or any address inside it")}},
@@ -322,6 +324,7 @@ void add_read_tools(std::vector<tool>& t)
             std::string file, why, name;
             uint64_t start = 0;
             bool ok = false;
+            std::vector<std::string> defines, format_args;
             s.run([&] {
                 database* db = need_db(s, out);
                 uint64_t a;
@@ -337,6 +340,8 @@ void add_read_tools(std::vector<tool>& t)
                     file = kuna_input(db->bin, why);
                 start = f->start;
                 name = db->location(f->start);
+                defines = kuna_define_args(*db);
+                format_args = kuna_format_args(db->bin);
                 ok = true;
             });
             if (!ok)
@@ -345,7 +350,8 @@ void add_read_tools(std::vector<tool>& t)
                 out = why;
                 return false;
             }
-            kuna_result k = kuna_decompile(s.opts.kuna, file, start, 120000, &s.stopping);
+            defines.insert(defines.end(), format_args.begin(), format_args.end());
+            kuna_result k = kuna_decompile(s.opts.kuna, file, start, 120000, &s.stopping, defines);
             if (!k.ok) {
                 out = k.error;
                 return false;
@@ -1742,6 +1748,132 @@ void add_debug_inspect_tools(std::vector<tool>& t)
 
 // ------------------------------------------------------------------ the tool registry
 
+// ------------------------------------------------------------------ file management tools
+
+// the one-line summary a file tool answers with
+std::string file_summary(database& db)
+{
+    const binary& b = db.bin;
+    std::string out = util::fmt("%s %s, base %s: %zu functions, %zu imports, %zu strings",
+        format_name(b.format), arch_name(b.arch), hexa(b.base).c_str(), db.an.funcs.size(),
+        b.imports.size(), db.an.strings.size());
+    for (const std::string& n : b.notes)
+        out += "\n  note: " + n;
+    return out;
+}
+
+std::string file_listing(mcp_server& s)
+{
+    std::string out;
+    for (const auto& [name, db] : s.owned)
+        out += util::fmt("%s %-14s %s\n", name == s.active ? "*" : " ", name.c_str(),
+                         file_summary(*db).c_str());
+    return out;
+}
+
+void add_file_tools(std::vector<tool>& t)
+{
+    auto add = [&](const char* name, const char* desc, json::value sch, tool::run_t fn) {
+        tool x;
+        x.name = name;
+        x.description = desc;
+        x.schema = std::move(sch);
+        x.files = true;
+        x.run = std::move(fn);
+        t.push_back(std::move(x));
+    };
+
+    add("open_file",
+        "Open another binary in the server: the analysis runs and every tool follows it. Executables, "
+        "libraries and kernel modules (.ko) work; a flat firmware dump needs raw_arch (and usually base). "
+        "Files stay open - switch with select_file, list them with list_files.",
+        schema({{"path", prop("string", "the file on disk")},
+                   {"raw_arch", prop("string", "load as raw code: x86, x64, arm64 or mips (a flat dump without headers)")},
+                   {"base", prop("string", "hex base address for a raw load (default 0)")},
+                   {"name", prop("string", "short name to refer to this file by (default: the file name)")}},
+               {"path"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            std::string path = arg_str(args, "path");
+            if (path.empty()) {
+                out = "path is required";
+                return false;
+            }
+            load_options opts;
+            std::string raw = util::lower(arg_str(args, "raw_arch"));
+            if (!raw.empty()) {
+                if (!parse_arch(raw, opts.raw_arch)) {
+                    out = "raw_arch is one of x86, x64, arm64, mips";
+                    return false;
+                }
+                opts.force_raw = true;
+            }
+            std::string base = arg_str(args, "base");
+            if (!base.empty())
+                util::parse_hex(base, opts.raw_base);
+
+            std::unique_ptr<database> db = open_any(path, opts, nullptr, out);
+            if (!db)
+                return false;
+
+            std::string name = arg_str(args, "name");
+            if (name.empty()) {
+                size_t slash = path.find_last_of('/');
+                name = slash == std::string::npos ? path : path.substr(slash + 1);
+            }
+            s.owned[name] = std::move(db);
+            s.active = name;
+            out = "opened " + name + " (" + file_summary(*s.owned[name]) + ")\n";
+            out += "open files, * = active:\n" + file_listing(s);
+            return true;
+        });
+
+    add("close_file",
+        "Close one of the open files (default: the active one). Annotations are saved when autosave is on.",
+        schema({{"name", prop("string", "the file's short name (default: the active one)")}}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            std::string name = arg_str(args, "name");
+            if (name.empty())
+                name = s.active;
+            auto it = s.owned.find(name);
+            if (it == s.owned.end()) {
+                out = "no such file is open: " + name;
+                return false;
+            }
+            if (s.opts.autosave) {
+                std::string err;
+                if (!it->second->save(err) && !err.empty())
+                    out += "note: couldn't save: " + err + "\n";
+            }
+            s.owned.erase(it);
+            if (s.active == name)
+                s.active = s.owned.empty() ? std::string() : s.owned.begin()->first;
+            out = "closed " + name + "\n" + file_listing(s);
+            return true;
+        });
+
+    add("select_file",
+        "Point every tool at one of the open files.",
+        schema({{"name", prop("string", "the file's short name (see list_files)")}}, {"name"}),
+        [](mcp_server& s, const json::value& args, std::string& out) {
+            std::string name = arg_str(args, "name");
+            if (!s.owned.count(name)) {
+                out = "no such file is open: " + name;
+                return false;
+            }
+            s.active = name;
+            out = "active: " + name + " (" + file_summary(*s.owned[name]) + ")";
+            return true;
+        });
+
+    add("list_files",
+        "The files open in the server, the active one marked.",
+        schema({}),
+        [](mcp_server& s, const json::value&, std::string& out) {
+            out = s.owned.empty() ? "no files are open (open_file loads one)" : file_listing(s);
+            return true;
+        });
+}
+
 const std::vector<mcp_server::tool>& mcp_all_tools()
 {
     static const std::vector<mcp_server::tool> all = [] {
@@ -1749,6 +1881,7 @@ const std::vector<mcp_server::tool>& mcp_all_tools()
         add_read_tools(t);
         add_query_tools(t);
         add_edit_tools(t);
+        add_file_tools(t);
         add_debug_tools(t);
         add_debug_inspect_tools(t);
         return t;
@@ -1766,12 +1899,20 @@ std::vector<const mcp_server::tool*> mcp_server::tools() const
             continue;
         if (t.kuna && opts.kuna.empty())
             continue;
+        if (t.files && !opts.allow_open)
+            continue;
         out.push_back(&t);
     }
     return out;
 }
 
 // ------------------------------------------------------------------ owner thread + waiting
+
+database* mcp_server::active_db()
+{
+    auto it = owned.find(active);
+    return it == owned.end() ? nullptr : it->second.get();
+}
 
 void mcp_server::run(const std::function<void()>& fn)
 {

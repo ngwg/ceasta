@@ -1,5 +1,11 @@
 # changelog
 
+## unreleased
+
+- kuna decompiles raw mips dumps (`--raw-mips` files: flash dumps, bootloader blobs) — they load
+  in kuna with its own raw loader (`--raw-image`, sleigh `MIPS:LE:32`) at the dump's base, so
+  `ceasta-cli decompile dump.bin 0x80104528 --kuna` works like it does on elf files
+
 ## v0.12.0 - 2026-09-25
 
 - **macos**: `ceasta-x.y.z-macos.dmg` (the app) and `ceasta-cli-x.y.z-macos.tar.gz`, one build

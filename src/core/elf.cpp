@@ -51,6 +51,8 @@ struct ctx {
     bool is64;
     std::vector<shdr> secs;
     std::vector<uint64_t> sec_addr; // load address per section (differs for .o files)
+    // mips: the dynamic got layout (dt_pltgot / dt_mips_local_gotno / dt_mips_gotsym)
+    uint64_t got_addr = 0, local_gotno = 0, gotsym = 0;
 
     bool sec_ok(uint32_t i) const { return i < secs.size(); }
 
@@ -128,6 +130,149 @@ void read_symbols(ctx& c, bool et_rel)
     b.exports.erase(std::unique(b.exports.begin(), b.exports.end(), same), b.exports.end());
 }
 
+// mips relocation types
+enum { r_mips_none = 0, r_mips_32 = 2, r_mips_26 = 4, r_mips_hi16 = 5, r_mips_lo16 = 6, r_mips_gprel16 = 7 };
+
+// a kernel module (.ko, elf relocatable): apply the section relocations into the laid out
+// segments, so cross section references resolve and the analysis sees the real code. hi16
+// relocs pair with the next lo16 in the list, whose addend they share (the gnu convention).
+void apply_relocs(ctx& c)
+{
+    binary& b = c.b;
+    size_t applied = 0, skipped = 0;
+    for (const shdr& rs : c.secs) {
+        if (rs.type != sht_rel && rs.type != sht_rela)
+            continue;
+        if (!c.sec_ok(rs.info) || !c.sec_ok(rs.link))
+            continue;
+        const shdr& target = c.secs[rs.info];
+        if (!(target.flags & shf_alloc) || target.type == sht_nobits)
+            continue;
+        const shdr& symtab = c.secs[rs.link];
+        if (symtab.type != sht_symtab && symtab.type != sht_dynsym)
+            continue;
+        bool rela = rs.type == sht_rela;
+        uint64_t base = c.sec_addr[rs.info];
+        uint64_t es = c.is64 ? (rela ? 24 : 16) : (rela ? 12 : 8);
+        uint64_t count = std::min<uint64_t>(rs.size / es, 1u << 20);
+
+        // collect in order: hi16 needs the next lo16
+        struct ent {
+            uint64_t off;
+            uint32_t type, symi;
+            int64_t addend;
+        };
+        std::vector<ent> ents;
+        for (uint64_t i = 0; i < count; i++) {
+            uint64_t off = rs.offset + i * es;
+            if (!c.r.ok(off, es))
+                break;
+            uint64_t where, info;
+            int64_t addend = 0;
+            uint32_t type, symi;
+            if (c.is64) {
+                where = c.r.u64(off);
+                info = c.r.u64(off + 8);
+                if (rela)
+                    addend = (int64_t)c.r.u64(off + 16);
+            } else {
+                where = c.r.u32(off);
+                info = c.r.u32(off + 4);
+                if (rela)
+                    addend = (int32_t)c.r.u32(off + 8);
+            }
+            type = (uint32_t)(info & (c.is64 ? 0xffffffff : 0xff));
+            symi = c.is64 ? (uint32_t)(info >> 32) : (uint32_t)(info >> 8);
+            ents.push_back({where, type, symi, addend});
+        }
+
+        auto symval = [&](uint32_t symi, uint64_t& out) {
+            elf_sym s;
+            if (!c.sym(symtab, symi, s))
+                return false;
+            if (s.shndx == 0)
+                return false; // an undefined kernel symbol: nothing to apply
+            if (s.shndx == 0xfff1) { // shn_abs
+                out = s.value;
+                return true;
+            }
+            if (!c.sec_ok(s.shndx))
+                return false;
+            out = s.value + c.sec_addr[s.shndx];
+            return true;
+        };
+
+        for (size_t i = 0; i < ents.size(); i++) {
+            const ent& e = ents[i];
+            if (e.type == r_mips_none)
+                continue;
+            uint64_t S = 0;
+            bool have_sym = symval(e.symi, S);
+            uint64_t place = base + e.off;
+            uint32_t word = 0;
+            if (!b.read_u32(place, word))
+                continue;
+            int64_t addend = e.addend;
+            if (!rela && (e.type == r_mips_hi16 || e.type == r_mips_lo16))
+                addend = (int16_t)(word & 0xffff);
+            uint32_t out;
+            bool ok = true;
+            switch (e.type) {
+            case r_mips_32:
+                out = have_sym ? (uint32_t)(word + (uint32_t)(S + addend)) : word;
+                break;
+            case r_mips_26:
+                if (!have_sym) {
+                    ok = false;
+                    break;
+                }
+                out = (word & 0xfc000000) | (uint32_t)(((S + addend) >> 2) & 0x3ffffff);
+                break;
+            case r_mips_lo16:
+                if (!have_sym) {
+                    ok = false;
+                    break;
+                }
+                out = (word & 0xffff0000) | (uint32_t)((S + addend) & 0xffff);
+                break;
+            case r_mips_hi16: {
+                // the paired lo16 (the next one in the list) carries the addend for both
+                int64_t lo_addend = addend;
+                for (size_t j = i + 1; j < ents.size(); j++)
+                    if (ents[j].type == r_mips_lo16) {
+                        lo_addend = ents[j].addend;
+                        if (!rela && j < ents.size()) {
+                            uint32_t low = 0;
+                            if (b.read_u32(base + ents[j].off, low))
+                                lo_addend = (int16_t)(low & 0xffff);
+                        }
+                        break;
+                    }
+                if (!have_sym) {
+                    ok = false;
+                    break;
+                }
+                int64_t full = (int64_t)S + lo_addend;
+                out = (word & 0xffff0000) | (uint32_t)(((full + 0x8000) >> 16) & 0xffff);
+                break;
+            }
+            default:
+                skipped++;
+                continue;
+            }
+            if (!ok) {
+                skipped++;
+                continue;
+            }
+            b.patch(place, &out, 4);
+            applied++;
+        }
+    }
+    if (applied)
+        b.notes.push_back(util::fmt("applied %zu mips relocations (%zu skipped: undefined kernel symbols)",
+            applied, skipped));
+}
+
 // jump_slot / glob_dat relocs against undefined symbols are the imports.
 // relative relocs into init/fini arrays point at constructors.
 void read_relocs(ctx& c)
@@ -141,7 +286,9 @@ void read_relocs(ctx& c)
             continue;
         bool rela = rs.type == sht_rela;
         uint64_t es = c.is64 ? (rela ? 24 : 16) : (rela ? 12 : 8);
-        // glob_dat, jump_slot and relative: 6, 7, 8 on x86 and x64, 1025, 1026, 1027 on arm64
+        // glob_dat, jump_slot and relative: 6, 7, 8 on x86 and x64, 1025, 1026, 1027 on arm64,
+        // and on mips only rel32 (3) and jump_slot (127) exist
+        bool mips = b.arch == bin_arch::mips;
         uint32_t t0 = b.arch == bin_arch::arm64 ? 1025 : 6;
         uint64_t count = std::min<uint64_t>(rs.size / es, 1u << 20);
         for (uint64_t i = 0; i < count; i++) {
@@ -167,11 +314,13 @@ void read_relocs(ctx& c)
                 type = (uint32_t)(info & 0xff);
                 symi = info >> 8;
             }
-            if ((type == t0 || type == t0 + 1) && symi != 0) {
+        // and on mips, rel32 (3) marks pointer slots while calls against shared libraries
+        // come through call16 (28) — jump_slot (127) barely appears in uClibc binaries
+            if ((mips ? type == 127 || type == 28 : type == t0 || type == t0 + 1) && symi != 0) {
                 elf_sym s;
                 if (c.sym(symtab, symi, s) && s.shndx == 0 && !s.name.empty())
                     b.imports.push_back({std::string(), s.name, where});
-            } else if (type == t0 + 2) {
+            } else if (mips ? type == 3 : type == t0 + 2) {
                 // R_*_RELATIVE: we load at the link address, so the pointer is just the addend.
                 // lld leaves zeros in rela targets, write the value so data reads right
                 uint64_t target = (uint64_t)addend;
@@ -213,8 +362,59 @@ void read_needed(ctx& c)
                 break;
             if (tag == 1 && val < strtab.size)
                 c.b.libs.push_back(c.r.cstr(strtab.offset + val, 256));
+            if (tag == 3)
+                c.got_addr = val;
+            else if (tag == 0x7000000a) // dt_mips_local_gotno
+                c.local_gotno = val;
+            else if (tag == 0x70000013) // dt_mips_gotsym
+                c.gotsym = val;
         }
     }
+}
+
+// mips: shared library calls don't get relocations — the got holds one slot per imported
+// symbol, ordered by dynsym index from gotsym on. an undefined symbol there is an import
+void read_mips_got_imports(ctx& c)
+{
+    bool dbg = getenv("CEASTA_MIPS_GOT") != nullptr;
+    if (dbg)
+        fprintf(stderr, "mips got: arch_mips=%d got=%llx local=%llu gotsym=%llu\n",
+            c.b.arch == bin_arch::mips, (unsigned long long)c.got_addr,
+            (unsigned long long)c.local_gotno, (unsigned long long)c.gotsym);
+    if (c.b.arch != bin_arch::mips || !c.got_addr || !c.gotsym || c.local_gotno > (1u << 20))
+        return;
+    const shdr* dynsym = nullptr;
+    for (const shdr& s : c.secs)
+        if (s.type == sht_dynsym) {
+            dynsym = &s;
+            break;
+        }
+    if (!dynsym || !c.sec_ok(dynsym->link))
+        return;
+    uint64_t es = c.is64 ? 24 : 16;
+    uint64_t nsym = std::min<uint64_t>(dynsym->size / es, 1u << 20);
+    uint64_t ptr = c.is64 ? 8 : 4;
+    // the got section caps how many slots exist: only dynsym entries [gotsym, gotsym + slots)
+    // got one. symbols past that are reached by other means entirely
+    for (const shdr& s : c.secs)
+        if (s.type != 0 && s.addr == c.got_addr) {
+            uint64_t entries = s.size / ptr;
+            if (entries > c.local_gotno)
+                nsym = std::min<uint64_t>(nsym, c.gotsym + (entries - c.local_gotno));
+            else
+                return;
+            break;
+        }
+    for (uint64_t i = c.gotsym; i < nsym; i++) {
+        elf_sym s;
+        if (!c.sym(*dynsym, i, s) || s.shndx != 0 || s.name.empty())
+            continue;
+        uint64_t slot = c.got_addr + (c.local_gotno + (i - c.gotsym)) * ptr;
+        c.b.imports.push_back({std::string(), s.name, slot});
+    }
+    std::sort(c.b.imports.begin(), c.b.imports.end(), [](const import_entry& x, const import_entry& y) { return x.slot < y.slot; });
+    c.b.imports.erase(std::unique(c.b.imports.begin(), c.b.imports.end(),
+        [](const import_entry& x, const import_entry& y) { return x.slot == y.slot; }), c.b.imports.end());
 }
 
 bool uleb(const binary& b, uint64_t& p, uint64_t end, uint64_t& out)
@@ -419,6 +619,8 @@ bool elf(binary& b, std::string& err)
         b.arch = bin_arch::x86;
     else if (machine == 183 && is64)
         b.arch = bin_arch::arm64;
+    else if (machine == 8 && !is64)
+        b.arch = bin_arch::mips; // mips32, little endian
     else {
         err = util::fmt("unsupported elf machine %u (x86, x64 and arm64 are supported)", machine);
         return false;
@@ -600,7 +802,13 @@ bool elf(binary& b, std::string& err)
 
     read_symbols(c, et_rel);
     read_relocs(c);
+    if (et_rel && b.arch == bin_arch::mips)
+        apply_relocs(c);
     read_needed(c);
+    read_mips_got_imports(c);
+    // mips pic: the abi sets $gp to got + 0x7ff0 (both sides of it stay within 16 bit reach)
+    if (b.arch == bin_arch::mips && c.got_addr)
+        b.mips_gp = c.got_addr + 0x7ff0;
     read_init_arrays(c);
     read_eh_frame_hdr(c);
 

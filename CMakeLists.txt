@@ -36,10 +36,11 @@ find_package(Threads REQUIRED)
 file(GLOB capstone_sources CONFIGURE_DEPENDS
     third_party/capstone/*.c
     third_party/capstone/arch/X86/*.c
-    third_party/capstone/arch/AArch64/*.c)
+    third_party/capstone/arch/AArch64/*.c
+    third_party/capstone/arch/Mips/*.c)
 add_library(capstone STATIC ${capstone_sources})
 target_include_directories(capstone PUBLIC third_party/capstone/include PRIVATE third_party/capstone)
-target_compile_definitions(capstone PUBLIC CAPSTONE_HAS_X86 CAPSTONE_HAS_ARM64 CAPSTONE_USE_SYS_DYN_MEM)
+target_compile_definitions(capstone PUBLIC CAPSTONE_HAS_X86 CAPSTONE_HAS_ARM64 CAPSTONE_HAS_MIPS CAPSTONE_USE_SYS_DYN_MEM)
 
 file(GLOB lua_sources CONFIGURE_DEPENDS third_party/lua/*.c)
 # compiled as c++ so lua errors are exceptions that unwind c++ frames (not longjmp)
@@ -85,6 +86,7 @@ add_library(ceasta_core STATIC
     src/core/dbg_trace.cpp
     src/core/debugger.cpp
     src/core/debugger_linux.cpp
+    src/core/debugger_remote.cpp
     src/core/debugger_steps.cpp
     src/core/decompiler.cpp
     src/core/diff.cpp

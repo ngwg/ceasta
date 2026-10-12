@@ -102,6 +102,8 @@ public:
 
     bool is64() const;
     uint64_t image_base() const;    // runtime base of the main module
+    // the stop reason for a fired watch, shared by the backends
+    static std::string watch_text(const watch& w);
     uint32_t pid() const;
     uint32_t tid() const;
     int exit_code() const;
@@ -132,7 +134,6 @@ private:
     // threads' debug registers
     std::vector<watch> active_watches() const;
     static uint64_t watch_dr7(const std::vector<watch>& w);
-    static std::string watch_text(const watch& w); // the stop reason
     bool apply_watches(std::string& err);
     std::vector<watch> watch_list_;
     uint32_t watch_pid_ = 0;

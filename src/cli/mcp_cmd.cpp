@@ -156,9 +156,12 @@ int cmd_mcp(int argc, char** argv)
         else if (a == "--http" && i + 1 < argc) {
             use_http = true;
             http = argv[++i];
-        } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
+        } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64" || a == "--raw-mips") {
             opts.force_raw = true;
-            opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
+            opts.raw_arch = a == "--raw32"   ? bin_arch::x86
+                          : a == "--raw64"   ? bin_arch::x64
+                          : a == "--raw-mips" ? bin_arch::mips
+                                              : bin_arch::arm64;
         } else if (a == "--arch" && i + 1 < argc) {
             opts.has_slice = true;
             if (!parse_arch(argv[++i], opts.slice)) {
@@ -191,6 +194,7 @@ int cmd_mcp(int argc, char** argv)
         return 1;
     }
 
+    mopts.allow_open = true;
     if (mopts.allow_debug && !debugger::supported()) {
         fprintf(stderr, "note: --allow-debug needs a build with the debugger (windows x64 or linux x64); "
                         "the debugger tools will be off\n");
@@ -204,16 +208,27 @@ int cmd_mcp(int argc, char** argv)
 
     mcp_server server;
     server.opts = mopts;
-    server.get_db = [&] { return db.get(); };
+    // the launched file joins the registry: open_file / select_file / close_file switch around it
+    database* dbp = nullptr;
+    {
+        std::string name = file;
+        size_t slash = name.find_last_of('/');
+        if (slash != std::string::npos)
+            name = name.substr(slash + 1);
+        server.owned[name] = std::move(db);
+        server.active = name;
+        dbp = server.owned[name].get(); // the rest of this function keeps using the raw pointer
+    }
+    server.get_db = [&] { return server.active_db(); };
 
     // lua, only when allowed
     lua_host lua;
     lua_bridge br;
     cli_debug cdbg;
-    cdbg.db = db.get();
-    uint64_t here = db->bin.has_entry ? db->bin.entry : db->bin.min_addr();
+    cdbg.db = dbp;
+    uint64_t here = dbp->bin.has_entry ? dbp->bin.entry : dbp->bin.min_addr();
     if (mopts.allow_lua) {
-        br.db = db.get();
+        br.db = dbp;
         br.dbg = mopts.allow_debug ? &cdbg.dbg : nullptr;
         br.log = [](const std::string&, int) {};
         br.here = [&here] { return here; };
@@ -244,7 +259,7 @@ int cmd_mcp(int argc, char** argv)
             fprintf(stderr, "bad --http value: %s\n", http.c_str());
             return 2;
         }
-        fprintf(stderr, "ceasta %s: serving %s over http\n", CEASTA_VERSION, db->bin.name.c_str());
+        fprintf(stderr, "ceasta %s: serving %s over http\n", CEASTA_VERSION, dbp->bin.name.c_str());
         std::string herr;
         int rc = mcp_serve_http(server, port, addr, [] { return false; }, herr,
                                 [](const std::string& url) { fprintf(stderr, "listening on %s\n", url.c_str()); });
@@ -253,7 +268,7 @@ int cmd_mcp(int argc, char** argv)
         return rc;
     }
 
-    fprintf(stderr, "ceasta %s: serving %s over stdio (%zu tools%s%s%s)\n", CEASTA_VERSION, db->bin.name.c_str(),
+    fprintf(stderr, "ceasta %s: serving %s over stdio (%zu tools%s%s%s)\n", CEASTA_VERSION, dbp->bin.name.c_str(),
             server.tools().size(), mopts.allow_debug ? ", debugger on" : "", mopts.allow_lua ? ", lua on" : "",
             mopts.kuna.empty() ? "" : ", kuna on");
     return mcp_serve_stdio(server);

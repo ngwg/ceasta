@@ -33,7 +33,7 @@ static void usage()
            "  strings <file>                strings found by the analysis\n"
            "  disasm <file> [where] [n]     n listing lines starting at where (default: entry)\n"
            "  func <file> <where>           listing of one function\n"
-           "  decompile <file> <where>      pseudocode for one function (--kuna: kuna's, when it's installed)\n"
+           "  decompile <file> <where>      pseudocode for one function (--kuna: kuna's, when it's installed; raw mips too)\n"
            "  graph <file> <where>          basic blocks and edges of a function\n"
            "  xrefs <file> <where>          references to an address\n"
            "  find <file> <pattern>         byte search, like \"48 8b ?? 05\"\n"
@@ -57,7 +57,10 @@ static void usage()
            "options:\n"
            "  --raw32 / --raw64             load the file as raw x86 / x64 code\n"
            "  --raw-arm64                   load the file as raw arm64 code\n"
+           "  --raw-mips                    load the file as raw mips32 (little endian) code\n"
            "  --base <hex>                  base address for raw files\n"
+           "  --gp <hex>                    raw mips pic: the $gp value (default: auto-detect)\n"
+           "  --entry <hex>                 raw blob: entry point (default: the base address)\n"
            "  --arch x64|arm64              which part of a universal (fat) mach-o file to open\n"
            "                                (default: x64 when it has one, the decompiler reads it)\n"
            "  --kuna / --kuna-path <file>   decompile with kuna (github.com/Noelo-Lab/kuna) instead\n"
@@ -274,9 +277,12 @@ int main(int argc, char** argv)
         } else if (a == "--kuna-path" && i + 1 < argc) {
             use_kuna = true;
             kuna_path = argv[++i];
-        } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64") {
+        } else if (a == "--raw32" || a == "--raw64" || a == "--raw-arm64" || a == "--raw-mips") {
             opts.force_raw = true;
-            opts.raw_arch = a == "--raw32" ? bin_arch::x86 : a == "--raw64" ? bin_arch::x64 : bin_arch::arm64;
+            opts.raw_arch = a == "--raw32" ? bin_arch::x86
+                          : a == "--raw64" ? bin_arch::x64
+                          : a == "--raw-mips" ? bin_arch::mips
+                                              : bin_arch::arm64;
         } else if (a == "--arch" && i + 1 < argc) {
             opts.has_slice = true;
             if (!parse_arch(argv[++i], opts.slice)) {
@@ -288,6 +294,17 @@ int main(int argc, char** argv)
                 fprintf(stderr, "bad base address\n");
                 return 2;
             }
+        } else if (a == "--gp" && i + 1 < argc) {
+            if (!util::parse_hex(argv[++i], opts.raw_gp)) {
+                fprintf(stderr, "bad gp value\n");
+                return 2;
+            }
+        } else if (a == "--entry" && i + 1 < argc) {
+            if (!util::parse_hex(argv[++i], opts.raw_entry)) {
+                fprintf(stderr, "bad entry address\n");
+                return 2;
+            }
+            opts.has_raw_entry = true;
         } else if (a == "--debug") {
             debug_mode = true;
         } else if (a == "-h" || a == "--help") {
@@ -373,8 +390,12 @@ int main(int argc, char** argv)
         return 0;
     }
     if (cmd == "imports") {
-        for (const import_entry& e : b.imports)
-            printf("%s  %s!%s\n", db.fmt_addr(e.slot).c_str(), e.lib.empty() ? "?" : e.lib.c_str(), e.name.c_str());
+        for (const import_entry& e : b.imports) {
+            if (e.lib.empty())
+                printf("%s  %s\n", db.fmt_addr(e.slot).c_str(), e.name.c_str());
+            else
+                printf("%s  %s!%s\n", db.fmt_addr(e.slot).c_str(), e.lib.c_str(), e.name.c_str());
+        }
         return 0;
     }
     if (cmd == "exports") {
@@ -444,7 +465,10 @@ int main(int argc, char** argv)
                 fprintf(stderr, "%s\n", why.c_str());
                 return 1;
             }
-            kuna_result k = kuna_decompile(exe, input, f->start);
+            std::vector<std::string> extra = kuna_define_args(db);
+            for (const std::string& a : kuna_format_args(b))
+                extra.push_back(a);
+            kuna_result k = kuna_decompile(exe, input, f->start, 120000, nullptr, extra);
             if (!k.ok) {
                 fprintf(stderr, "%s\n", k.error.c_str());
                 return 1;
